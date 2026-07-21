@@ -47,44 +47,53 @@ class MarketRadarRepository:
             )
 
     def sync_universe(self, sectors: list[SectorDefinition]) -> None:
+        self._validate_universe(sectors)
+        self._run_idempotent_write(
+            "sync_market_radar_universe",
+            lambda session: self._sync_universe_in_session(session, sectors),
+        )
+
+    @staticmethod
+    def _validate_universe(sectors: list[SectorDefinition]) -> None:
         if any(sector.market != "cn" for sector in sectors):
             raise ValueError("Market Radar Phase 1 supports market=cn only")
 
-        def write(session: Any) -> None:
-            for sector in sectors:
-                row = session.execute(
-                    select(RadarUniverseRecord).where(
-                        and_(
-                            RadarUniverseRecord.sector_id == sector.sector_id,
-                            RadarUniverseRecord.effective_from
-                            == sector.effective_from,
-                        )
+    @staticmethod
+    def _sync_universe_in_session(
+        session: Any,
+        sectors: list[SectorDefinition],
+    ) -> None:
+        for sector in sectors:
+            row = session.execute(
+                select(RadarUniverseRecord).where(
+                    and_(
+                        RadarUniverseRecord.sector_id == sector.sector_id,
+                        RadarUniverseRecord.effective_from == sector.effective_from,
                     )
-                ).scalar_one_or_none()
-                fields = {
-                    "market": sector.market,
-                    "kind": sector.kind,
-                    "name": sector.name,
-                    "aliases_json": _dump(sector.aliases),
-                    "benchmark_code": sector.benchmark_code,
-                    "etfs_json": _dump(
-                        [item.model_dump(mode="json") for item in sector.etfs]
-                    ),
-                    "effective_to": sector.effective_to,
-                }
-                if row is None:
-                    session.add(
-                        RadarUniverseRecord(
-                            sector_id=sector.sector_id,
-                            effective_from=sector.effective_from,
-                            **fields,
-                        )
+                )
+            ).scalar_one_or_none()
+            fields = {
+                "market": sector.market,
+                "kind": sector.kind,
+                "name": sector.name,
+                "aliases_json": _dump(sector.aliases),
+                "benchmark_code": sector.benchmark_code,
+                "etfs_json": _dump(
+                    [item.model_dump(mode="json") for item in sector.etfs]
+                ),
+                "effective_to": sector.effective_to,
+            }
+            if row is None:
+                session.add(
+                    RadarUniverseRecord(
+                        sector_id=sector.sector_id,
+                        effective_from=sector.effective_from,
+                        **fields,
                     )
-                else:
-                    for field, value in fields.items():
-                        setattr(row, field, value)
-
-        self._run_idempotent_write("sync_market_radar_universe", write)
+                )
+            else:
+                for field, value in fields.items():
+                    setattr(row, field, value)
 
     def list_universe(self, as_of: date) -> list[SectorDefinition]:
         with self.db.get_session() as session:
@@ -125,58 +134,78 @@ class MarketRadarRepository:
 
     def save_run(self, snapshot: RadarRunSnapshot) -> int:
         self._validate_snapshot_traceability(snapshot)
-
-        def write(session: Any) -> int:
-            existing_id = session.execute(
-                select(RadarRunRecord.id).where(
-                    RadarRunRecord.run_key == snapshot.run_key
-                )
-            ).scalar_one_or_none()
-            if existing_id is not None:
-                return int(existing_id)
-
-            snapshot_data = snapshot.model_dump(mode="json")
-            run = RadarRunRecord(
-                run_key=snapshot.run_key,
-                market=snapshot.market,
-                trigger=snapshot.trigger,
-                as_of=to_utc_naive_datetime(snapshot.as_of),
-                quality=snapshot.quality,
-                scoring_version=snapshot.scoring_version,
-                provider_trace_json=_dump(snapshot_data["provider_trace"]),
-            )
-            session.add(run)
-            session.flush()
-            for position, sector in enumerate(snapshot.sectors):
-                sector_data = sector.model_dump(mode="json")
-                session.add(
-                    RadarSectorSnapshotRecord(
-                        run_id=run.id,
-                        position=position,
-                        sector_id=sector.sector_id,
-                        name=sector.name,
-                        kind=sector.kind,
-                        score=sector.score,
-                        gross_score=sector.gross_score,
-                        risk_deduction=sector.risk_deduction,
-                        confidence=sector.confidence,
-                        state=sector.state,
-                        scoring_version=sector.scoring_version,
-                        quality=sector.quality,
-                        source=sector.source,
-                        observed_at=to_utc_naive_datetime(sector.observed_at),
-                        factors_json=_dump(sector_data["factors"]),
-                        risk_reasons_json=_dump(sector_data["risk_reasons"]),
-                        missing_fields_json=_dump(sector_data["missing_fields"]),
-                        observation_json=_dump(sector_data["observation"]),
-                    )
-                )
-            return int(run.id)
-
         return self._run_idempotent_write(
             f"save_market_radar_run[{snapshot.run_key}]",
+            lambda session: self._save_run_in_session(session, snapshot),
+        )
+
+    def save_run_with_universe(
+        self,
+        sectors: list[SectorDefinition],
+        snapshot: RadarRunSnapshot,
+    ) -> int:
+        self._validate_universe(sectors)
+        self._validate_snapshot_traceability(snapshot)
+
+        def write(session: Any) -> int:
+            self._sync_universe_in_session(session, sectors)
+            return self._save_run_in_session(session, snapshot)
+
+        return self._run_idempotent_write(
+            f"save_market_radar_run_with_universe[{snapshot.run_key}]",
             write,
         )
+
+    @staticmethod
+    def _save_run_in_session(
+        session: Any,
+        snapshot: RadarRunSnapshot,
+    ) -> int:
+        existing_id = session.execute(
+            select(RadarRunRecord.id).where(
+                RadarRunRecord.run_key == snapshot.run_key
+            )
+        ).scalar_one_or_none()
+        if existing_id is not None:
+            return int(existing_id)
+
+        snapshot_data = snapshot.model_dump(mode="json")
+        run = RadarRunRecord(
+            run_key=snapshot.run_key,
+            market=snapshot.market,
+            trigger=snapshot.trigger,
+            as_of=to_utc_naive_datetime(snapshot.as_of),
+            quality=snapshot.quality,
+            scoring_version=snapshot.scoring_version,
+            provider_trace_json=_dump(snapshot_data["provider_trace"]),
+        )
+        session.add(run)
+        session.flush()
+        for position, sector in enumerate(snapshot.sectors):
+            sector_data = sector.model_dump(mode="json")
+            session.add(
+                RadarSectorSnapshotRecord(
+                    run_id=run.id,
+                    position=position,
+                    sector_id=sector.sector_id,
+                    name=sector.name,
+                    kind=sector.kind,
+                    score=sector.score,
+                    gross_score=sector.gross_score,
+                    risk_deduction=sector.risk_deduction,
+                    confidence=sector.confidence,
+                    state=sector.state,
+                    scoring_version=sector.scoring_version,
+                    quality=sector.quality,
+                    source=sector.source,
+                    observed_at=to_utc_naive_datetime(sector.observed_at),
+                    factors_json=_dump(sector_data["factors"]),
+                    risk_reasons_json=_dump(sector_data["risk_reasons"]),
+                    missing_fields_json=_dump(sector_data["missing_fields"]),
+                    observation_json=_dump(sector_data["observation"]),
+                )
+            )
+        return int(run.id)
 
     @staticmethod
     def _validate_snapshot_traceability(snapshot: RadarRunSnapshot) -> None:
@@ -222,17 +251,34 @@ class MarketRadarRepository:
             ).scalar_one_or_none()
             if run is None:
                 return None
-            sectors = self._list_sector_snapshots_in_session(session, int(run.id))
-            return RadarRunSnapshot(
-                run_key=run.run_key,
-                market=run.market,
-                trigger=run.trigger,
-                as_of=_aware(run.as_of),
-                quality=run.quality,
-                scoring_version=run.scoring_version,
-                sectors=sectors,
-                provider_trace=json.loads(run.provider_trace_json or "[]"),
-            )
+            return self._snapshot_from_run_in_session(session, run)
+
+    def get_run(self, run_id: int) -> RadarRunSnapshot | None:
+        with self.db.get_session() as session:
+            run = session.execute(
+                select(RadarRunRecord).where(RadarRunRecord.id == run_id)
+            ).scalar_one_or_none()
+            if run is None:
+                return None
+            return self._snapshot_from_run_in_session(session, run)
+
+    @classmethod
+    def _snapshot_from_run_in_session(
+        cls,
+        session: Any,
+        run: RadarRunRecord,
+    ) -> RadarRunSnapshot:
+        sectors = cls._list_sector_snapshots_in_session(session, int(run.id))
+        return RadarRunSnapshot(
+            run_key=run.run_key,
+            market=run.market,
+            trigger=run.trigger,
+            as_of=_aware(run.as_of),
+            quality=run.quality,
+            scoring_version=run.scoring_version,
+            sectors=sectors,
+            provider_trace=json.loads(run.provider_trace_json or "[]"),
+        )
 
     def list_sector_snapshots(self, run_id: int) -> list[SectorScore]:
         with self.db.get_session() as session:

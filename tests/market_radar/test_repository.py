@@ -253,6 +253,16 @@ def test_save_run_is_idempotent_and_preserves_first_snapshot(isolated_db) -> Non
     assert repo.list_sector_snapshots(first_id) == list(original.sectors)
 
 
+def test_get_run_reconstructs_the_exact_snapshot_by_id(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    snapshot = _snapshot()
+
+    run_id = repo.save_run(snapshot)
+
+    assert repo.get_run(run_id) == snapshot
+    assert repo.get_run(run_id + 1) is None
+
+
 def test_save_run_retries_one_integrity_race_then_succeeds(
     isolated_db,
     monkeypatch,

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Callable, Literal
+from zoneinfo import ZoneInfo
 
 from src.market_radar.models import DataQuality, RadarRunSnapshot
 from src.market_radar.providers import MarketRadarProvider
 from src.market_radar.ranking import RankingConfig, score_sectors
 from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.universe import UniverseLoader
+
+
+_CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class MarketRadarService:
@@ -36,11 +40,13 @@ class MarketRadarService:
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar Phase 1 supports market=cn only")
-        effective_as_of = as_of or self.clock()
-        if effective_as_of.tzinfo is None or effective_as_of.utcoffset() is None:
+        requested_as_of = as_of if as_of is not None else self.clock()
+        if requested_as_of.tzinfo is None or requested_as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
+        effective_as_of = requested_as_of.astimezone(timezone.utc)
 
-        universe = self.universe_loader.load(effective_as_of.date())
+        market_date = effective_as_of.astimezone(_CN_MARKET_TIMEZONE).date()
+        universe = self.universe_loader.load(market_date)
         batch = self.provider.fetch(market, effective_as_of, universe)
         sectors = score_sectors(batch.observations, self.ranking_config)
         snapshot = RadarRunSnapshot(
@@ -62,13 +68,17 @@ class MarketRadarService:
                 item.sector_id: item for item in batch.discovered_sectors
             }
             combined_universe.update({item.sector_id: item for item in universe})
-            self.repository.sync_universe(
+            run_id = self.repository.save_run_with_universe(
                 sorted(
                     combined_universe.values(),
                     key=lambda item: (item.kind, item.sector_id),
-                )
+                ),
+                snapshot,
             )
-            self.repository.save_run(snapshot)
+            stored_snapshot = self.repository.get_run(run_id)
+            if stored_snapshot is None:
+                raise RuntimeError(f"Persisted Market Radar run {run_id} was not found")
+            return stored_snapshot
         return snapshot
 
     @staticmethod
