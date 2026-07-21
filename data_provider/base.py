@@ -3690,7 +3690,7 @@ class DataFetcherManager:
                         }
                     )
                     return data[0] or [], data[1] or [], source_chain, ""
-                last_error = f"{fetcher.name} returned an empty result"
+                last_error = f"{fetcher.name}返回空结果"
                 source_chain.append(
                     {
                         "provider": fetcher.name,

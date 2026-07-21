@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,7 +57,7 @@ class LegacyRankingProvider:
         )
         for kind, fetch in datasets:
             top, bottom, source_chain, last_error = fetch(self.limit)
-            rows = self._dedupe_rows([*top, *bottom])
+            raw_rows = [*top, *bottom]
             trace.extend({"dataset": kind, **entry} for entry in source_chain)
             successful_source = next(
                 (
@@ -66,7 +67,7 @@ class LegacyRankingProvider:
                 ),
                 f"{kind}_rankings_unavailable",
             )
-            if not rows and last_error:
+            if not raw_rows and last_error:
                 trace.append(
                     {
                         "dataset": kind,
@@ -75,7 +76,10 @@ class LegacyRankingProvider:
                         "error": last_error,
                     }
                 )
-            for row in rows:
+            resolved_rows: dict[
+                str, tuple[dict[str, Any], str, SectorDefinition | None]
+            ] = {}
+            for row in raw_rows:
                 name = str(row.get("name") or "").strip()
                 if not name:
                     continue
@@ -85,6 +89,9 @@ class LegacyRankingProvider:
                     if definition
                     else canonical_sector_id(kind, name)
                 )
+                resolved_rows.setdefault(sector_id, (dict(row), name, definition))
+
+            for sector_id, (row, name, definition) in resolved_rows.items():
                 if definition is None:
                     discovered_by_id.setdefault(
                         sector_id,
@@ -95,6 +102,7 @@ class LegacyRankingProvider:
                             effective_from=as_of.date(),
                         ),
                     )
+                change_pct = self._finite_change_pct(row.get("change_pct"))
                 observations.append(
                     SectorObservation(
                         sector_id=sector_id,
@@ -104,11 +112,11 @@ class LegacyRankingProvider:
                         source=successful_source,
                         freshness_seconds=0,
                         quality="partial",
-                        return_1d_pct=float(row["change_pct"]),
+                        return_1d_pct=change_pct,
                         missing_fields=tuple(
                             field
                             for field in SectorObservation.tracked_metric_fields
-                            if field != "return_1d_pct"
+                            if change_pct is None or field != "return_1d_pct"
                         ),
                         raw_reference=dict(row),
                     )
@@ -126,11 +134,12 @@ class LegacyRankingProvider:
     def _name_key(name: str) -> str:
         return "".join(str(name or "").strip().lower().split())
 
-    @classmethod
-    def _dedupe_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        by_name: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            key = cls._name_key(str(row.get("name") or ""))
-            if key:
-                by_name[key] = dict(row)
-        return list(by_name.values())
+    @staticmethod
+    def _finite_change_pct(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            return None
+        return converted if math.isfinite(converted) else None
