@@ -5,11 +5,13 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import and_, desc, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from src.market_radar.models import (
     EtfDefinition,
     RadarRunSnapshot,
     SectorDefinition,
+    SectorObservation,
     SectorScore,
 )
 from src.storage import (
@@ -34,6 +36,15 @@ def _aware(value: datetime) -> datetime:
 class MarketRadarRepository:
     def __init__(self, db: DatabaseManager | None = None) -> None:
         self.db = db or DatabaseManager.get_instance()
+
+    def _run_idempotent_write(self, operation_name: str, operation: Any) -> Any:
+        try:
+            return self.db._run_write_transaction(operation_name, operation)
+        except IntegrityError:
+            return self.db._run_write_transaction(
+                f"{operation_name}[integrity-retry]",
+                operation,
+            )
 
     def sync_universe(self, sectors: list[SectorDefinition]) -> None:
         if any(sector.market != "cn" for sector in sectors):
@@ -73,7 +84,7 @@ class MarketRadarRepository:
                     for field, value in fields.items():
                         setattr(row, field, value)
 
-        self.db._run_write_transaction("sync_market_radar_universe", write)
+        self._run_idempotent_write("sync_market_radar_universe", write)
 
     def list_universe(self, as_of: date) -> list[SectorDefinition]:
         with self.db.get_session() as session:
@@ -113,6 +124,8 @@ class MarketRadarRepository:
             ]
 
     def save_run(self, snapshot: RadarRunSnapshot) -> int:
+        self._validate_snapshot_traceability(snapshot)
+
         def write(session: Any) -> int:
             existing_id = session.execute(
                 select(RadarRunRecord.id).where(
@@ -134,11 +147,12 @@ class MarketRadarRepository:
             )
             session.add(run)
             session.flush()
-            for sector in snapshot.sectors:
+            for position, sector in enumerate(snapshot.sectors):
                 sector_data = sector.model_dump(mode="json")
                 session.add(
                     RadarSectorSnapshotRecord(
                         run_id=run.id,
+                        position=position,
                         sector_id=sector.sector_id,
                         name=sector.name,
                         kind=sector.kind,
@@ -159,10 +173,44 @@ class MarketRadarRepository:
                 )
             return int(run.id)
 
-        return self.db._run_write_transaction(
+        return self._run_idempotent_write(
             f"save_market_radar_run[{snapshot.run_key}]",
             write,
         )
+
+    @staticmethod
+    def _validate_snapshot_traceability(snapshot: RadarRunSnapshot) -> None:
+        for sector in snapshot.sectors:
+            if not sector.observation:
+                raise ValueError(
+                    f"SectorScore observation is required for {sector.sector_id}"
+                )
+            try:
+                observation = SectorObservation.model_validate(sector.observation)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid SectorScore observation for {sector.sector_id}: {exc}"
+                ) from exc
+
+            comparisons = {
+                "sector_id": (sector.sector_id, observation.sector_id),
+                "source": (sector.source, observation.source),
+                "observed_at": (
+                    _aware(sector.observed_at),
+                    _aware(observation.observed_at),
+                ),
+                "quality": (sector.quality, observation.quality),
+                "missing_fields": (
+                    sorted(sector.missing_fields),
+                    sorted(observation.missing_fields),
+                ),
+            }
+            for field_name, (score_value, observation_value) in comparisons.items():
+                if score_value != observation_value:
+                    raise ValueError(
+                        f"SectorScore observation {field_name} mismatch for "
+                        f"{sector.sector_id}"
+                    )
 
     def get_latest_run(self, market: str) -> RadarRunSnapshot | None:
         with self.db.get_session() as session:
@@ -199,8 +247,9 @@ class MarketRadarRepository:
             select(RadarSectorSnapshotRecord)
             .where(RadarSectorSnapshotRecord.run_id == run_id)
             .order_by(
-                desc(RadarSectorSnapshotRecord.score),
-                RadarSectorSnapshotRecord.sector_id,
+                RadarSectorSnapshotRecord.position.is_(None),
+                RadarSectorSnapshotRecord.position,
+                RadarSectorSnapshotRecord.id,
             )
         ).scalars().all()
         return [

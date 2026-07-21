@@ -1180,6 +1180,7 @@ class RadarSectorSnapshotRecord(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "sector_id", name="uix_radar_run_sector"),
         Index("idx_radar_sector_history", "sector_id", "observed_at"),
+        Index("idx_radar_sector_run_position", "run_id", "position"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1189,6 +1190,7 @@ class RadarSectorSnapshotRecord(Base):
         nullable=False,
         index=True,
     )
+    position = Column(Integer, nullable=True)
     sector_id = Column(String(160), nullable=False)
     name = Column(String(160), nullable=False)
     kind = Column(String(32), nullable=False)
@@ -1288,6 +1290,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._ensure_market_radar_snapshot_position_schema()
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_intelligence_item_scope_values()
@@ -1310,6 +1313,32 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._SessionLocal = None
             self.__class__._instance = None
             raise
+
+    def _ensure_market_radar_snapshot_position_schema(self) -> None:
+        """Add the nullable ordering column to pre-position SQLite schemas."""
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        table_name = RadarSectorSnapshotRecord.__tablename__
+        if not inspector.has_table(table_name):
+            return
+        existing_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        if "position" not in existing_columns:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_name} ADD COLUMN position INTEGER"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "position"):
+                    raise
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_radar_sector_run_position "
+                f"ON {table_name} (run_id, position)"
+            )
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()
