@@ -420,6 +420,85 @@ sectors:
     ] == [["512401"], ["512402"], ["512403"]]
 
 
+def test_current_discovery_is_bounded_before_future_configured_interval(
+    isolated_db,
+    tmp_path,
+) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        """
+version: 1
+sectors:
+  - kind: industry
+    name: Configured Semiconductor
+    aliases: [Historical Chips]
+    benchmark_code: "000905"
+    effective_from: 2020-01-01
+    effective_to: 2025-12-31
+    etfs:
+      - code: "512401"
+        name: Historical Semiconductor ETF
+        effective_from: 2020-01-01
+        effective_to: 2025-12-31
+  - kind: industry
+    name: Configured Semiconductor
+    aliases: [Configured Chips]
+    benchmark_code: "000300"
+    effective_from: 2027-01-01
+    etfs:
+      - code: "512403"
+        name: Future Semiconductor ETF
+        effective_from: 2027-01-01
+""".strip(),
+        encoding="utf-8",
+    )
+    discovered = SectorDefinition(
+        sector_id="industry:configured-semiconductor",
+        kind="industry",
+        name="configured semiconductor",
+        aliases=["Discovered Chips"],
+        effective_from=date(2026, 7, 21),
+    )
+
+    class DiscoveryProvider:
+        def __init__(self) -> None:
+            self.universes: list[list[SectorDefinition]] = []
+
+        def fetch(self, market, as_of, universe):
+            self.universes.append(universe)
+            return ProviderBatch(
+                observations=[],
+                trace=[],
+                discovered_sectors=[discovered],
+            )
+
+    provider = DiscoveryProvider()
+    repository = MarketRadarRepository(isolated_db)
+    service = MarketRadarService(
+        universe_loader=UniverseLoader(path),
+        provider=provider,
+        repository=repository,
+        ranking_config=RankingConfig(),
+    )
+
+    service.run(as_of=datetime(2026, 7, 21, 6, tzinfo=timezone.utc))
+
+    past = repository.list_universe(date(2025, 12, 31))
+    current = repository.list_universe(date(2026, 12, 31))
+    future = repository.list_universe(date(2027, 1, 1))
+    assert provider.universes == [[]]
+    assert len(past) == 1
+    assert past[0].name == "Configured Semiconductor"
+    assert [etf.code for etf in past[0].etfs] == ["512401"]
+    assert len(current) == 1
+    assert current[0].name == "configured semiconductor"
+    assert len(future) == 1
+    assert future[0].name == "Configured Semiconductor"
+    assert [etf.code for etf in future[0].etfs] == ["512403"]
+    assert current[0].effective_to == date(2026, 12, 31)
+    assert discovered.effective_to is None
+
+
 def test_run_without_persistence_does_not_write() -> None:
     events: list[str] = []
     repository = FakeRepository(events=events)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
-from src.market_radar.models import RadarRunSnapshot, aggregate_run_quality
+from src.market_radar.models import (
+    RadarRunSnapshot,
+    SectorDefinition,
+    aggregate_run_quality,
+)
 from src.market_radar.providers import MarketRadarProvider
 from src.market_radar.ranking import RankingConfig, score_sectors
 from src.market_radar.repository import MarketRadarRepository
@@ -12,6 +16,50 @@ from src.market_radar.universe import UniverseLoader
 
 
 _CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _merge_discovered_sectors(
+    configured_history: list[SectorDefinition],
+    discovered_sectors: list[SectorDefinition],
+) -> list[SectorDefinition]:
+    configured_by_id: dict[str, list[SectorDefinition]] = {}
+    for configured in configured_history:
+        configured_by_id.setdefault(configured.sector_id, []).append(configured)
+
+    merged: list[SectorDefinition] = []
+    for discovered in discovered_sectors:
+        intervals = configured_by_id.get(discovered.sector_id, [])
+        if any(
+            configured.effective_from <= discovered.effective_from
+            and (
+                configured.effective_to is None
+                or configured.effective_to >= discovered.effective_from
+            )
+            for configured in intervals
+        ):
+            continue
+
+        future_starts = [
+            configured.effective_from
+            for configured in intervals
+            if configured.effective_from > discovered.effective_from
+        ]
+        if not future_starts:
+            merged.append(discovered)
+            continue
+
+        boundary = min(future_starts) - timedelta(days=1)
+        if (
+            discovered.effective_to is not None
+            and discovered.effective_to <= boundary
+        ):
+            merged.append(discovered)
+            continue
+
+        payload = discovered.model_dump(mode="python")
+        payload["effective_to"] = boundary
+        merged.append(SectorDefinition.model_validate(payload))
+    return merged
 
 
 class MarketRadarService:
@@ -71,13 +119,11 @@ class MarketRadarService:
             provider_trace=batch.trace,
         )
         if persist:
-            active_configured_ids = {item.sector_id for item in universe}
             combined_universe = [
                 *configured_history,
-                *(
-                    item
-                    for item in batch.discovered_sectors
-                    if item.sector_id not in active_configured_ids
+                *_merge_discovered_sectors(
+                    configured_history,
+                    batch.discovered_sectors,
                 ),
             ]
             run_id = repository.save_run_with_universe(
