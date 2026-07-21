@@ -12,7 +12,7 @@ class ReplayFrame(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     as_of: datetime
-    observations: list[SectorObservation]
+    observations: tuple[SectorObservation, ...]
 
 
 class MarketRadarReplayEngine:
@@ -25,13 +25,15 @@ class MarketRadarReplayEngine:
         for frame in frames:
             if frame.as_of.tzinfo is None or frame.as_of.utcoffset() is None:
                 raise ValueError("replay as_of must be timezone-aware")
-            if previous is not None and frame.as_of < previous:
+            frame_as_of_utc = frame.as_of.astimezone(timezone.utc)
+            if previous is not None and frame_as_of_utc < previous:
                 raise ValueError("replay frames must be in chronological order")
             for item in frame.observations:
-                if item.observed_at > frame.as_of:
+                observed_at_utc = item.observed_at.astimezone(timezone.utc)
+                if observed_at_utc > frame_as_of_utc:
                     raise ValueError("future observation is not allowed in replay")
 
-            sectors = score_sectors(frame.observations, self.ranking_config)
+            sectors = score_sectors(list(frame.observations), self.ranking_config)
             quality: DataQuality = (
                 "unavailable" if not frame.observations else "partial"
             )
@@ -43,7 +45,7 @@ class MarketRadarReplayEngine:
                 RadarRunSnapshot(
                     run_key=(
                         "cn:"
-                        f"{frame.as_of.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}:"
+                        f"{frame_as_of_utc:%Y%m%dT%H%M%SZ}:"
                         "replay"
                     ),
                     market="cn",
@@ -55,5 +57,5 @@ class MarketRadarReplayEngine:
                     provider_trace=[{"source": "replay_frame", "result": "ok"}],
                 )
             )
-            previous = frame.as_of
+            previous = frame_as_of_utc
         return snapshots

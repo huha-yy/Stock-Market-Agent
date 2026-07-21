@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -89,6 +90,33 @@ def test_replay_allows_duplicate_frame_times_and_preserves_input_order() -> None
     ] == [1.0, 2.0]
 
 
+def test_second_precision_keys_collide_for_distinct_subsecond_instants() -> None:
+    first = START.replace(microsecond=100)
+    second = START.replace(microsecond=900)
+    frames = [
+        ReplayFrame(as_of=first, observations=[]),
+        ReplayFrame(as_of=second, observations=[]),
+    ]
+
+    snapshots = MarketRadarReplayEngine(RankingConfig()).replay(frames)
+
+    assert first < second
+    assert snapshots[0].run_key == snapshots[1].run_key
+
+
+def test_replay_frame_copies_input_into_an_immutable_observation_tuple() -> None:
+    first = observation(START, 1.0)
+    second = observation(START, 2.0)
+    caller_observations = [first]
+
+    frame = ReplayFrame(as_of=START, observations=caller_observations)
+    caller_observations.append(second)
+
+    assert frame.observations == (first,)
+    with pytest.raises(AttributeError):
+        frame.observations.append(second)
+
+
 def test_replay_compares_frame_order_by_absolute_instant_across_timezones() -> None:
     cn_start = datetime(
         2026,
@@ -153,6 +181,38 @@ def test_replay_rejects_out_of_order_frames_across_timezones() -> None:
 
     with pytest.raises(ValueError, match="chronological order"):
         MarketRadarReplayEngine(RankingConfig()).replay(frames)
+
+
+def test_replay_rejects_out_of_order_dst_folds_with_same_zoneinfo() -> None:
+    zone = ZoneInfo("America/New_York")
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    later = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    frames = [
+        ReplayFrame(as_of=later, observations=[]),
+        ReplayFrame(as_of=earlier, observations=[]),
+    ]
+
+    assert earlier == later
+    assert earlier.astimezone(timezone.utc) < later.astimezone(timezone.utc)
+    with pytest.raises(ValueError, match="chronological order"):
+        MarketRadarReplayEngine(RankingConfig()).replay(frames)
+
+
+def test_replay_rejects_future_observation_in_later_dst_fold() -> None:
+    zone = ZoneInfo("America/New_York")
+    frame_as_of = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=0)
+    future_observed_at = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    frame = ReplayFrame(
+        as_of=frame_as_of,
+        observations=[observation(future_observed_at, 1.0)],
+    )
+
+    assert future_observed_at == frame_as_of
+    assert future_observed_at.astimezone(timezone.utc) > frame_as_of.astimezone(
+        timezone.utc
+    )
+    with pytest.raises(ValueError, match="future observation"):
+        MarketRadarReplayEngine(RankingConfig()).replay([frame])
 
 
 def test_replay_rejects_timezone_naive_frame() -> None:
