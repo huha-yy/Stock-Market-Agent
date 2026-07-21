@@ -13,6 +13,24 @@ from src.market_radar.models import (
 
 
 NOW = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
+TRACKED_METRICS = [
+    "return_1d_pct",
+    "return_5d_pct",
+    "return_20d_pct",
+    "benchmark_return_20d_pct",
+    "capital_flow_1d",
+    "capital_flow_5d",
+    "capital_flow_20d",
+    "turnover_ratio_20d",
+    "up_count",
+    "down_count",
+    "flat_count",
+    "volatility_ratio_20d",
+    "distance_ma20_pct",
+    "concentration_ratio",
+    "catalyst_score",
+]
+MISSING_EXCEPT_RETURN_1D = TRACKED_METRICS[1:]
 
 
 def test_sector_definition_rejects_non_cn_market() -> None:
@@ -36,12 +54,12 @@ def test_observation_keeps_missing_fields_and_provenance() -> None:
         freshness_seconds=12,
         quality="partial",
         return_1d_pct=2.5,
-        missing_fields=["return_20d_pct", "capital_flow_5d"],
+        missing_fields=MISSING_EXCEPT_RETURN_1D,
     )
 
     assert observation.market == "cn"
     assert observation.return_20d_pct is None
-    assert observation.missing_fields == ["return_20d_pct", "capital_flow_5d"]
+    assert observation.missing_fields == MISSING_EXCEPT_RETURN_1D
 
 
 def test_run_snapshot_requires_unique_sector_ids() -> None:
@@ -143,7 +161,7 @@ def test_contract_containers_are_deeply_immutable_and_serializable() -> None:
         source="akshare_industry",
         freshness_seconds=12,
         quality="partial",
-        missing_fields=["return_20d_pct"],
+        missing_fields=TRACKED_METRICS,
         raw_reference={"providers": [{"name": "akshare"}]},
     )
     score = SectorScore(
@@ -210,4 +228,60 @@ def test_run_snapshot_rejects_non_cn_v1_scoring_version() -> None:
             scoring_version="cn-v2",
             sectors=[],
             provider_trace=[],
+        )
+
+
+def test_observation_rejects_empty_provenance_when_metrics_are_missing() -> None:
+    with pytest.raises(ValidationError, match="missing_fields"):
+        SectorObservation(
+            sector_id="industry:semiconductor",
+            name="Semiconductor",
+            kind="industry",
+            observed_at=NOW,
+            source="akshare_industry",
+            freshness_seconds=12,
+            quality="partial",
+            missing_fields=[],
+        )
+
+
+def test_observation_rejects_incomplete_missing_field_provenance() -> None:
+    with pytest.raises(ValidationError, match="missing_fields"):
+        SectorObservation(
+            sector_id="industry:semiconductor",
+            name="Semiconductor",
+            kind="industry",
+            observed_at=NOW,
+            source="akshare_industry",
+            freshness_seconds=12,
+            quality="partial",
+            missing_fields=TRACKED_METRICS[:-1],
+        )
+
+
+def test_observation_rejects_unknown_missing_field_provenance() -> None:
+    with pytest.raises(ValidationError, match="unknown"):
+        SectorObservation(
+            sector_id="industry:semiconductor",
+            name="Semiconductor",
+            kind="industry",
+            observed_at=NOW,
+            source="akshare_industry",
+            freshness_seconds=12,
+            quality="partial",
+            missing_fields=["non_metric"],
+        )
+
+
+def test_observation_rejects_duplicate_missing_field_provenance() -> None:
+    with pytest.raises(ValidationError, match="duplicates"):
+        SectorObservation(
+            sector_id="industry:semiconductor",
+            name="Semiconductor",
+            kind="industry",
+            observed_at=NOW,
+            source="akshare_industry",
+            freshness_seconds=12,
+            quality="partial",
+            missing_fields=TRACKED_METRICS + ["return_1d_pct"],
         )

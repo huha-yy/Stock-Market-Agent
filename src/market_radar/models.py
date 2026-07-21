@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -109,6 +109,24 @@ class SectorDefinition(FrozenModel):
 
 
 class SectorObservation(FrozenModel):
+    tracked_metric_fields: ClassVar[tuple[str, ...]] = (
+        "return_1d_pct",
+        "return_5d_pct",
+        "return_20d_pct",
+        "benchmark_return_20d_pct",
+        "capital_flow_1d",
+        "capital_flow_5d",
+        "capital_flow_20d",
+        "turnover_ratio_20d",
+        "up_count",
+        "down_count",
+        "flat_count",
+        "volatility_ratio_20d",
+        "distance_ma20_pct",
+        "concentration_ratio",
+        "catalyst_score",
+    )
+
     sector_id: str = Field(min_length=3)
     market: MarketRadarMarket = "cn"
     kind: SectorKind
@@ -142,6 +160,29 @@ class SectorObservation(FrozenModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("observed_at must be timezone-aware")
         return value
+
+    @model_validator(mode="after")
+    def validate_missing_field_provenance(self) -> "SectorObservation":
+        declared_fields = list(self.missing_fields)
+        declared_set = set(declared_fields)
+        if len(declared_fields) != len(declared_set):
+            raise ValueError("missing_fields must not contain duplicates")
+
+        tracked_fields = set(self.tracked_metric_fields)
+        unknown_fields = declared_set - tracked_fields
+        if unknown_fields:
+            raise ValueError("missing_fields contains unknown metric names")
+
+        absent_fields = {
+            field_name
+            for field_name in self.tracked_metric_fields
+            if getattr(self, field_name) is None
+        }
+        if declared_set != absent_fields:
+            raise ValueError(
+                "missing_fields must exactly list tracked metrics whose values are None"
+            )
+        return self
 
 
 class FactorBreakdown(FrozenModel):
