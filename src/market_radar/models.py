@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import date, datetime
+from types import MappingProxyType
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 MarketRadarMarket = Literal["cn"]
@@ -19,53 +29,48 @@ SectorState = Literal[
 ]
 
 
-class FrozenList(list[Any]):
-    """A list-compatible container that rejects in-place mutation."""
+class FrozenMapping(Mapping[str, Any]):
+    """A recursively frozen mapping that is not a mutable dict subclass."""
 
-    @staticmethod
-    def _immutable(*args: Any, **kwargs: Any) -> None:
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
+
+    def __setattr__(self, name: str, value: Any) -> None:
         raise TypeError("canonical contract containers are immutable")
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
+    def __getitem__(self, key: str) -> Any:
+        return self._values[key]
 
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
 
-class FrozenDict(dict[str, Any]):
-    """A dict-compatible container that rejects in-place mutation."""
-
-    @staticmethod
-    def _immutable(*args: Any, **kwargs: Any) -> None:
-        raise TypeError("canonical contract containers are immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __ior__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 def _freeze(value: Any) -> Any:
-    if isinstance(value, dict):
-        return FrozenDict({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return FrozenList(_freeze(item) for item in value)
-    if isinstance(value, tuple):
+    if isinstance(value, Mapping):
+        return FrozenMapping({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, set):
         return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _thaw_for_serialization(value: Any, mode: str) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode=mode)
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_for_serialization(item, mode) for key, item in value.items()
+        }
+    if isinstance(value, (tuple, frozenset)):
+        return [_thaw_for_serialization(item, mode) for item in value]
+    if mode == "json" and isinstance(value, (date, datetime)):
+        return value.isoformat()
     return value
 
 
@@ -77,6 +82,13 @@ class FrozenModel(BaseModel):
         for field_name in type(self).model_fields:
             object.__setattr__(self, field_name, _freeze(getattr(self, field_name)))
         return self
+
+    @model_serializer(mode="plain")
+    def serialize_public_containers(self, info: SerializationInfo) -> dict[str, Any]:
+        return {
+            field_name: _thaw_for_serialization(getattr(self, field_name), info.mode)
+            for field_name in type(self).model_fields
+        }
 
 
 class EtfDefinition(FrozenModel):
@@ -93,9 +105,9 @@ class SectorDefinition(FrozenModel):
     market: MarketRadarMarket = "cn"
     kind: SectorKind
     name: str = Field(min_length=1)
-    aliases: list[str] = Field(default_factory=list)
+    aliases: tuple[str, ...] = Field(default_factory=tuple)
     benchmark_code: str | None = None
-    etfs: list[EtfDefinition] = Field(default_factory=list)
+    etfs: tuple[EtfDefinition, ...] = Field(default_factory=tuple)
     effective_from: date
     effective_to: date | None = None
 
@@ -151,8 +163,8 @@ class SectorObservation(FrozenModel):
     price_flow_divergence: bool = False
     concentration_ratio: float | None = Field(default=None, ge=0, le=1)
     catalyst_score: float | None = Field(default=None, ge=0, le=1)
-    missing_fields: list[str]
-    raw_reference: dict[str, Any] = Field(default_factory=dict)
+    missing_fields: tuple[str, ...]
+    raw_reference: Mapping[str, Any] = Field(default_factory=dict)
 
     @field_validator("observed_at")
     @classmethod
@@ -204,13 +216,13 @@ class SectorScore(FrozenModel):
     score: float = Field(ge=0, le=100)
     confidence: float = Field(ge=0, le=1)
     state: SectorState
-    factors: FactorBreakdown | dict[str, Any]
-    risk_reasons: list[str]
-    missing_fields: list[str]
+    factors: FactorBreakdown | Mapping[str, Any]
+    risk_reasons: tuple[str, ...]
+    missing_fields: tuple[str, ...]
     source: str
     observed_at: datetime
     quality: DataQuality
-    observation: dict[str, Any] = Field(default_factory=dict)
+    observation: Mapping[str, Any] = Field(default_factory=dict)
 
 
 class RadarRunSnapshot(FrozenModel):
@@ -220,8 +232,8 @@ class RadarRunSnapshot(FrozenModel):
     as_of: datetime
     quality: DataQuality
     scoring_version: Literal["cn-v1"]
-    sectors: list[SectorScore]
-    provider_trace: list[dict[str, Any]]
+    sectors: tuple[SectorScore, ...]
+    provider_trace: tuple[Mapping[str, Any], ...]
 
     @model_validator(mode="after")
     def require_unique_sectors(self) -> "RadarRunSnapshot":

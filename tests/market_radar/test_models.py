@@ -1,3 +1,4 @@
+import warnings
 from datetime import date, datetime, timezone
 
 import pytest
@@ -59,7 +60,7 @@ def test_observation_keeps_missing_fields_and_provenance() -> None:
 
     assert observation.market == "cn"
     assert observation.return_20d_pct is None
-    assert observation.missing_fields == MISSING_EXCEPT_RETURN_1D
+    assert tuple(observation.missing_fields) == tuple(MISSING_EXCEPT_RETURN_1D)
 
 
 def test_run_snapshot_requires_unique_sector_ids() -> None:
@@ -193,28 +194,61 @@ def test_contract_containers_are_deeply_immutable_and_serializable() -> None:
         provider_trace=[{"provider": {"name": "akshare"}}],
     )
 
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         definition.aliases.append("Semis")
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         definition.etfs.append(etf)
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         observation.missing_fields.append("capital_flow_5d")
     with pytest.raises(TypeError):
         observation.raw_reference["providers"][0]["name"] = "other"
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         score.risk_reasons.append("volatility")
     with pytest.raises(TypeError):
         score.factors["trend"]["value"] = 10.0
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         score.observation["details"].append("stale")
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         snapshot.sectors.append(score)
     with pytest.raises(TypeError):
         snapshot.provider_trace[0]["provider"]["name"] = "other"
 
-    assert snapshot.model_dump()["provider_trace"] == [
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        python_dump = snapshot.model_dump()
+        json_dump = snapshot.model_dump(mode="json")
+    assert python_dump["provider_trace"] == [{"provider": {"name": "akshare"}}]
+    assert json_dump["provider_trace"] == [
         {"provider": {"name": "akshare"}}
     ]
+    assert not captured_warnings
+
+
+def test_contract_containers_reject_builtin_mutation_descriptors() -> None:
+    definition = SectorDefinition(
+        sector_id="industry:semiconductor",
+        kind="industry",
+        name="Semiconductor",
+        aliases=["Chips"],
+        effective_from=date(2026, 1, 1),
+    )
+    observation = SectorObservation(
+        sector_id="industry:semiconductor",
+        name="Semiconductor",
+        kind="industry",
+        observed_at=NOW,
+        source="akshare_industry",
+        freshness_seconds=12,
+        quality="partial",
+        missing_fields=TRACKED_METRICS,
+        raw_reference={"provider": "akshare"},
+    )
+
+    with pytest.raises(TypeError):
+        list.append(definition.aliases, "Semis")
+    with pytest.raises(TypeError):
+        dict.__setitem__(observation.raw_reference, "x", 1)
+    with pytest.raises(TypeError):
+        observation.raw_reference._values = {}
 
 
 def test_run_snapshot_rejects_non_cn_v1_scoring_version() -> None:
