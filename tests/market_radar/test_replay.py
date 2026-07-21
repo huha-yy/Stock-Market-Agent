@@ -254,7 +254,7 @@ def test_replay_scores_are_exactly_the_direct_ranking_output() -> None:
     [
         ([], "unavailable"),
         ([observation(START, 1.0, quality="complete")], "complete"),
-        ([observation(START, 1.0, quality="stale")], "partial"),
+        ([observation(START, 1.0, quality="stale")], "stale"),
         (
             [
                 observation(START, 1.0, quality="complete"),

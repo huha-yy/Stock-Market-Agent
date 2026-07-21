@@ -17,6 +17,7 @@ from src.market_radar.providers import ProviderBatch
 from src.market_radar.ranking import RankingConfig
 from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.service import MarketRadarService
+from src.market_radar.universe import UniverseLoader
 from src.storage import DatabaseManager
 
 
@@ -79,6 +80,12 @@ class FakeUniverse:
         if self.events is not None:
             self.events.append("load")
         return self.sectors
+
+    def load_with_history(
+        self,
+        as_of: date,
+    ) -> tuple[list[SectorDefinition], list[SectorDefinition]]:
+        return self.load(as_of), self.sectors
 
 
 class FakeProvider:
@@ -354,6 +361,63 @@ def test_persistence_syncs_configured_and_discovered_universe_stably() -> None:
         "industry:shared",
     ]
     assert repository.universe[-1] == configured[0]
+
+
+def test_repeated_service_sync_preserves_etf_history_and_fetches_only_active_etfs(
+    isolated_db,
+    tmp_path,
+) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        """
+version: 1
+sectors:
+  - kind: industry
+    name: Semiconductor
+    effective_from: 2020-01-01
+    etfs:
+      - code: "512401"
+        name: Past ETF
+        effective_from: 2020-01-01
+        effective_to: 2021-12-31
+      - code: "512402"
+        name: Current ETF
+        effective_from: 2022-01-01
+        effective_to: 2026-12-31
+      - code: "512403"
+        name: Future ETF
+        effective_from: 2027-01-01
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class RecordingProvider:
+        def __init__(self) -> None:
+            self.active_etf_codes: list[list[str]] = []
+
+        def fetch(self, market, as_of, universe):
+            self.active_etf_codes.append(
+                [etf.code for sector in universe for etf in sector.etfs]
+            )
+            return ProviderBatch(observations=[], trace=[])
+
+    provider = RecordingProvider()
+    repository = MarketRadarRepository(isolated_db)
+    service = MarketRadarService(
+        universe_loader=UniverseLoader(path),
+        provider=provider,
+        repository=repository,
+        ranking_config=RankingConfig(),
+    )
+
+    service.run(as_of=datetime(2026, 7, 21, 6, tzinfo=timezone.utc))
+    service.run(as_of=datetime(2027, 7, 21, 6, tzinfo=timezone.utc))
+
+    assert provider.active_etf_codes == [["512402"], ["512403"]]
+    assert [
+        [etf.code for etf in repository.list_universe(as_of)[0].etfs]
+        for as_of in [date(2021, 7, 21), date(2026, 7, 21), date(2027, 7, 21)]
+    ] == [["512401"], ["512402"], ["512403"]]
 
 
 def test_run_without_persistence_does_not_write() -> None:

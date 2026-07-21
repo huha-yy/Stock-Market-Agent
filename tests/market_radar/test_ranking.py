@@ -4,7 +4,11 @@ from math import inf, nan
 import pytest
 
 from src.market_radar.models import SectorObservation
-from src.market_radar.ranking import RankingConfig, score_sectors
+from src.market_radar.ranking import (
+    _COVERAGE_WEIGHTS,
+    RankingConfig,
+    score_sectors,
+)
 
 
 NOW = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
@@ -32,6 +36,7 @@ def observation(name: str, sector_id: str, **values: object) -> SectorObservatio
         "flat_count": 0,
         "volatility_ratio_20d": 1.0,
         "distance_ma20_pct": 4.0,
+        "price_flow_divergence": False,
         "concentration_ratio": 0.25,
         "catalyst_score": 0.5,
     }
@@ -89,7 +94,7 @@ def test_missing_data_lowers_confidence_without_becoming_zero_strength() -> None
 
     assert result.factors.trend_momentum > 0
     assert result.gross_score == 54.4444
-    assert result.confidence == 0.3376
+    assert result.confidence == 0.359
     assert result.state == "insufficient_data"
 
 
@@ -221,7 +226,7 @@ def test_zero_is_rankable_evidence_while_missing_is_not() -> None:
 
     assert by_id["industry:zero"].factors.trend_momentum == 12.5
     assert by_id["industry:missing"].factors.trend_momentum == 0.0
-    assert by_id["industry:zero"].confidence == 0.0538
+    assert by_id["industry:zero"].confidence == 0.0513
     assert by_id["industry:missing"].confidence == 0.0
 
 
@@ -269,9 +274,9 @@ def test_score_is_clamped_at_zero() -> None:
             **unavailable_metrics,
             "volatility_ratio_20d": 3.0,
             "distance_ma20_pct": 25.0,
+            "price_flow_divergence": True,
             "concentration_ratio": 0.95,
         },
-        price_flow_divergence=True,
     )
 
     result = score_sectors([risky], RankingConfig())[0]
@@ -294,21 +299,22 @@ def test_observation_evidence_uses_json_serialization() -> None:
 @pytest.mark.parametrize(
     ("missing_field", "expected_confidence"),
     [
-        ("return_1d_pct", 0.9328),
-        ("return_5d_pct", 0.9328),
-        ("return_20d_pct", 0.8522),
-        ("benchmark_return_20d_pct", 0.9194),
-        ("capital_flow_1d", 0.9462),
-        ("capital_flow_5d", 0.9462),
-        ("capital_flow_20d", 0.9462),
-        ("turnover_ratio_20d", 0.9194),
-        ("up_count", 0.9597),
-        ("down_count", 0.9597),
-        ("flat_count", 0.9597),
-        ("volatility_ratio_20d", 0.9194),
-        ("distance_ma20_pct", 0.9355),
-        ("concentration_ratio", 0.9516),
-        ("catalyst_score", 0.9194),
+        ("return_1d_pct", 0.9359),
+        ("return_5d_pct", 0.9359),
+        ("return_20d_pct", 0.859),
+        ("benchmark_return_20d_pct", 0.9231),
+        ("capital_flow_1d", 0.9487),
+        ("capital_flow_5d", 0.9487),
+        ("capital_flow_20d", 0.9487),
+        ("turnover_ratio_20d", 0.9231),
+        ("up_count", 0.9615),
+        ("down_count", 0.9615),
+        ("flat_count", 0.9615),
+        ("volatility_ratio_20d", 0.9231),
+        ("distance_ma20_pct", 0.9385),
+        ("price_flow_divergence", 0.9538),
+        ("concentration_ratio", 0.9538),
+        ("catalyst_score", 0.9231),
     ],
 )
 def test_each_tracked_field_independently_lowers_confidence(
@@ -324,6 +330,11 @@ def test_each_tracked_field_independently_lowers_confidence(
     result = score_sectors([partial], RankingConfig())[0]
 
     assert result.confidence == expected_confidence
+
+
+def test_confidence_coverage_has_130_points_of_authority() -> None:
+    assert _COVERAGE_WEIGHTS["price_flow_divergence"] == 6.0
+    assert sum(_COVERAGE_WEIGHTS.values()) == pytest.approx(130.0)
 
 
 def test_relative_inputs_contribute_independent_cumulative_coverage() -> None:
@@ -352,9 +363,9 @@ def test_relative_inputs_contribute_independent_cumulative_coverage() -> None:
         )
     }
 
-    assert by_id["industry:sector-missing"].confidence == 0.8522
-    assert by_id["industry:benchmark-missing"].confidence == 0.9194
-    assert by_id["industry:both-missing"].confidence == 0.7715
+    assert by_id["industry:sector-missing"].confidence == 0.859
+    assert by_id["industry:benchmark-missing"].confidence == 0.9231
+    assert by_id["industry:both-missing"].confidence == 0.7821
 
 
 def test_multiple_missing_fields_reduce_confidence_additively() -> None:
@@ -368,7 +379,7 @@ def test_multiple_missing_fields_reduce_confidence_additively() -> None:
 
     result = score_sectors([partial], RankingConfig())[0]
 
-    assert result.confidence == 0.8118
+    assert result.confidence == 0.8205
 
 
 def test_incomplete_breadth_is_excluded_from_strength_denominator() -> None:

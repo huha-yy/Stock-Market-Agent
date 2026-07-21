@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal
@@ -27,6 +27,17 @@ SectorState = Literal[
     "avoid",
     "insufficient_data",
 ]
+
+
+def aggregate_run_quality(values: Iterable[DataQuality]) -> DataQuality:
+    qualities = tuple(values)
+    if not qualities or all(value == "unavailable" for value in qualities):
+        return "unavailable"
+    if any(value == "stale" for value in qualities):
+        return "stale"
+    if any(value in {"partial", "unavailable"} for value in qualities):
+        return "partial"
+    return "complete"
 
 
 def _freeze(value: Any) -> Any:
@@ -114,6 +125,7 @@ class SectorObservation(FrozenModel):
         "flat_count",
         "volatility_ratio_20d",
         "distance_ma20_pct",
+        "price_flow_divergence",
         "concentration_ratio",
         "catalyst_score",
     )
@@ -139,7 +151,7 @@ class SectorObservation(FrozenModel):
     flat_count: int | None = Field(default=None, ge=0)
     volatility_ratio_20d: float | None = Field(default=None, ge=0)
     distance_ma20_pct: float | None = None
-    price_flow_divergence: bool = False
+    price_flow_divergence: bool | None = None
     concentration_ratio: float | None = Field(default=None, ge=0, le=1)
     catalyst_score: float | None = Field(default=None, ge=0, le=1)
     missing_fields: tuple[str, ...]

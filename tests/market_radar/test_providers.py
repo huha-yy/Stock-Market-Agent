@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -72,6 +72,19 @@ def test_legacy_adapter_rejects_unsupported_market() -> None:
 
     with pytest.raises(ValueError, match="^Market Radar Phase 1 supports market=cn only$"):
         provider.fetch("hk", NOW, [])
+
+
+def test_discovered_sector_uses_cn_market_date_at_utc_boundary() -> None:
+    boundary = datetime(2026, 7, 20, 16, 30, tzinfo=timezone.utc)
+
+    batch = LegacyRankingProvider(FakeManager(), limit=1000).fetch(
+        "cn", boundary, []
+    )
+
+    assert {item.effective_from for item in batch.discovered_sectors} == {
+        date(2026, 7, 21)
+    }
+    assert all(item.observed_at == boundary for item in batch.observations)
 
 
 @pytest.mark.parametrize(

@@ -125,6 +125,11 @@ class MarketRadarRepository:
                     etfs=[
                         EtfDefinition.model_validate(item)
                         for item in json.loads(row.etfs_json or "[]")
+                        if date.fromisoformat(str(item["effective_from"])) <= as_of
+                        and (
+                            not item.get("effective_to")
+                            or date.fromisoformat(str(item["effective_to"])) >= as_of
+                        )
                     ],
                     effective_from=row.effective_from,
                     effective_to=row.effective_to,

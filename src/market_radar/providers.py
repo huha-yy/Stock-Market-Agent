@@ -3,12 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 import math
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from data_provider import DataFetcherManager
 from src.market_radar.models import SectorDefinition, SectorObservation
 from src.market_radar.universe import canonical_sector_id
+
+
+_CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class ProviderBatch(BaseModel):
@@ -99,7 +103,9 @@ class LegacyRankingProvider:
                             sector_id=sector_id,
                             kind=kind,
                             name=name,
-                            effective_from=as_of.date(),
+                            effective_from=as_of.astimezone(
+                                _CN_MARKET_TIMEZONE
+                            ).date(),
                         ),
                     )
                 change_pct = self._finite_change_pct(row.get("change_pct"))

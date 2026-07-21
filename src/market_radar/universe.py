@@ -22,12 +22,18 @@ class UniverseLoader:
         self.path = Path(path)
 
     def load(self, as_of: date) -> list[SectorDefinition]:
+        active, _history = self.load_with_history(as_of)
+        return active
+
+    def load_with_history(
+        self,
+        as_of: date,
+    ) -> tuple[list[SectorDefinition], list[SectorDefinition]]:
         payload = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         if payload.get("version") != 1:
             raise ValueError("unsupported Market Radar universe version")
 
-        sectors: list[SectorDefinition] = []
-        seen_etfs: set[str] = set()
+        history: list[SectorDefinition] = []
         for raw in payload.get("sectors", []):
             kind = raw["kind"]
             name = str(raw["name"]).strip()
@@ -38,11 +44,6 @@ class UniverseLoader:
                 if raw.get("effective_to")
                 else None
             )
-            if effective_from > as_of or (
-                effective_to is not None and effective_to < as_of
-            ):
-                continue
-
             etfs: list[EtfDefinition] = []
             for item in raw.get("etfs", []):
                 code = str(item["code"])
@@ -52,13 +53,6 @@ class UniverseLoader:
                     if item.get("effective_to")
                     else None
                 )
-                if etf_effective_from > as_of or (
-                    etf_effective_to is not None and etf_effective_to < as_of
-                ):
-                    continue
-                if code in seen_etfs:
-                    raise ValueError(f"duplicate ETF code in universe: {code}")
-                seen_etfs.add(code)
                 etfs.append(
                     EtfDefinition(
                         code=code,
@@ -69,7 +63,7 @@ class UniverseLoader:
                         effective_to=etf_effective_to,
                     )
                 )
-            sectors.append(
+            history.append(
                 SectorDefinition(
                     sector_id=sector_id,
                     kind=kind,
@@ -81,4 +75,30 @@ class UniverseLoader:
                     effective_to=effective_to,
                 )
             )
-        return sorted(sectors, key=lambda sector: (sector.kind, sector.sector_id))
+        history = sorted(
+            history,
+            key=lambda sector: (
+                sector.kind,
+                sector.sector_id,
+                sector.effective_from,
+            ),
+        )
+        active: list[SectorDefinition] = []
+        seen_etfs: set[str] = set()
+        for sector in history:
+            if sector.effective_from > as_of or (
+                sector.effective_to is not None and sector.effective_to < as_of
+            ):
+                continue
+            active_etfs = []
+            for etf in sector.etfs:
+                if etf.effective_from > as_of or (
+                    etf.effective_to is not None and etf.effective_to < as_of
+                ):
+                    continue
+                if etf.code in seen_etfs:
+                    raise ValueError(f"duplicate ETF code in universe: {etf.code}")
+                seen_etfs.add(etf.code)
+                active_etfs.append(etf)
+            active.append(sector.model_copy(update={"etfs": tuple(active_etfs)}))
+        return active, history

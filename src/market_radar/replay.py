@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict
 
-from src.market_radar.models import DataQuality, RadarRunSnapshot, SectorObservation
+from src.market_radar.models import (
+    RadarRunSnapshot,
+    SectorObservation,
+    aggregate_run_quality,
+)
 from src.market_radar.ranking import RankingConfig, score_sectors
 
 
@@ -34,13 +38,9 @@ class MarketRadarReplayEngine:
                     raise ValueError("future observation is not allowed in replay")
 
             sectors = score_sectors(list(frame.observations), self.ranking_config)
-            quality: DataQuality = (
-                "unavailable" if not frame.observations else "partial"
+            quality = aggregate_run_quality(
+                item.quality for item in frame.observations
             )
-            if frame.observations and all(
-                item.quality == "complete" for item in frame.observations
-            ):
-                quality = "complete"
             snapshots.append(
                 RadarRunSnapshot(
                     run_key=(

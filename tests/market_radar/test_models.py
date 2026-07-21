@@ -29,6 +29,7 @@ TRACKED_METRICS = [
     "flat_count",
     "volatility_ratio_20d",
     "distance_ma20_pct",
+    "price_flow_divergence",
     "concentration_ratio",
     "catalyst_score",
 ]
@@ -61,7 +62,29 @@ def test_observation_keeps_missing_fields_and_provenance() -> None:
 
     assert observation.market == "cn"
     assert observation.return_20d_pct is None
+    assert observation.price_flow_divergence is None
     assert tuple(observation.missing_fields) == tuple(MISSING_EXCEPT_RETURN_1D)
+
+
+def test_explicit_false_divergence_is_observed_evidence() -> None:
+    observation = SectorObservation(
+        sector_id="industry:semiconductor",
+        name="Semiconductor",
+        kind="industry",
+        observed_at=NOW,
+        source="akshare_industry",
+        freshness_seconds=12,
+        quality="partial",
+        price_flow_divergence=False,
+        missing_fields=[
+            field
+            for field in TRACKED_METRICS
+            if field != "price_flow_divergence"
+        ],
+    )
+
+    assert observation.price_flow_divergence is False
+    assert "price_flow_divergence" not in observation.missing_fields
 
 
 def test_run_snapshot_requires_unique_sector_ids() -> None:

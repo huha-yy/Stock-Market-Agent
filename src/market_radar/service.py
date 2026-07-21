@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Callable, Literal
 from zoneinfo import ZoneInfo
 
-from src.market_radar.models import DataQuality, RadarRunSnapshot
+from src.market_radar.models import RadarRunSnapshot, aggregate_run_quality
 from src.market_radar.providers import MarketRadarProvider
 from src.market_radar.ranking import RankingConfig, score_sectors
 from src.market_radar.repository import MarketRadarRepository
@@ -49,7 +49,9 @@ class MarketRadarService:
         effective_as_of = requested_as_of.astimezone(timezone.utc)
 
         market_date = effective_as_of.astimezone(_CN_MARKET_TIMEZONE).date()
-        universe = self.universe_loader.load(market_date)
+        universe, configured_history = self.universe_loader.load_with_history(
+            market_date
+        )
         batch = self.provider.fetch(market, effective_as_of, universe)
         sectors = score_sectors(batch.observations, self.ranking_config)
         snapshot = RadarRunSnapshot(
@@ -61,20 +63,31 @@ class MarketRadarService:
             market="cn",
             trigger=trigger,
             as_of=effective_as_of,
-            quality=self._run_quality([item.quality for item in batch.observations]),
+            quality=aggregate_run_quality(
+                item.quality for item in batch.observations
+            ),
             scoring_version=self.ranking_config.scoring_version,
             sectors=sectors,
             provider_trace=batch.trace,
         )
         if persist:
-            combined_universe = {
-                item.sector_id: item for item in batch.discovered_sectors
-            }
-            combined_universe.update({item.sector_id: item for item in universe})
+            active_configured_ids = {item.sector_id for item in universe}
+            combined_universe = [
+                *configured_history,
+                *(
+                    item
+                    for item in batch.discovered_sectors
+                    if item.sector_id not in active_configured_ids
+                ),
+            ]
             run_id = repository.save_run_with_universe(
                 sorted(
-                    combined_universe.values(),
-                    key=lambda item: (item.kind, item.sector_id),
+                    combined_universe,
+                    key=lambda item: (
+                        item.kind,
+                        item.sector_id,
+                        item.effective_from,
+                    ),
                 ),
                 snapshot,
             )
@@ -83,13 +96,3 @@ class MarketRadarService:
                 raise RuntimeError(f"Persisted Market Radar run {run_id} was not found")
             return stored_snapshot
         return snapshot
-
-    @staticmethod
-    def _run_quality(values: list[DataQuality]) -> DataQuality:
-        if not values or all(value == "unavailable" for value in values):
-            return "unavailable"
-        if any(value == "stale" for value in values):
-            return "stale"
-        if any(value in {"partial", "unavailable"} for value in values):
-            return "partial"
-        return "complete"

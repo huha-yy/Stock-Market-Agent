@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 - [新功能] 新增 A 股 Market Radar 第一阶段基础能力，包括板块/ETF 契约、可追溯数据质量、确定性评分、快照持久化、离线回放基础与手动 CLI；暂不包含 Web、API、调度、告警、仓位策略和港股。
+- [修复] 修复 Market Radar 生效日期历史被后续同步覆盖、发现板块使用 UTC 日期、价量背离缺失被误判为否，以及回放 stale 质量降级为 partial 的契约问题。
 - [新功能] 新增 `--portfolio futu`，只读导入 Futu OpenD 真实账户的沪深 A 股、港股、美股 LONG 正股持仓作为分析列表。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

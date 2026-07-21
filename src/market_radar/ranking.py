@@ -36,6 +36,7 @@ _COVERAGE_WEIGHTS = {
     "flat_count": 5.0,
     "volatility_ratio_20d": 10.0,
     "distance_ma20_pct": 8.0,
+    "price_flow_divergence": 6.0,
     "concentration_ratio": 6.0,
     "catalyst_score": 10.0,
 }
@@ -187,7 +188,7 @@ def _risk_deduction(item: SectorObservation) -> tuple[float, list[str]]:
     if item.distance_ma20_pct is not None and item.distance_ma20_pct > 8.0:
         deduction += _linear(item.distance_ma20_pct, 8.0, 20.0, 8.0)
         reasons.append("trend_overheating")
-    if item.price_flow_divergence:
+    if item.price_flow_divergence is True:
         deduction += 6.0
         reasons.append("price_flow_divergence")
     if item.concentration_ratio is not None and item.concentration_ratio > 0.6:
