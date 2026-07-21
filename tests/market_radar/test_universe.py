@@ -45,6 +45,72 @@ sectors:
     assert [item.code for item in sectors[0].etfs] == ["512480"]
 
 
+def test_loader_includes_effective_date_boundaries(tmp_path: Path) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        """
+version: 1
+sectors:
+  - kind: industry
+    name: 半导体
+    effective_from: 2026-07-21
+    effective_to: 2026-07-21
+    etfs:
+      - code: "512480"
+        name: 半导体ETF
+        effective_from: 2026-07-21
+        effective_to: 2026-07-21
+""".strip(),
+        encoding="utf-8",
+    )
+
+    sectors = UniverseLoader(path).load(date(2026, 7, 21))
+
+    assert [sector.sector_id for sector in sectors] == ["industry:半导体"]
+    assert [etf.code for etf in sectors[0].etfs] == ["512480"]
+
+
+def test_loader_returns_sectors_in_deterministic_kind_and_id_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        """
+version: 1
+sectors:
+  - kind: industry
+    name: Zebra
+    effective_from: 2026-01-01
+    etfs: []
+  - kind: concept
+    name: Beta
+    effective_from: 2026-01-01
+    etfs: []
+  - kind: industry
+    name: Alpha
+    effective_from: 2026-01-01
+    etfs: []
+""".strip(),
+        encoding="utf-8",
+    )
+
+    sectors = UniverseLoader(path).load(date(2026, 7, 21))
+
+    assert [(sector.kind, sector.sector_id) for sector in sectors] == [
+        ("concept", "concept:beta"),
+        ("industry", "industry:alpha"),
+        ("industry", "industry:zebra"),
+    ]
+
+
+def test_loader_rejects_unsupported_universe_version(tmp_path: Path) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text("version: 2\nsectors: []\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported Market Radar universe version"):
+        UniverseLoader(path).load(date(2026, 7, 21))
+
+
 def test_loader_rejects_duplicate_active_etf_code(tmp_path: Path) -> None:
     path = tmp_path / "universe.yaml"
     path.write_text(
@@ -71,6 +137,47 @@ sectors:
 
     with pytest.raises(ValueError, match="duplicate ETF code"):
         UniverseLoader(path).load(date(2026, 7, 21))
+
+
+def test_loader_ignores_duplicate_historical_etf_codes(tmp_path: Path) -> None:
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        """
+version: 1
+sectors:
+  - kind: industry
+    name: 历史半导体
+    effective_from: 2020-01-01
+    effective_to: 2024-12-31
+    etfs:
+      - code: "512480"
+        name: 历史半导体ETF
+        effective_from: 2020-01-01
+        effective_to: 2024-12-31
+  - kind: concept
+    name: 历史芯片
+    effective_from: 2020-01-01
+    effective_to: 2024-12-31
+    etfs:
+      - code: "512480"
+        name: 历史芯片ETF
+        effective_from: 2020-01-01
+        effective_to: 2024-12-31
+  - kind: industry
+    name: 半导体
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512480"
+        name: 半导体ETF
+        effective_from: 2026-01-01
+""".strip(),
+        encoding="utf-8",
+    )
+
+    sectors = UniverseLoader(path).load(date(2026, 7, 21))
+
+    assert [sector.sector_id for sector in sectors] == ["industry:半导体"]
+    assert [etf.code for etf in sectors[0].etfs] == ["512480"]
 
 
 def test_repository_seed_contains_no_duplicate_etf_code() -> None:
