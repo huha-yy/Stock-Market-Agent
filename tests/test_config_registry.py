@@ -547,6 +547,15 @@ class TestEnvExampleWebSettingsCoverage(unittest.TestCase):
     _ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
     _ACTIVE_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=")
 
+    def test_market_radar_cli_keys_are_intentionally_hidden_from_web_ui(self) -> None:
+        self.assertTrue(
+            {
+                "MARKET_RADAR_PROVIDER_LIMIT",
+                "MARKET_RADAR_SCORING_VERSION",
+                "MARKET_RADAR_STALE_AFTER_SECONDS",
+            }.issubset(WEB_SETTINGS_HIDDEN_FROM_UI)
+        )
+
     def test_active_env_example_keys_are_registered_or_hidden_from_web_ui(self) -> None:
         active_keys = {
             match.group(1)
