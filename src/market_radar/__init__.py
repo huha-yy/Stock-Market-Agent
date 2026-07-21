@@ -1,3 +1,5 @@
+from importlib import import_module
+
 from src.market_radar.models import (
     DataQuality,
     EtfDefinition,
@@ -8,16 +10,28 @@ from src.market_radar.models import (
     SectorScore,
     SectorState,
 )
-from src.market_radar.providers import (
-    LegacyRankingProvider,
-    MarketRadarProvider,
-    ProviderBatch,
-)
-from src.market_radar.ranking import RankingConfig, score_sectors
-from src.market_radar.replay import MarketRadarReplayEngine, ReplayFrame
-from src.market_radar.repository import MarketRadarRepository
-from src.market_radar.service import MarketRadarService
-from src.market_radar.universe import UniverseLoader
+
+_LAZY_IMPORTS = {
+    "LegacyRankingProvider": "src.market_radar.providers",
+    "MarketRadarProvider": "src.market_radar.providers",
+    "ProviderBatch": "src.market_radar.providers",
+    "RankingConfig": "src.market_radar.ranking",
+    "score_sectors": "src.market_radar.ranking",
+    "MarketRadarReplayEngine": "src.market_radar.replay",
+    "ReplayFrame": "src.market_radar.replay",
+    "MarketRadarRepository": "src.market_radar.repository",
+    "MarketRadarService": "src.market_radar.service",
+    "UniverseLoader": "src.market_radar.universe",
+}
+
+
+def __getattr__(name: str):
+    module_name = _LAZY_IMPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "DataQuality",
