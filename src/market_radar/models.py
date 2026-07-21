@@ -19,8 +19,64 @@ SectorState = Literal[
 ]
 
 
+class FrozenList(list[Any]):
+    """A list-compatible container that rejects in-place mutation."""
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
+        raise TypeError("canonical contract containers are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+class FrozenDict(dict[str, Any]):
+    """A dict-compatible container that rejects in-place mutation."""
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
+        raise TypeError("canonical contract containers are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return FrozenList(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
 class FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def freeze_public_containers(self) -> "FrozenModel":
+        for field_name in type(self).model_fields:
+            object.__setattr__(self, field_name, _freeze(getattr(self, field_name)))
+        return self
 
 
 class EtfDefinition(FrozenModel):
@@ -77,7 +133,7 @@ class SectorObservation(FrozenModel):
     price_flow_divergence: bool = False
     concentration_ratio: float | None = Field(default=None, ge=0, le=1)
     catalyst_score: float | None = Field(default=None, ge=0, le=1)
-    missing_fields: list[str] = Field(default_factory=list)
+    missing_fields: list[str]
     raw_reference: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("observed_at")
