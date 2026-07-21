@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from datetime import date, datetime
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal
@@ -29,30 +29,9 @@ SectorState = Literal[
 ]
 
 
-class FrozenMapping(Mapping[str, Any]):
-    """A recursively frozen mapping that is not a mutable dict subclass."""
-
-    __slots__ = ("_values",)
-
-    def __init__(self, values: Mapping[str, Any]) -> None:
-        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise TypeError("canonical contract containers are immutable")
-
-    def __getitem__(self, key: str) -> Any:
-        return self._values[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._values)
-
-    def __len__(self) -> int:
-        return len(self._values)
-
-
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return FrozenMapping({key: _freeze(item) for key, item in value.items()})
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, set):

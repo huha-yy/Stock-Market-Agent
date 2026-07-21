@@ -1,5 +1,6 @@
 import warnings
 from datetime import date, datetime, timezone
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -247,8 +248,10 @@ def test_contract_containers_reject_builtin_mutation_descriptors() -> None:
         list.append(definition.aliases, "Semis")
     with pytest.raises(TypeError):
         dict.__setitem__(observation.raw_reference, "x", 1)
-    with pytest.raises(TypeError):
+    with pytest.raises(AttributeError):
         observation.raw_reference._values = {}
+    with pytest.raises(AttributeError):
+        object.__setattr__(observation.raw_reference, "_values", MappingProxyType({}))
 
 
 def test_run_snapshot_rejects_non_cn_v1_scoring_version() -> None:
