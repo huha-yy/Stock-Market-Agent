@@ -89,7 +89,7 @@ def test_missing_data_lowers_confidence_without_becoming_zero_strength() -> None
 
     assert result.factors.trend_momentum > 0
     assert result.gross_score == 54.4444
-    assert result.confidence == 0.2267
+    assert result.confidence == 0.3376
     assert result.state == "insufficient_data"
 
 
@@ -221,7 +221,7 @@ def test_zero_is_rankable_evidence_while_missing_is_not() -> None:
 
     assert by_id["industry:zero"].factors.trend_momentum == 12.5
     assert by_id["industry:missing"].factors.trend_momentum == 0.0
-    assert by_id["industry:zero"].confidence == 0.0667
+    assert by_id["industry:zero"].confidence == 0.0538
     assert by_id["industry:missing"].confidence == 0.0
 
 
@@ -294,11 +294,24 @@ def test_observation_evidence_uses_json_serialization() -> None:
 @pytest.mark.parametrize(
     ("missing_field", "expected_confidence"),
     [
-        ("return_5d_pct", 0.9167),
-        ("flat_count", 0.95),
+        ("return_1d_pct", 0.9328),
+        ("return_5d_pct", 0.9328),
+        ("return_20d_pct", 0.8522),
+        ("benchmark_return_20d_pct", 0.9194),
+        ("capital_flow_1d", 0.9462),
+        ("capital_flow_5d", 0.9462),
+        ("capital_flow_20d", 0.9462),
+        ("turnover_ratio_20d", 0.9194),
+        ("up_count", 0.9597),
+        ("down_count", 0.9597),
+        ("flat_count", 0.9597),
+        ("volatility_ratio_20d", 0.9194),
+        ("distance_ma20_pct", 0.9355),
+        ("concentration_ratio", 0.9516),
+        ("catalyst_score", 0.9194),
     ],
 )
-def test_each_missing_tracked_field_lowers_confidence_granularly(
+def test_each_tracked_field_independently_lowers_confidence(
     missing_field: str,
     expected_confidence: float,
 ) -> None:
@@ -311,6 +324,51 @@ def test_each_missing_tracked_field_lowers_confidence_granularly(
     result = score_sectors([partial], RankingConfig())[0]
 
     assert result.confidence == expected_confidence
+
+
+def test_relative_inputs_contribute_independent_cumulative_coverage() -> None:
+    sector_missing = observation(
+        "Sector Missing",
+        "industry:sector-missing",
+        return_20d_pct=None,
+    )
+    benchmark_missing = observation(
+        "Benchmark Missing",
+        "industry:benchmark-missing",
+        benchmark_return_20d_pct=None,
+    )
+    both_missing = observation(
+        "Both Missing",
+        "industry:both-missing",
+        return_20d_pct=None,
+        benchmark_return_20d_pct=None,
+    )
+
+    by_id = {
+        item.sector_id: item
+        for item in score_sectors(
+            [sector_missing, benchmark_missing, both_missing],
+            RankingConfig(),
+        )
+    }
+
+    assert by_id["industry:sector-missing"].confidence == 0.8522
+    assert by_id["industry:benchmark-missing"].confidence == 0.9194
+    assert by_id["industry:both-missing"].confidence == 0.7715
+
+
+def test_multiple_missing_fields_reduce_confidence_additively() -> None:
+    partial = observation(
+        "Multiple Missing",
+        "industry:multiple-missing",
+        return_5d_pct=None,
+        flat_count=None,
+        volatility_ratio_20d=None,
+    )
+
+    result = score_sectors([partial], RankingConfig())[0]
+
+    assert result.confidence == 0.8118
 
 
 def test_incomplete_breadth_is_excluded_from_strength_denominator() -> None:

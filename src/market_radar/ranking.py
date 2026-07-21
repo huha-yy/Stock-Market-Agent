@@ -22,6 +22,24 @@ _FACTOR_WEIGHTS = {
     "catalyst": 10.0,
 }
 
+_COVERAGE_WEIGHTS = {
+    "return_1d_pct": 25.0 / 3.0,
+    "return_5d_pct": 25.0 / 3.0,
+    "return_20d_pct": 25.0 / 3.0 + 10.0,
+    "benchmark_return_20d_pct": 10.0,
+    "capital_flow_1d": 20.0 / 3.0,
+    "capital_flow_5d": 20.0 / 3.0,
+    "capital_flow_20d": 20.0 / 3.0,
+    "turnover_ratio_20d": 10.0,
+    "up_count": 5.0,
+    "down_count": 5.0,
+    "flat_count": 5.0,
+    "volatility_ratio_20d": 10.0,
+    "distance_ma20_pct": 8.0,
+    "concentration_ratio": 6.0,
+    "catalyst_score": 10.0,
+}
+
 
 @dataclass(frozen=True)
 class RankingConfig:
@@ -179,43 +197,22 @@ def _risk_deduction(item: SectorObservation) -> tuple[float, list[str]]:
 
 
 def _confidence(item: SectorObservation) -> float:
-    return_horizons = [
-        item.return_1d_pct,
-        item.return_5d_pct,
-        item.return_20d_pct,
-    ]
-    flow_horizons = [
-        item.capital_flow_1d,
-        item.capital_flow_5d,
-        item.capital_flow_20d,
-    ]
-    breadth_counts = [item.up_count, item.down_count, item.flat_count]
-    weighted_presence = (
-        25.0
-        * sum(value is not None for value in return_horizons)
-        / len(return_horizons)
-        + (
-            20.0
-            if item.return_20d_pct is not None
-            and item.benchmark_return_20d_pct is not None
-            else 0.0
-        )
-        + 20.0
-        * sum(value is not None for value in flow_horizons)
-        / len(flow_horizons)
-        + 15.0
-        * sum(value is not None for value in breadth_counts)
-        / len(breadth_counts)
-        + (10.0 if item.turnover_ratio_20d is not None else 0.0)
-        + (10.0 if item.catalyst_score is not None else 0.0)
+    weighted_presence = sum(
+        weight
+        for field_name, weight in _COVERAGE_WEIGHTS.items()
+        if getattr(item, field_name) is not None
     )
+    total_coverage_weight = sum(_COVERAGE_WEIGHTS.values())
     quality_multiplier = {
         "complete": 1.0,
         "partial": 0.8,
         "stale": 0.4,
         "unavailable": 0.0,
     }[item.quality]
-    return round(weighted_presence / 100.0 * quality_multiplier, 4)
+    return round(
+        weighted_presence / total_coverage_weight * quality_multiplier,
+        4,
+    )
 
 
 def _state(
