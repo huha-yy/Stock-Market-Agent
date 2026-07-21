@@ -1,0 +1,78 @@
+version: 1
+sectors:
+  - kind: industry
+    name: 半导体
+    aliases: [芯片, 半导体设备]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512480"
+        name: 半导体ETF
+        effective_from: 2026-01-01
+      - code: "159995"
+        name: 芯片ETF
+        effective_from: 2026-01-01
+  - kind: industry
+    name: 证券
+    aliases: [券商]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512880"
+        name: 证券ETF
+        effective_from: 2026-01-01
+      - code: "512000"
+        name: 券商ETF
+        effective_from: 2026-01-01
+  - kind: industry
+    name: 银行
+    aliases: []
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512800"
+        name: 银行ETF
+        effective_from: 2026-01-01
+  - kind: industry
+    name: 医药生物
+    aliases: [医药]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512010"
+        name: 医药ETF
+        effective_from: 2026-01-01
+      - code: "159929"
+        name: 医药ETF
+        effective_from: 2026-01-01
+  - kind: concept
+    name: 新能源车
+    aliases: [新能车]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "515030"
+        name: 新能源车ETF
+        effective_from: 2026-01-01
+      - code: "515700"
+        name: 新能车ETF
+        effective_from: 2026-01-01
+  - kind: industry
+    name: 国防军工
+    aliases: [军工]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512660"
+        name: 军工ETF
+        effective_from: 2026-01-01
+  - kind: industry
+    name: 有色金属
+    aliases: [有色]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "512400"
+        name: 有色金属ETF
+        effective_from: 2026-01-01
+  - kind: concept
+    name: 光伏
+    aliases: [光伏设备]
+    effective_from: 2026-01-01
+    etfs:
+      - code: "515790"
+        name: 光伏ETF
+        effective_from: 2026-01-01
