@@ -1033,6 +1033,9 @@ class Config:
     # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、jp(日股)、kr(韩股)、both(全部市场)
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
+    market_radar_provider_limit: int = 1000
+    market_radar_stale_after_seconds: int = 2700
+    market_radar_scoring_version: str = "cn-v1"
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
@@ -1986,6 +1989,24 @@ class Config:
             ),
             market_review_color_scheme=cls._parse_market_review_color_scheme(
                 os.getenv('MARKET_REVIEW_COLOR_SCHEME', 'green_up')
+            ),
+            market_radar_provider_limit=parse_env_int(
+                os.getenv('MARKET_RADAR_PROVIDER_LIMIT'),
+                1000,
+                field_name='MARKET_RADAR_PROVIDER_LIMIT',
+                minimum=10,
+                maximum=5000,
+            ),
+            market_radar_stale_after_seconds=parse_env_int(
+                os.getenv('MARKET_RADAR_STALE_AFTER_SECONDS'),
+                2700,
+                field_name='MARKET_RADAR_STALE_AFTER_SECONDS',
+                minimum=60,
+                maximum=86400,
+            ),
+            market_radar_scoring_version=(
+                os.getenv('MARKET_RADAR_SCORING_VERSION', 'cn-v1').strip()
+                or 'cn-v1'
             ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
