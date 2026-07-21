@@ -1131,6 +1131,83 @@ class DecisionSignalFeedbackRecord(Base):
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
 
 
+class RadarUniverseRecord(Base):
+    __tablename__ = "radar_universe"
+    __table_args__ = (
+        UniqueConstraint(
+            "sector_id",
+            "effective_from",
+            name="uix_radar_universe_effective",
+        ),
+        Index("idx_radar_universe_market_kind", "market", "kind"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sector_id = Column(String(160), nullable=False)
+    market = Column(String(16), nullable=False, default="cn")
+    kind = Column(String(32), nullable=False)
+    name = Column(String(160), nullable=False)
+    aliases_json = Column(Text, nullable=False, default="[]")
+    benchmark_code = Column(String(64), nullable=True)
+    etfs_json = Column(Text, nullable=False, default="[]")
+    effective_from = Column(Date, nullable=False)
+    effective_to = Column(Date, nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=utc_naive_now,
+        onupdate=utc_naive_now,
+        nullable=False,
+    )
+
+
+class RadarRunRecord(Base):
+    __tablename__ = "radar_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_key = Column(String(160), nullable=False, unique=True, index=True)
+    market = Column(String(16), nullable=False, index=True)
+    trigger = Column(String(32), nullable=False)
+    as_of = Column(DateTime, nullable=False, index=True)
+    quality = Column(String(32), nullable=False)
+    scoring_version = Column(String(32), nullable=False)
+    provider_trace_json = Column(Text, nullable=False, default="[]")
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarSectorSnapshotRecord(Base):
+    __tablename__ = "radar_sector_snapshots"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sector_id", name="uix_radar_run_sector"),
+        Index("idx_radar_sector_history", "sector_id", "observed_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sector_id = Column(String(160), nullable=False)
+    name = Column(String(160), nullable=False)
+    kind = Column(String(32), nullable=False)
+    score = Column(Float, nullable=False)
+    gross_score = Column(Float, nullable=False)
+    risk_deduction = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+    state = Column(String(32), nullable=False)
+    scoring_version = Column(String(32), nullable=False)
+    quality = Column(String(32), nullable=False)
+    source = Column(String(128), nullable=False)
+    observed_at = Column(DateTime, nullable=False)
+    factors_json = Column(Text, nullable=False, default="{}")
+    risk_reasons_json = Column(Text, nullable=False, default="[]")
+    missing_fields_json = Column(Text, nullable=False, default="[]")
+    observation_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
