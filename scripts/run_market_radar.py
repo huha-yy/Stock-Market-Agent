@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import tempfile
 from typing import Sequence
 
 
@@ -20,8 +21,12 @@ from src.market_radar.service import MarketRadarService
 from src.market_radar.universe import UniverseLoader
 
 
-def build_service() -> MarketRadarService:
+def build_service(*, persist: bool) -> MarketRadarService:
     config = get_config()
+    ranking_config = RankingConfig(
+        scoring_version=config.market_radar_scoring_version,
+        stale_after_seconds=config.market_radar_stale_after_seconds,
+    )
     return MarketRadarService(
         universe_loader=UniverseLoader(
             ROOT / "src/data/market_radar/a_share_etfs.yaml"
@@ -30,12 +35,30 @@ def build_service() -> MarketRadarService:
             DataFetcherManager(),
             limit=config.market_radar_provider_limit,
         ),
-        repository=MarketRadarRepository(),
-        ranking_config=RankingConfig(
-            scoring_version=config.market_radar_scoring_version,
-            stale_after_seconds=config.market_radar_stale_after_seconds,
-        ),
+        repository=MarketRadarRepository() if persist else None,
+        ranking_config=ranking_config,
     )
+
+
+def _write_output_atomic(output: Path, rendered: str) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(rendered + "\n")
+            temporary.flush()
+        temporary_path.replace(output)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -51,11 +74,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        snapshot = build_service().run(market="cn", persist=args.persist)
+        snapshot = build_service(persist=args.persist).run(
+            market="cn",
+            persist=args.persist,
+        )
         rendered = snapshot.model_dump_json(indent=2)
         if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(rendered + "\n", encoding="utf-8")
+            _write_output_atomic(args.output, rendered)
         else:
             print(rendered)
         return 0

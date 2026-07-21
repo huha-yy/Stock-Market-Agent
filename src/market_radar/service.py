@@ -20,7 +20,7 @@ class MarketRadarService:
         *,
         universe_loader: UniverseLoader,
         provider: MarketRadarProvider,
-        repository: MarketRadarRepository,
+        repository: MarketRadarRepository | None,
         ranking_config: RankingConfig,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -40,6 +40,9 @@ class MarketRadarService:
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar Phase 1 supports market=cn only")
+        repository = self.repository
+        if persist and repository is None:
+            raise ValueError("repository is required when persist=True")
         requested_as_of = as_of if as_of is not None else self.clock()
         if requested_as_of.tzinfo is None or requested_as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
@@ -68,14 +71,14 @@ class MarketRadarService:
                 item.sector_id: item for item in batch.discovered_sectors
             }
             combined_universe.update({item.sector_id: item for item in universe})
-            run_id = self.repository.save_run_with_universe(
+            run_id = repository.save_run_with_universe(
                 sorted(
                     combined_universe.values(),
                     key=lambda item: (item.kind, item.sector_id),
                 ),
                 snapshot,
             )
-            stored_snapshot = self.repository.get_run(run_id)
+            stored_snapshot = repository.get_run(run_id)
             if stored_snapshot is None:
                 raise RuntimeError(f"Persisted Market Radar run {run_id} was not found")
             return stored_snapshot

@@ -83,7 +83,6 @@ def test_build_service_composes_phase_one_dependencies(monkeypatch) -> None:
     universe_loader = object()
     provider = object()
     repository = object()
-    ranking_config = object()
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
@@ -108,37 +107,97 @@ def test_build_service_composes_phase_one_dependencies(monkeypatch) -> None:
         captured["limit"] = limit
         return provider
 
-    def build_ranking_config(**kwargs):
-        captured["ranking_kwargs"] = kwargs
-        return ranking_config
-
-    def build_service(**kwargs):
-        captured["service_kwargs"] = kwargs
-        return "service"
-
     monkeypatch.setattr(run_market_radar, "LegacyRankingProvider", build_provider)
     monkeypatch.setattr(run_market_radar, "MarketRadarRepository", lambda: repository)
-    monkeypatch.setattr(run_market_radar, "RankingConfig", build_ranking_config)
-    monkeypatch.setattr(run_market_radar, "MarketRadarService", build_service)
 
-    result = run_market_radar.build_service()
+    result = run_market_radar.build_service(persist=True)
 
-    assert result == "service"
+    assert isinstance(result, run_market_radar.MarketRadarService)
     assert captured["universe_path"] == (
         run_market_radar.ROOT / "src/data/market_radar/a_share_etfs.yaml"
     )
     assert captured["manager"] is manager
     assert captured["limit"] == 321
-    assert captured["ranking_kwargs"] == {
-        "scoring_version": "cn-v1",
-        "stale_after_seconds": 654,
-    }
-    assert captured["service_kwargs"] == {
-        "universe_loader": universe_loader,
-        "provider": provider,
-        "repository": repository,
-        "ranking_config": ranking_config,
-    }
+    assert result.universe_loader is universe_loader
+    assert result.provider is provider
+    assert result.repository is repository
+    assert result.ranking_config.scoring_version == "cn-v1"
+    assert result.ranking_config.stale_after_seconds == 654
+
+
+def test_build_service_default_mode_does_not_initialize_database(
+    monkeypatch,
+) -> None:
+    from src.storage import DatabaseManager
+
+    monkeypatch.setattr(
+        run_market_radar,
+        "get_config",
+        lambda: SimpleNamespace(
+            market_radar_provider_limit=321,
+            market_radar_stale_after_seconds=654,
+            market_radar_scoring_version="cn-v1",
+        ),
+    )
+    monkeypatch.setattr(run_market_radar, "DataFetcherManager", lambda: object())
+
+    def unexpected_database(*_args, **_kwargs):
+        raise AssertionError("non-persistent CLI must not initialize the database")
+
+    monkeypatch.setattr(
+        run_market_radar,
+        "MarketRadarRepository",
+        unexpected_database,
+    )
+    monkeypatch.setattr(DatabaseManager, "get_instance", unexpected_database)
+
+    service = run_market_radar.build_service(persist=False)
+
+    assert isinstance(service, run_market_radar.MarketRadarService)
+    assert service.repository is None
+
+
+def test_invalid_scoring_version_fails_before_side_effectful_construction(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        run_market_radar,
+        "get_config",
+        lambda: SimpleNamespace(
+            market_radar_provider_limit=321,
+            market_radar_stale_after_seconds=654,
+            market_radar_scoring_version="cn-v2",
+        ),
+    )
+    calls: list[str] = []
+
+    def unexpected(name):
+        def construct(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} must not be constructed")
+
+        return construct
+
+    monkeypatch.setattr(
+        run_market_radar,
+        "DataFetcherManager",
+        unexpected("manager"),
+    )
+    monkeypatch.setattr(
+        run_market_radar,
+        "UniverseLoader",
+        unexpected("universe"),
+    )
+    monkeypatch.setattr(
+        run_market_radar,
+        "MarketRadarRepository",
+        unexpected("repository"),
+    )
+
+    with pytest.raises(ValueError, match="scoring_version"):
+        run_market_radar.build_service(persist=True)
+
+    assert calls == []
 
 
 def test_cli_writes_structured_json_without_persistence(
@@ -152,7 +211,11 @@ def test_cli_writes_structured_json_without_persistence(
             assert kwargs == {"market": "cn", "persist": False}
             return _snapshot()
 
-    monkeypatch.setattr(run_market_radar, "build_service", lambda: FakeService())
+    monkeypatch.setattr(
+        run_market_radar,
+        "build_service",
+        lambda persist: FakeService(),
+    )
 
     exit_code = run_market_radar.main(
         ["--market", "cn", "--output", str(output)]
@@ -164,6 +227,7 @@ def test_cli_writes_structured_json_without_persistence(
         "quality": "partial",
         "sectors": [],
     }
+    assert list(output.parent.iterdir()) == [output]
 
 
 def test_cli_persists_and_writes_structured_json_to_stdout(
@@ -175,7 +239,11 @@ def test_cli_persists_and_writes_structured_json_to_stdout(
             assert kwargs == {"market": "cn", "persist": True}
             return _snapshot()
 
-    monkeypatch.setattr(run_market_radar, "build_service", lambda: FakeService())
+    monkeypatch.setattr(
+        run_market_radar,
+        "build_service",
+        lambda persist: FakeService(),
+    )
 
     exit_code = run_market_radar.main(["--market", "cn", "--persist"])
 
@@ -192,7 +260,9 @@ def test_cli_rejects_non_cn_market_before_building_service(
     monkeypatch.setattr(
         run_market_radar,
         "build_service",
-        lambda: pytest.fail("unsupported market must not build dependencies"),
+        lambda persist: pytest.fail(
+            "unsupported market must not build dependencies"
+        ),
     )
 
     exit_code = run_market_radar.main(["--market", "hk"])
@@ -214,7 +284,11 @@ def test_cli_reports_runtime_failure_without_json_output(
         def run(self, **_kwargs):
             raise RuntimeError("provider unavailable")
 
-    monkeypatch.setattr(run_market_radar, "build_service", lambda: FailingService())
+    monkeypatch.setattr(
+        run_market_radar,
+        "build_service",
+        lambda persist: FailingService(),
+    )
 
     exit_code = run_market_radar.main(["--output", str(output)])
 
@@ -223,6 +297,39 @@ def test_cli_reports_runtime_failure_without_json_output(
     assert captured.err.strip() == "Market Radar failed: provider unavailable"
     assert captured.out == ""
     assert not output.exists()
+
+
+def test_cli_failed_atomic_replace_preserves_existing_output(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    output = tmp_path / "radar.json"
+    original = b'{"status":"existing"}\n'
+    output.write_bytes(original)
+
+    class FakeService:
+        def run(self, **_kwargs):
+            return _snapshot()
+
+    monkeypatch.setattr(
+        run_market_radar,
+        "build_service",
+        lambda persist: FakeService(),
+    )
+
+    def fail_replace(_self, _target):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    exit_code = run_market_radar.main(["--output", str(output)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "replace denied" in captured.err
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
 
 
 def test_import_does_not_construct_provider_or_repository(monkeypatch) -> None:

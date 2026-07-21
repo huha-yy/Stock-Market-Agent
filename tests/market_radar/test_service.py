@@ -368,6 +368,36 @@ def test_run_without_persistence_does_not_write() -> None:
     assert events == []
 
 
+def test_run_without_persistence_does_not_require_repository() -> None:
+    service = MarketRadarService(
+        universe_loader=FakeUniverse(),
+        provider=FakeProvider(),
+        repository=None,
+        ranking_config=RankingConfig(),
+        clock=lambda: NOW,
+    )
+
+    snapshot = service.run(persist=False)
+
+    assert snapshot.sectors
+
+
+def test_persisted_run_requires_repository_before_loading_data() -> None:
+    events: list[str] = []
+    service = MarketRadarService(
+        universe_loader=FakeUniverse(events=events),
+        provider=FakeProvider(events=events),
+        repository=None,
+        ranking_config=RankingConfig(),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="repository is required"):
+        service.run(persist=True)
+
+    assert events == []
+
+
 @pytest.mark.parametrize("market", ["hk", "us"])
 def test_run_rejects_unsupported_market_before_using_dependencies(market: str) -> None:
     events: list[str] = []
