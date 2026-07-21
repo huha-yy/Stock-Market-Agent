@@ -3637,6 +3637,13 @@ class DataFetcherManager:
 
             return [], [], source_chain, last_error
 
+    def get_sector_rankings_with_meta(
+        self,
+        n: int = 5,
+    ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
+        """Return sector rankings with the complete ordered provider trace."""
+        return self._get_sector_rankings_with_meta(n)
+
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
         # 按需求固定回退顺序：Akshare(EM) -> Akshare(Sina) -> Tushare -> Efinance
@@ -3654,6 +3661,56 @@ class DataFetcherManager:
     def clear_concept_rankings_cache_for_tests(cls) -> None:
         with cls._concept_rankings_cache_lock:
             cls._concept_rankings_cache.clear()
+
+    def get_concept_rankings_with_meta(
+        self,
+        n: int = 5,
+    ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
+        """Return concept rankings with ordered provider trace for audit-sensitive consumers."""
+        try:
+            normalized_n = int(n)
+        except (TypeError, ValueError):
+            normalized_n = 5
+        if normalized_n <= 0:
+            normalized_n = 5
+
+        source_chain: List[Dict[str, Any]] = []
+        last_error = ""
+        for fetcher in self._get_fetchers_snapshot():
+            start = time.time()
+            try:
+                data = fetcher.get_concept_rankings(normalized_n)
+                duration_ms = int((time.time() - start) * 1000)
+                if data and (data[0] or data[1]):
+                    source_chain.append(
+                        {
+                            "provider": fetcher.name,
+                            "result": "ok",
+                            "duration_ms": duration_ms,
+                        }
+                    )
+                    return data[0] or [], data[1] or [], source_chain, ""
+                last_error = f"{fetcher.name} returned an empty result"
+                source_chain.append(
+                    {
+                        "provider": fetcher.name,
+                        "result": "empty",
+                        "duration_ms": duration_ms,
+                        "error": last_error,
+                    }
+                )
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                last_error = f"{fetcher.name} ({error_type}) {error_reason}"
+                source_chain.append(
+                    {
+                        "provider": fetcher.name,
+                        "result": "failed",
+                        "duration_ms": int((time.time() - start) * 1000),
+                        "error": error_reason,
+                    }
+                )
+        return [], [], source_chain, last_error
 
     def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取概念/题材涨跌榜（自动切换数据源）。"""
