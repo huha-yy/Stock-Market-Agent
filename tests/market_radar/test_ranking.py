@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+from math import inf, nan
+
+import pytest
 
 from src.market_radar.models import SectorObservation
 from src.market_radar.ranking import RankingConfig, score_sectors
@@ -85,15 +88,32 @@ def test_missing_data_lowers_confidence_without_becoming_zero_strength() -> None
     result = score_sectors([partial], RankingConfig())[0]
 
     assert result.factors.trend_momentum > 0
-    assert 0 < result.confidence < 0.4
+    assert result.gross_score == 54.4444
+    assert result.confidence == 0.2267
     assert result.state == "insufficient_data"
 
 
-def test_stale_critical_price_is_insufficient() -> None:
+def test_stale_quality_is_insufficient_even_while_fresh() -> None:
     stale = observation(
         "Stale",
         "industry:stale",
         quality="stale",
+        freshness_seconds=30,
+    )
+
+    result = score_sectors(
+        [stale], RankingConfig(stale_after_seconds=2700)
+    )[0]
+
+    assert result.state == "insufficient_data"
+    assert "critical_price_stale" in result.risk_reasons
+
+
+def test_stale_age_is_insufficient_even_with_complete_quality() -> None:
+    stale = observation(
+        "Stale",
+        "industry:stale",
+        quality="complete",
         freshness_seconds=4000,
     )
 
@@ -103,6 +123,22 @@ def test_stale_critical_price_is_insufficient() -> None:
 
     assert result.state == "insufficient_data"
     assert "critical_price_stale" in result.risk_reasons
+
+
+def test_exact_stale_threshold_remains_eligible() -> None:
+    current = observation(
+        "Current",
+        "industry:current",
+        quality="complete",
+        freshness_seconds=2700,
+    )
+
+    result = score_sectors(
+        [current], RankingConfig(stale_after_seconds=2700)
+    )[0]
+
+    assert result.state != "insufficient_data"
+    assert "critical_price_stale" not in result.risk_reasons
 
 
 def test_risk_deductions_are_capped_at_thirty() -> None:
@@ -185,7 +221,7 @@ def test_zero_is_rankable_evidence_while_missing_is_not() -> None:
 
     assert by_id["industry:zero"].factors.trend_momentum == 12.5
     assert by_id["industry:missing"].factors.trend_momentum == 0.0
-    assert by_id["industry:zero"].confidence == 0.2
+    assert by_id["industry:zero"].confidence == 0.0667
     assert by_id["industry:missing"].confidence == 0.0
 
 
@@ -253,3 +289,168 @@ def test_observation_evidence_uses_json_serialization() -> None:
 
     assert serialized_evidence == source.model_dump(mode="json")
     assert serialized_evidence["observed_at"] == NOW.isoformat()
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_confidence"),
+    [
+        ("return_5d_pct", 0.9167),
+        ("flat_count", 0.95),
+    ],
+)
+def test_each_missing_tracked_field_lowers_confidence_granularly(
+    missing_field: str,
+    expected_confidence: float,
+) -> None:
+    partial = observation(
+        "Granular",
+        "industry:granular",
+        **{missing_field: None},
+    )
+
+    result = score_sectors([partial], RankingConfig())[0]
+
+    assert result.confidence == expected_confidence
+
+
+def test_incomplete_breadth_is_excluded_from_strength_denominator() -> None:
+    partial = observation(
+        "Breadth Missing",
+        "industry:breadth-missing",
+        flat_count=None,
+    )
+
+    result = score_sectors([partial], RankingConfig())[0]
+
+    assert result.factors.breadth == 0.0
+    assert result.gross_score == 52.3529
+
+
+def test_no_available_factor_has_zero_strength_and_confidence() -> None:
+    unavailable_metrics = {
+        field: None for field in SectorObservation.tracked_metric_fields
+    }
+    unavailable = observation(
+        "Unavailable",
+        "industry:unavailable",
+        quality="complete",
+        **unavailable_metrics,
+    )
+
+    result = score_sectors([unavailable], RankingConfig())[0]
+
+    assert result.gross_score == 0.0
+    assert result.confidence == 0.0
+    assert result.state == "insufficient_data"
+
+
+def test_duplicate_sector_ids_are_rejected_across_sources() -> None:
+    first = observation("Duplicate", "industry:duplicate", source="source-a")
+    second = observation("Duplicate", "industry:duplicate", source="source-b")
+
+    with pytest.raises(ValueError, match="duplicate sector_id"):
+        score_sectors([first, second], RankingConfig())
+
+
+@pytest.mark.parametrize(
+    "config_values",
+    [
+        {"scoring_version": "cn-v2"},
+        {"min_confidence": -0.1},
+        {"min_confidence": True},
+        {"min_confidence": nan},
+        {"leading_confidence": 1.1},
+        {"leading_confidence": inf},
+        {"min_confidence": 0.8, "leading_confidence": 0.7},
+        {"stale_after_seconds": -1},
+        {"stale_after_seconds": 1.5},
+        {"stale_after_seconds": True},
+    ],
+)
+def test_ranking_config_rejects_invalid_values_on_construction(
+    config_values: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        RankingConfig(**config_values)
+
+
+def test_percentiles_are_isolated_by_source() -> None:
+    observations = [
+        observation(
+            "A Low",
+            "industry:a-low",
+            source="source-a",
+            capital_flow_1d=1.0,
+            capital_flow_5d=1.0,
+            capital_flow_20d=1.0,
+        ),
+        observation(
+            "A High",
+            "industry:a-high",
+            source="source-a",
+            capital_flow_1d=2.0,
+            capital_flow_5d=2.0,
+            capital_flow_20d=2.0,
+        ),
+        observation(
+            "B Low",
+            "industry:b-low",
+            source="source-b",
+            capital_flow_1d=1_000.0,
+            capital_flow_5d=1_000.0,
+            capital_flow_20d=1_000.0,
+        ),
+        observation(
+            "B High",
+            "industry:b-high",
+            source="source-b",
+            capital_flow_1d=2_000.0,
+            capital_flow_5d=2_000.0,
+            capital_flow_20d=2_000.0,
+        ),
+    ]
+
+    by_id = {
+        item.sector_id: item
+        for item in score_sectors(observations, RankingConfig())
+    }
+
+    assert by_id["industry:a-low"].factors.capital_flow == 0.0
+    assert by_id["industry:b-low"].factors.capital_flow == 0.0
+    assert by_id["industry:a-high"].factors.capital_flow == 20.0
+    assert by_id["industry:b-high"].factors.capital_flow == 20.0
+
+
+def test_tied_values_receive_the_average_percentile_rank() -> None:
+    observations = [
+        observation(
+            "Tie A",
+            "industry:tie-a",
+            capital_flow_1d=1.0,
+            capital_flow_5d=1.0,
+            capital_flow_20d=1.0,
+        ),
+        observation(
+            "Tie B",
+            "industry:tie-b",
+            capital_flow_1d=1.0,
+            capital_flow_5d=1.0,
+            capital_flow_20d=1.0,
+        ),
+        observation(
+            "High",
+            "industry:high",
+            capital_flow_1d=3.0,
+            capital_flow_5d=3.0,
+            capital_flow_20d=3.0,
+        ),
+    ]
+
+    by_id = {
+        item.sector_id: item
+        for item in score_sectors(observations, RankingConfig())
+    }
+
+    assert by_id["industry:tie-a"].factors.capital_flow == 5.0
+    assert by_id["industry:tie-b"].factors.capital_flow == 5.0
+    assert by_id["industry:high"].factors.capital_flow == 20.0

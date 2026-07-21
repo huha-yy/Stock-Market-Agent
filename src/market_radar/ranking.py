@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from statistics import fmean
-from typing import Callable
+from typing import Callable, Literal
 
 from src.market_radar.models import (
     FactorBreakdown,
@@ -12,12 +13,45 @@ from src.market_radar.models import (
 )
 
 
+_FACTOR_WEIGHTS = {
+    "trend_momentum": 25.0,
+    "relative_strength": 20.0,
+    "capital_flow": 20.0,
+    "breadth": 15.0,
+    "liquidity_expansion": 10.0,
+    "catalyst": 10.0,
+}
+
+
 @dataclass(frozen=True)
 class RankingConfig:
-    scoring_version: str = "cn-v1"
+    scoring_version: Literal["cn-v1"] = "cn-v1"
     min_confidence: float = 0.4
     leading_confidence: float = 0.7
     stale_after_seconds: int = 2700
+
+    def __post_init__(self) -> None:
+        if self.scoring_version != "cn-v1":
+            raise ValueError("scoring_version must be 'cn-v1'")
+        for field_name in ("min_confidence", "leading_confidence"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+            ):
+                raise ValueError(f"{field_name} must be a finite number")
+        if not 0 <= self.min_confidence <= self.leading_confidence <= 1:
+            raise ValueError(
+                "confidence thresholds must satisfy "
+                "0 <= min_confidence <= leading_confidence <= 1"
+            )
+        if (
+            isinstance(self.stale_after_seconds, bool)
+            or not isinstance(self.stale_after_seconds, int)
+            or self.stale_after_seconds < 0
+        ):
+            raise ValueError("stale_after_seconds must be a non-negative integer")
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -66,13 +100,14 @@ def _percentile_map(
 def _factor_scores(
     item: SectorObservation,
     *,
+    availability: dict[str, bool],
     trend_percentiles: dict[str, float],
     relative_percentiles: dict[str, float],
     flow_percentiles: dict[str, float],
 ) -> FactorBreakdown:
     total = (
         (item.up_count or 0) + (item.down_count or 0) + (item.flat_count or 0)
-        if item.up_count is not None and item.down_count is not None
+        if availability["breadth"]
         else 0
     )
     breadth = (
@@ -94,6 +129,37 @@ def _factor_scores(
     )
 
 
+def _factor_availability(item: SectorObservation) -> dict[str, bool]:
+    return {
+        "trend_momentum": any(
+            value is not None
+            for value in [
+                item.return_1d_pct,
+                item.return_5d_pct,
+                item.return_20d_pct,
+            ]
+        ),
+        "relative_strength": (
+            item.return_20d_pct is not None
+            and item.benchmark_return_20d_pct is not None
+        ),
+        "capital_flow": any(
+            value is not None
+            for value in [
+                item.capital_flow_1d,
+                item.capital_flow_5d,
+                item.capital_flow_20d,
+            ]
+        ),
+        "breadth": all(
+            value is not None
+            for value in [item.up_count, item.down_count, item.flat_count]
+        ),
+        "liquidity_expansion": item.turnover_ratio_20d is not None,
+        "catalyst": item.catalyst_score is not None,
+    }
+
+
 def _risk_deduction(item: SectorObservation) -> tuple[float, list[str]]:
     deduction = 0.0
     reasons: list[str] = []
@@ -113,37 +179,33 @@ def _risk_deduction(item: SectorObservation) -> tuple[float, list[str]]:
 
 
 def _confidence(item: SectorObservation) -> float:
+    return_horizons = [
+        item.return_1d_pct,
+        item.return_5d_pct,
+        item.return_20d_pct,
+    ]
+    flow_horizons = [
+        item.capital_flow_1d,
+        item.capital_flow_5d,
+        item.capital_flow_20d,
+    ]
+    breadth_counts = [item.up_count, item.down_count, item.flat_count]
     weighted_presence = (
-        (
-            25.0
-            if item.return_5d_pct is not None
-            or item.return_20d_pct is not None
-            or item.return_1d_pct is not None
-            else 0.0
-        )
+        25.0
+        * sum(value is not None for value in return_horizons)
+        / len(return_horizons)
         + (
             20.0
             if item.return_20d_pct is not None
             and item.benchmark_return_20d_pct is not None
             else 0.0
         )
-        + (
-            20.0
-            if any(
-                value is not None
-                for value in [
-                    item.capital_flow_1d,
-                    item.capital_flow_5d,
-                    item.capital_flow_20d,
-                ]
-            )
-            else 0.0
-        )
-        + (
-            15.0
-            if item.up_count is not None and item.down_count is not None
-            else 0.0
-        )
+        + 20.0
+        * sum(value is not None for value in flow_horizons)
+        / len(flow_horizons)
+        + 15.0
+        * sum(value is not None for value in breadth_counts)
+        / len(breadth_counts)
         + (10.0 if item.turnover_ratio_20d is not None else 0.0)
         + (10.0 if item.catalyst_score is not None else 0.0)
     )
@@ -179,6 +241,17 @@ def score_sectors(
     observations: list[SectorObservation],
     config: RankingConfig,
 ) -> list[SectorScore]:
+    sector_ids = [item.sector_id for item in observations]
+    duplicate_sector_ids = sorted(
+        sector_id
+        for sector_id in set(sector_ids)
+        if sector_ids.count(sector_id) > 1
+    )
+    if duplicate_sector_ids:
+        raise ValueError(
+            "duplicate sector_id inputs: " + ", ".join(duplicate_sector_ids)
+        )
+
     trend_percentiles = _percentile_map(
         observations,
         lambda item: _mean_available(
@@ -206,13 +279,29 @@ def score_sectors(
     )
     results: list[SectorScore] = []
     for item in observations:
+        availability = _factor_availability(item)
         factors = _factor_scores(
             item,
+            availability=availability,
             trend_percentiles=trend_percentiles,
             relative_percentiles=relative_percentiles,
             flow_percentiles=flow_percentiles,
         )
-        gross = round(sum(factors.model_dump().values()), 4)
+        available_weight = sum(
+            weight
+            for factor_name, weight in _FACTOR_WEIGHTS.items()
+            if availability[factor_name]
+        )
+        earned_points = sum(
+            getattr(factors, factor_name)
+            for factor_name in _FACTOR_WEIGHTS
+            if availability[factor_name]
+        )
+        gross = (
+            round(_clamp(earned_points / available_weight * 100.0, 0.0, 100.0), 4)
+            if available_weight > 0
+            else 0.0
+        )
         deduction, reasons = _risk_deduction(item)
         score = round(_clamp(gross - deduction, 0.0, 100.0), 4)
         confidence = _confidence(item)
