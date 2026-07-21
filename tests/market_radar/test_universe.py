@@ -185,3 +185,25 @@ def test_repository_seed_contains_no_duplicate_etf_code() -> None:
     sectors = UniverseLoader(path).load(date(2026, 7, 21))
     codes = [etf.code for sector in sectors for etf in sector.etfs]
     assert len(codes) == len(set(codes))
+
+
+def test_repository_seed_matches_official_etf_code_name_contract() -> None:
+    path = Path("src/data/market_radar/a_share_etfs.yaml")
+    sectors = UniverseLoader(path).load(date(2026, 7, 21))
+    pairs = [(etf.code, etf.name) for sector in sectors for etf in sector.etfs]
+
+    assert len(pairs) == 12
+    assert dict(pairs) == {
+        "512480": "半导体ETF",
+        "159995": "芯片ETF",
+        "512880": "证券ETF",
+        "512000": "券商ETF",
+        "512800": "银行ETF",
+        "512010": "医药ETF",
+        "159929": "医药ETF",
+        "515030": "新能源车ETF",
+        "515700": "新能源车ETF",
+        "512660": "军工ETF",
+        "512400": "有色金属ETF",
+        "515790": "光伏ETF",
+    }

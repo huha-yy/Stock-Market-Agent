@@ -50,7 +50,7 @@ sectors:
         name: 新能源车ETF
         effective_from: 2026-01-01
       - code: "515700"
-        name: 新能车ETF
+        name: 新能源车ETF
         effective_from: 2026-01-01
   - kind: industry
     name: 国防军工
