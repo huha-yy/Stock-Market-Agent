@@ -380,6 +380,28 @@ def test_market_radar_docs_cover_phase_2a_operational_contract() -> None:
     ):
         assert token in text
 
+    for token in (
+        "AkShare currently implements board history, benchmark history, "
+        "industry flow, and current industry/concept membership",
+        "Concept flow has no equivalent capability and is explicitly "
+        "`unavailable`",
+        "Constituent realtime quotes use the existing `DataFetcherManager` "
+        "fallback chain",
+        "Tushare and TickFlow do not currently override the optional "
+        "normalized board-capability methods",
+    ):
+        assert token in text
+    assert "EFinance may provide industry membership" not in text
+    assert "Tushare or TickFlow providers participate" not in text
+
+
+def test_english_index_market_radar_entry_tracks_phase_2a() -> None:
+    text = (ROOT / "docs/INDEX_EN.md").read_text(encoding="utf-8")
+    entry = next(line for line in text.splitlines() if "[Market Radar]" in line)
+
+    assert "Phase 2A" in entry
+    assert "Phase 1" not in entry
+
 
 def test_offline_manual_run_persists_and_replays_same_scoring_path(
     isolated_db,

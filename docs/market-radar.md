@@ -32,7 +32,7 @@ Phase 2A works without new configuration. The following optional integer setting
 
 The formula thresholds remain code-owned and versioned; these settings are not exposed in Web settings because Phase 2A has no Web administration surface.
 
-The default free path uses AkShare board-level capabilities. EFinance may provide industry membership or quote fallback where its data satisfies the same contract. Configured Tushare or TickFlow providers participate only when they can produce the same normalized semantics. An empty, malformed, non-finite, or wrong-date result advances that individual capability to its next provider; a history failure does not discard valid flow or constituent evidence.
+AkShare currently implements board history, benchmark history, industry flow, and current industry/concept membership. Concept flow has no equivalent capability and is explicitly `unavailable`. Constituent realtime quotes use the existing `DataFetcherManager` fallback chain, which may use configured realtime sources that return a valid same-date quote. Tushare and TickFlow do not currently override the optional normalized board-capability methods. Future implementations may participate only when they satisfy the same normalized field, date, and provenance contracts. An empty, malformed, non-finite, or wrong-date result advances that individual capability to its next implemented provider; a history failure does not discard valid flow or constituent evidence.
 
 ## Two-Stage Flow
 
