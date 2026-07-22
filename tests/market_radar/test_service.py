@@ -7,6 +7,9 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from src.config import Config
+from src.market_radar.candidates import EnrichmentCandidate
+from src.market_radar.capabilities import MarketRadarEnrichmentConfig
+from src.market_radar.enrichment import EnrichmentBatch
 from src.market_radar.models import (
     EtfDefinition,
     RadarRunSnapshot,
@@ -16,6 +19,7 @@ from src.market_radar.models import (
 from src.market_radar.providers import ProviderBatch
 from src.market_radar.ranking import RankingConfig
 from src.market_radar.repository import MarketRadarRepository
+from src.market_radar import service as service_module
 from src.market_radar.service import MarketRadarService
 from src.market_radar.universe import UniverseLoader
 from src.storage import DatabaseManager
@@ -128,6 +132,11 @@ class FakeRepository:
         self.error = error
         self.universe: list[SectorDefinition] | None = None
         self.snapshot: RadarRunSnapshot | None = None
+        self.previous: RadarRunSnapshot | None = None
+        self.latest_calls: list[tuple[str, datetime | None]] = []
+        self.enriched_writes: list[
+            tuple[list[SectorDefinition], tuple[object, ...], RadarRunSnapshot]
+        ] = []
 
     def save_run_with_universe(
         self,
@@ -147,12 +156,78 @@ class FakeRepository:
             self.events.append("get")
         return self.snapshot if run_id == 7 else None
 
+    def get_latest_run(
+        self,
+        market: str,
+        before: datetime | None = None,
+    ) -> RadarRunSnapshot | None:
+        if self.events is not None:
+            self.events.append("latest")
+        self.latest_calls.append((market, before))
+        return self.previous
+
+    def save_enriched_run(
+        self,
+        sectors: list[SectorDefinition],
+        evidence: tuple[object, ...],
+        snapshot: RadarRunSnapshot,
+    ) -> int:
+        if self.events is not None:
+            self.events.append("persist")
+        if self.error is not None:
+            raise self.error
+        self.universe = sectors
+        self.snapshot = snapshot
+        self.enriched_writes.append((sectors, evidence, snapshot))
+        return 7
+
+
+class RecordingSelector:
+    def __init__(
+        self,
+        result: tuple[EnrichmentCandidate, ...] = (),
+        events: list[str] | None = None,
+    ) -> None:
+        self.result = result
+        self.events = events
+        self.calls: list[tuple[object, ...]] = []
+
+    def select(self, universe, observations, previous, limit):
+        if self.events is not None:
+            self.events.append("select")
+        self.calls.append((universe, observations, previous, limit))
+        return self.result
+
+
+class RecordingEnricher:
+    def __init__(
+        self,
+        result: EnrichmentBatch,
+        events: list[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.result = result
+        self.events = events
+        self.error = error
+        self.calls: list[tuple[object, ...]] = []
+
+    def enrich(self, candidates, as_of):
+        if self.events is not None:
+            self.events.append("enrich")
+        self.calls.append((candidates, as_of))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
 
 def _service(
     *,
     universe: FakeUniverse | None = None,
     provider: FakeProvider | None = None,
     repository: FakeRepository | MarketRadarRepository | None = None,
+    enricher: RecordingEnricher | None = None,
+    candidate_selector: RecordingSelector | None = None,
+    enrichment_config: MarketRadarEnrichmentConfig | None = None,
     clock=lambda: NOW,
 ) -> MarketRadarService:
     return MarketRadarService(
@@ -160,7 +235,23 @@ def _service(
         provider=provider or FakeProvider(),
         repository=repository or FakeRepository(),
         ranking_config=RankingConfig(),
+        enricher=enricher,
+        candidate_selector=candidate_selector,
+        enrichment_config=enrichment_config,
         clock=clock,
+    )
+
+
+def _previous_snapshot(as_of: datetime) -> RadarRunSnapshot:
+    return RadarRunSnapshot(
+        run_key=f"cn:{as_of.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}:manual",
+        market="cn",
+        trigger="manual",
+        as_of=as_of,
+        quality="unavailable",
+        scoring_version="cn-v1",
+        sectors=(),
+        provider_trace=(),
     )
 
 
@@ -193,6 +284,220 @@ def test_run_builds_stable_snapshot_and_persists_in_dependency_order() -> None:
     assert provider.arguments == ("cn", NOW, universe.sectors)
     assert repository.snapshot == snapshot
     assert events == ["load", "fetch", "persist", "get"]
+
+
+def test_enriched_run_selects_merges_ranks_once_and_persists_atomically(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    shared = _definition("industry:shared", name="Shared")
+    configured_only = _definition("concept:configured", kind="concept", name="Configured")
+    universe = FakeUniverse([shared, configured_only], events=events)
+    discovered_shared = _observation(
+        "industry:shared", name="Shared", return_1d_pct=1.0
+    )
+    unselected = _observation(
+        "concept:unselected", kind="concept", name="Unselected", return_1d_pct=-2.0
+    )
+    batch = ProviderBatch(
+        observations=[discovered_shared, unselected],
+        trace=[{"provider": "discovery", "result": "ok"}],
+        discovered_sectors=[
+            _definition("concept:unselected", kind="concept", name="Unselected")
+        ],
+    )
+    provider = FakeProvider(batch, events=events)
+    candidates = (
+        EnrichmentCandidate(shared, discovered_shared, ("configured_seed",)),
+        EnrichmentCandidate(configured_only, None, ("configured_seed",)),
+    )
+    selector = RecordingSelector(candidates, events=events)
+    enriched_shared = _observation(
+        "industry:shared", name="Shared", return_1d_pct=8.0
+    ).model_copy(update={"source": "enriched"})
+    enriched_configured = _observation(
+        "concept:configured",
+        kind="concept",
+        name="Configured",
+        return_1d_pct=4.0,
+    ).model_copy(update={"source": "enriched"})
+    enricher = RecordingEnricher(
+        EnrichmentBatch(
+            observations=(enriched_shared, enriched_configured),
+            constituent_evidence=(),
+            trace=(
+                {"capability": "board_history", "result": "ok"},
+                {"capability": "quotes", "result": "partial"},
+            ),
+        ),
+        events=events,
+    )
+    previous = _previous_snapshot(NOW - timedelta(hours=1))
+    repository = FakeRepository(events=events)
+    repository.previous = previous
+    ranking_calls: list[list[SectorObservation]] = []
+    actual_score_sectors = service_module.score_sectors
+
+    def record_score(observations, config):
+        ranking_calls.append(list(observations))
+        return actual_score_sectors(observations, config)
+
+    monkeypatch.setattr(service_module, "score_sectors", record_score)
+
+    snapshot = _service(
+        universe=universe,
+        provider=provider,
+        repository=repository,
+        enricher=enricher,
+        candidate_selector=selector,
+        enrichment_config=MarketRadarEnrichmentConfig(candidate_limit=2),
+    ).run(as_of=NOW)
+
+    assert events == ["load", "fetch", "latest", "select", "enrich", "persist", "get"]
+    assert repository.latest_calls == [("cn", NOW)]
+    assert selector.calls == [
+        (universe.sectors, batch.observations, previous, 2)
+    ]
+    assert enricher.calls == [(candidates, NOW)]
+    assert [[item.sector_id for item in call] for call in ranking_calls] == [[
+        "industry:shared",
+        "concept:unselected",
+        "concept:configured",
+    ]]
+    assert ranking_calls[0][0] == enriched_shared
+    assert ranking_calls[0][1] == unselected
+    assert ranking_calls[0][2] == enriched_configured
+    assert repository.enriched_writes == [
+        (repository.universe, (), snapshot)
+    ]
+    assert snapshot.provider_trace[:1] == tuple(batch.trace)
+    assert [item["stage"] for item in snapshot.provider_trace[1:]] == [
+        "enrichment",
+        "enrichment",
+    ]
+    assert [item["dataset"] for item in snapshot.provider_trace[1:]] == [
+        "board_history",
+        "quotes",
+    ]
+
+
+def test_explicit_previous_wins_and_nonpersistent_run_never_reads_repository() -> None:
+    explicit = _previous_snapshot(NOW - timedelta(hours=2))
+    repository = FakeRepository()
+    repository.previous = _previous_snapshot(NOW - timedelta(hours=1))
+    selector = RecordingSelector()
+    enricher = RecordingEnricher(EnrichmentBatch((), (), ()))
+
+    _service(
+        repository=repository,
+        candidate_selector=selector,
+        enricher=enricher,
+    ).run(persist=False, previous_snapshot=explicit)
+
+    assert repository.latest_calls == []
+    assert selector.calls[0][2] is explicit
+
+
+def test_discovery_only_and_missing_enricher_never_read_previous_state() -> None:
+    repository = FakeRepository()
+    selector = RecordingSelector()
+    enricher = RecordingEnricher(EnrichmentBatch((), (), ()))
+
+    _service(
+        repository=repository,
+        candidate_selector=selector,
+        enricher=enricher,
+    ).run(discovery_only=True)
+    _service(repository=repository).run()
+
+    assert repository.latest_calls == []
+    assert selector.calls == []
+    assert enricher.calls == []
+
+
+@pytest.mark.parametrize(
+    ("previous", "message"),
+    [
+        (_previous_snapshot(NOW), "strictly earlier"),
+        (_previous_snapshot(NOW + timedelta(seconds=1)), "strictly earlier"),
+        (
+            _previous_snapshot(NOW - timedelta(seconds=1)).model_copy(
+                update={"as_of": datetime(2026, 7, 21, 5, 59, 59)}
+            ),
+            "timezone-aware",
+        ),
+        (
+            _previous_snapshot(NOW - timedelta(seconds=1)).model_copy(
+                update={"market": "hk"}
+            ),
+            "market=cn",
+        ),
+    ],
+)
+def test_previous_snapshot_is_validated_before_loading_data(
+    previous: RadarRunSnapshot,
+    message: str,
+) -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match=message):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=FakeRepository(events=events),
+        ).run(previous_snapshot=previous)
+
+    assert events == []
+
+
+def test_duplicate_enrichment_output_aborts_before_ranking_or_persistence(
+    monkeypatch,
+) -> None:
+    duplicate = _observation()
+    repository = FakeRepository()
+    selector = RecordingSelector()
+    enricher = RecordingEnricher(
+        EnrichmentBatch((duplicate, duplicate), (), ())
+    )
+    monkeypatch.setattr(
+        service_module,
+        "score_sectors",
+        lambda *_args, **_kwargs: pytest.fail("duplicate output must not be ranked"),
+    )
+
+    with pytest.raises(ValueError, match="duplicate enrichment.*sector_id"):
+        _service(
+            repository=repository,
+            candidate_selector=selector,
+            enricher=enricher,
+        ).run()
+
+    assert repository.enriched_writes == []
+    assert repository.snapshot is None
+
+
+def test_enrichment_trace_is_bounded_tagged_and_drops_unknown_secret_fields() -> None:
+    trace = tuple(
+        {
+            "capability": "board_history",
+            "result": "ok",
+            "secret": f"token-{index}",
+        }
+        for index in range(1300)
+    )
+    selector = RecordingSelector()
+    enricher = RecordingEnricher(EnrichmentBatch((), (), trace))
+
+    snapshot = _service(
+        candidate_selector=selector,
+        enricher=enricher,
+    ).run(persist=False)
+
+    enrichment_trace = snapshot.provider_trace[1:]
+    assert len(enrichment_trace) == 1200
+    assert all(item["stage"] == "enrichment" for item in enrichment_trace)
+    assert all(item["dataset"] == "board_history" for item in enrichment_trace)
+    assert "secret" not in str(enrichment_trace)
 
 
 def test_explicit_as_of_and_trigger_determine_key_without_reading_clock() -> None:
@@ -547,7 +852,7 @@ def test_run_rejects_unsupported_market_before_using_dependencies(market: str) -
 
     with pytest.raises(
         ValueError,
-        match="^Market Radar Phase 1 supports market=cn only$",
+        match="^Market Radar supports market=cn only$",
     ):
         _service(
             universe=FakeUniverse(events=events),

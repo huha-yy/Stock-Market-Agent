@@ -4,28 +4,45 @@ import os
 import subprocess
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 import src.market_radar as market_radar
 from src.config import Config
+from src.market_radar.capabilities import (
+    BoardBar,
+    BoardBarSeries,
+    BoardFlow,
+    BoardFlowSeries,
+    CapabilityResult,
+    ConstituentMembership,
+    ConstituentQuote,
+    ConstituentQuoteBatch,
+)
 from src.storage import DatabaseManager
 
 
 NOW = datetime(2026, 7, 21, 6, 0, tzinfo=timezone.utc)
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_API = {
+    "CandidateSelector",
     "DataQuality",
+    "EnrichmentBatch",
+    "EnrichmentCandidate",
     "EtfDefinition",
     "FactorBreakdown",
     "LegacyRankingProvider",
     "MarketRadarProvider",
+    "MarketRadarEnricher",
+    "MarketRadarEnrichmentConfig",
     "MarketRadarReplayEngine",
     "MarketRadarRepository",
     "MarketRadarService",
     "ProviderBatch",
+    "ProviderCapabilityAdapter",
     "RadarRunSnapshot",
     "RankingConfig",
     "ReplayFrame",
@@ -56,6 +73,161 @@ class OfflineManager:
             [{"provider": "OfflineFixture", "result": "empty", "duration_ms": 0}],
             "",
         )
+
+
+class OfflineDiscoveryManager:
+    def get_sector_rankings_with_meta(self, n: int):
+        assert n == 1000
+        return (
+            [{"name": "Discovered Industry", "change_pct": 2.5}],
+            [],
+            [{"provider": "OfflineDiscovery", "result": "ok"}],
+            "",
+        )
+
+    def get_concept_rankings_with_meta(self, n: int):
+        assert n == 1000
+        return (
+            [],
+            [],
+            [{"provider": "OfflineDiscovery", "result": "empty"}],
+            "",
+        )
+
+
+class OfflineUniverse:
+    def __init__(self) -> None:
+        self.seed = market_radar.SectorDefinition(
+            sector_id="concept:configured-seed",
+            kind="concept",
+            name="Configured Seed",
+            benchmark_code="000985",
+            effective_from=date(2026, 1, 1),
+        )
+
+    def load_with_history(self, as_of: date):
+        assert as_of == NOW.date()
+        return [self.seed], [self.seed]
+
+
+class OfflineCapabilityProvider:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    @staticmethod
+    def _result(capability, data, *, status="ok"):
+        return CapabilityResult(
+            capability=capability,
+            status=status,
+            data=data,
+            source="OfflineCapability",
+            observed_at=NOW,
+            data_date=NOW.date(),
+            bar_status="finalized",
+            freshness_seconds=0,
+            trace=({"provider": "OfflineCapability", "result": status},),
+        )
+
+    @staticmethod
+    def _history(code: str) -> BoardBarSeries:
+        start = NOW.date() - timedelta(days=20)
+        return BoardBarSeries(
+            code=code,
+            bars=tuple(
+                BoardBar(
+                    data_date=start + timedelta(days=index),
+                    close=100.0 + index,
+                    traded_amount=1000.0,
+                )
+                for index in range(21)
+            ),
+        )
+
+    def fetch_board_history(self, sector, as_of):
+        self.calls.append(("board_history", sector.sector_id))
+        status = "partial" if sector.kind == "concept" else "ok"
+        return self._result(
+            "board_history",
+            self._history(sector.sector_id),
+            status=status,
+        )
+
+    def fetch_benchmark_history(self, code, as_of):
+        self.calls.append(("benchmark_history", code))
+        return self._result("benchmark_history", self._history(code))
+
+    def fetch_board_flow(self, sector, as_of):
+        self.calls.append(("board_flow", sector.sector_id))
+        start = NOW.date() - timedelta(days=19)
+        return self._result(
+            "board_flow",
+            BoardFlowSeries(
+                code=sector.sector_id,
+                flows=tuple(
+                    BoardFlow(
+                        data_date=start + timedelta(days=index),
+                        net_main_inflow=10.0,
+                        traded_amount=1000.0,
+                    )
+                    for index in range(20)
+                ),
+            ),
+        )
+
+    def fetch_constituents(self, sector, as_of):
+        self.calls.append(("constituents", sector.sector_id))
+        suffix = "1" if sector.kind == "industry" else "2"
+        codes = tuple(f"{suffix}{index:05d}" for index in range(1, 6))
+        return self._result(
+            "constituents",
+            ConstituentMembership(codes=codes, data_date=NOW.date()),
+        )
+
+    def fetch_constituent_quotes(self, codes, as_of):
+        self.calls.append(("constituent_quotes", tuple(codes)))
+        return self._result(
+            "constituent_quotes",
+            ConstituentQuoteBatch(
+                quotes=tuple(
+                    ConstituentQuote(
+                        code=code,
+                        current_price=11.0,
+                        previous_close=10.0,
+                        traded_amount=100.0,
+                        quoted_at=NOW,
+                    )
+                    for code in codes
+                )
+            ),
+            status="partial",
+        )
+
+
+def _offline_enriched_service(isolated_db):
+    config = market_radar.MarketRadarEnrichmentConfig(
+        candidate_limit=2,
+        total_budget_seconds=10,
+        max_concurrency=1,
+    )
+    capability_provider = OfflineCapabilityProvider()
+    repository = market_radar.MarketRadarRepository(isolated_db)
+    service = market_radar.MarketRadarService(
+        universe_loader=OfflineUniverse(),
+        provider=market_radar.LegacyRankingProvider(
+            OfflineDiscoveryManager(),
+            limit=1000,
+        ),
+        repository=repository,
+        ranking_config=market_radar.RankingConfig(),
+        enricher=market_radar.MarketRadarEnricher(
+            provider=capability_provider,
+            config=config,
+        ),
+        candidate_selector=market_radar.CandidateSelector(),
+        enrichment_config=config,
+        clock=lambda: NOW,
+    )
+    return service, repository, capability_provider
 
 
 @pytest.fixture()
@@ -91,6 +263,10 @@ def test_package_and_model_imports_do_not_load_runtime_stack() -> None:
             "pandas",
             "src.storage",
             "src.market_radar.providers",
+            "src.market_radar.candidates",
+            "src.market_radar.capabilities",
+            "src.market_radar.capability_provider",
+            "src.market_radar.enrichment",
             "src.market_radar.ranking",
             "src.market_radar.replay",
             "src.market_radar.repository",
@@ -184,7 +360,7 @@ def test_isolated_db_restores_state_when_database_initialization_fails(
     assert resets == ["config", "database", "database", "config"]
 
 
-def test_phase_one_public_api_is_explicit_and_complete() -> None:
+def test_public_api_is_explicit_and_complete() -> None:
     assert set(market_radar.__all__) == PUBLIC_API
     assert all(hasattr(market_radar, name) for name in PUBLIC_API)
 
@@ -230,3 +406,127 @@ def test_offline_manual_run_persists_and_replays_same_scoring_path(
 
     assert replay.trigger == "replay"
     assert replay.sectors == snapshot.sectors
+
+
+def test_offline_enrichment_persists_evidence_and_replays_without_live_calls(
+    isolated_db,
+) -> None:
+    service, repository, capability_provider = _offline_enriched_service(isolated_db)
+
+    snapshot = service.run(market="cn", persist=True)
+
+    assert snapshot == repository.get_latest_run("cn")
+    assert {item.sector_id for item in snapshot.sectors} == {
+        "concept:configured-seed",
+        "industry:discovered-industry",
+    }
+    configured = next(
+        item
+        for item in snapshot.sectors
+        if item.sector_id == "concept:configured-seed"
+    )
+    observation = market_radar.SectorObservation.model_validate(
+        configured.observation
+    )
+    assert observation.return_20d_pct == pytest.approx(20.0)
+    assert observation.benchmark_return_20d_pct == pytest.approx(20.0)
+    assert observation.capital_flow_20d == 1.0
+    assert (observation.up_count, observation.down_count, observation.flat_count) == (
+        5,
+        0,
+        0,
+    )
+    assert observation.concentration_ratio == 1.0
+    assert observation.raw_reference["candidate_reasons"] == (
+        "configured_seed",
+    )
+    assert len(repository.resolve_snapshot_constituent_evidence(snapshot)) == 2
+    assert snapshot.provider_trace[0]["provider"] == "OfflineDiscovery"
+    assert all(
+        item["stage"] == "enrichment"
+        for item in snapshot.provider_trace[2:]
+    )
+    assert any(
+        item.get("result") == "partial"
+        for item in snapshot.provider_trace[2:]
+    )
+
+    calls_before_replay = tuple(capability_provider.calls)
+    replay = market_radar.MarketRadarReplayEngine(
+        market_radar.RankingConfig()
+    ).replay_persisted_run(repository, snapshot.run_key)
+
+    assert replay.sectors == snapshot.sectors
+    assert tuple(capability_provider.calls) == calls_before_replay
+
+
+def test_offline_nonpersistent_enrichment_never_initializes_database(
+    monkeypatch,
+) -> None:
+    config = market_radar.MarketRadarEnrichmentConfig(
+        candidate_limit=2,
+        total_budget_seconds=10,
+        max_concurrency=1,
+    )
+    capability_provider = OfflineCapabilityProvider()
+    monkeypatch.setattr(
+        DatabaseManager,
+        "get_instance",
+        lambda: pytest.fail("nonpersistent enrichment must not initialize SQLite"),
+    )
+    service = market_radar.MarketRadarService(
+        universe_loader=OfflineUniverse(),
+        provider=market_radar.LegacyRankingProvider(
+            OfflineDiscoveryManager(),
+            limit=1000,
+        ),
+        repository=None,
+        ranking_config=market_radar.RankingConfig(),
+        enricher=market_radar.MarketRadarEnricher(
+            provider=capability_provider,
+            config=config,
+        ),
+        candidate_selector=market_radar.CandidateSelector(),
+        enrichment_config=config,
+        clock=lambda: NOW,
+    )
+
+    snapshot = service.run(market="cn", persist=False)
+
+    assert len(snapshot.sectors) == 2
+    assert capability_provider.calls
+
+
+def test_offline_enriched_service_rolls_back_every_table_on_atomic_failure(
+    isolated_db,
+) -> None:
+    service, repository, _ = _offline_enriched_service(isolated_db)
+    with isolated_db._engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER reject_offline_enriched_evidence
+            BEFORE INSERT ON radar_constituent_observations
+            WHEN NEW.sector_id = 'concept:configured-seed'
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected offline enriched evidence');
+            END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="rejected offline enriched evidence"):
+        service.run(market="cn", persist=True)
+
+    assert repository.get_latest_run("cn") is None
+    assert repository.list_universe(NOW.date()) == []
+    with isolated_db._engine.connect() as connection:
+        for table in (
+            "radar_constituent_sets",
+            "radar_constituent_observations",
+            "radar_runs",
+            "radar_sector_snapshots",
+            "radar_universe",
+        ):
+            count = connection.exec_driver_sql(
+                f"SELECT COUNT(*) FROM {table}"
+            ).scalar_one()
+            assert count == 0, table

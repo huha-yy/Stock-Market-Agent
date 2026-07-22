@@ -1317,6 +1317,54 @@ def test_integrity_retry_recovers_identical_concurrent_evidence(
     assert repo.get_run(run_id) == snapshot
 
 
+def test_get_latest_run_before_uses_aware_utc_strict_upper_bound(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    earlier_as_of = NOW - timedelta(hours=1)
+    later_as_of = NOW + timedelta(hours=1)
+    earlier = _snapshot(
+        run_key="cn:20260721T050000Z:manual",
+        as_of=earlier_as_of,
+        sectors=(_score(observed_at=earlier_as_of),),
+    )
+    current = _snapshot()
+    later = _snapshot(
+        run_key="cn:20260721T070000Z:manual",
+        as_of=later_as_of,
+        sectors=(_score(observed_at=later_as_of),),
+    )
+    for snapshot in (earlier, current, later):
+        repo.save_run(snapshot)
+
+    assert repo.get_latest_run("cn") == later
+    assert repo.get_latest_run(
+        "cn",
+        before=NOW.astimezone(ZoneInfo("Asia/Shanghai")),
+    ) == earlier
+    assert repo.get_latest_run("cn", before=earlier_as_of) is None
+
+
+@pytest.mark.parametrize(
+    "before",
+    [datetime(2026, 7, 21, 6, 0), "2026-07-21T06:00:00Z"],
+)
+def test_get_latest_run_rejects_invalid_before_without_opening_database(
+    isolated_db,
+    monkeypatch,
+    before,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    monkeypatch.setattr(
+        isolated_db,
+        "get_session",
+        lambda: pytest.fail("invalid before must not open a database session"),
+    )
+
+    with pytest.raises(ValueError, match="before must be timezone-aware"):
+        repo.get_latest_run("cn", before=before)
+
+
 def test_integrity_retry_surfaces_different_concurrent_membership(
     isolated_db,
     monkeypatch,

@@ -80,7 +80,7 @@ class MarketRadarRepository:
     @staticmethod
     def _validate_universe(sectors: list[SectorDefinition]) -> None:
         if any(sector.market != "cn" for sector in sectors):
-            raise ValueError("Market Radar Phase 1 supports market=cn only")
+            raise ValueError("Market Radar supports market=cn only")
 
     @staticmethod
     def _sync_universe_in_session(
@@ -664,11 +664,27 @@ class MarketRadarRepository:
                         f"{sector.sector_id}"
                     )
 
-    def get_latest_run(self, market: str) -> RadarRunSnapshot | None:
+    def get_latest_run(
+        self,
+        market: str,
+        before: datetime | None = None,
+    ) -> RadarRunSnapshot | None:
+        filters = [RadarRunRecord.market == market]
+        if before is not None:
+            if (
+                not isinstance(before, datetime)
+                or before.tzinfo is None
+                or before.utcoffset() is None
+            ):
+                raise ValueError("before must be timezone-aware")
+            filters.append(
+                RadarRunRecord.as_of
+                < to_utc_naive_datetime(before.astimezone(timezone.utc))
+            )
         with self.db.get_session() as session:
             run = session.execute(
                 select(RadarRunRecord)
-                .where(RadarRunRecord.market == market)
+                .where(*filters)
                 .order_by(desc(RadarRunRecord.as_of), desc(RadarRunRecord.id))
                 .limit(1)
             ).scalar_one_or_none()

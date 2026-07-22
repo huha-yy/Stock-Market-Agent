@@ -12,6 +12,12 @@ from src.market_radar.models import (
 )
 
 _LAZY_IMPORTS = {
+    "CandidateSelector": "src.market_radar.candidates",
+    "EnrichmentCandidate": "src.market_radar.candidates",
+    "MarketRadarEnrichmentConfig": "src.market_radar.capabilities",
+    "ProviderCapabilityAdapter": "src.market_radar.capability_provider",
+    "EnrichmentBatch": "src.market_radar.enrichment",
+    "MarketRadarEnricher": "src.market_radar.enrichment",
     "LegacyRankingProvider": "src.market_radar.providers",
     "MarketRadarProvider": "src.market_radar.providers",
     "ProviderBatch": "src.market_radar.providers",
@@ -34,15 +40,21 @@ def __getattr__(name: str):
     return value
 
 __all__ = [
+    "CandidateSelector",
     "DataQuality",
+    "EnrichmentBatch",
+    "EnrichmentCandidate",
     "EtfDefinition",
     "FactorBreakdown",
     "LegacyRankingProvider",
     "MarketRadarProvider",
+    "MarketRadarEnricher",
+    "MarketRadarEnrichmentConfig",
     "MarketRadarReplayEngine",
     "MarketRadarRepository",
     "MarketRadarService",
     "ProviderBatch",
+    "ProviderCapabilityAdapter",
     "RadarRunSnapshot",
     "RankingConfig",
     "ReplayFrame",

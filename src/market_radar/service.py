@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Literal
+from math import isfinite
+from typing import Any, Callable, Literal
 from zoneinfo import ZoneInfo
 
+from data_provider.base import sanitize_persisted_text
+from src.market_radar.candidates import CandidateSelector
+from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.models import (
     RadarRunSnapshot,
     SectorDefinition,
+    SectorObservation,
     aggregate_run_quality,
 )
 from src.market_radar.providers import MarketRadarProvider
@@ -16,6 +22,22 @@ from src.market_radar.universe import UniverseLoader
 
 
 _CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_ENRICHMENT_TRACE_LIMIT = 1200
+_TRACE_TEXT_LIMIT = 128
+_TRACE_ERROR_LIMIT = 256
+_ENRICHMENT_TRACE_FIELDS = frozenset(
+    {
+        "sector_id",
+        "capability",
+        "provider",
+        "result",
+        "source",
+        "code",
+        "selected",
+        "duration_ms",
+        "error",
+    }
+)
 
 
 def _merge_discovered_sectors(
@@ -62,6 +84,82 @@ def _merge_discovered_sectors(
     return merged
 
 
+def _merge_observations(
+    discovered: Sequence[SectorObservation],
+    enriched: Sequence[SectorObservation],
+) -> list[SectorObservation]:
+    enriched_by_id: dict[str, SectorObservation] = {}
+    for observation in enriched:
+        if observation.sector_id in enriched_by_id:
+            raise ValueError(
+                "duplicate enrichment output sector_id: "
+                f"{observation.sector_id}"
+            )
+        enriched_by_id[observation.sector_id] = observation
+
+    merged = [
+        enriched_by_id.get(observation.sector_id, observation)
+        for observation in discovered
+    ]
+    discovered_ids = {observation.sector_id for observation in discovered}
+    merged.extend(
+        observation
+        for observation in enriched
+        if observation.sector_id not in discovered_ids
+    )
+    return merged
+
+
+def _clean_trace_scalar(key: str, value: Any) -> str | int | float | bool | None:
+    if isinstance(value, str):
+        limit = _TRACE_ERROR_LIMIT if key == "error" else _TRACE_TEXT_LIMIT
+        return sanitize_persisted_text(value, limit)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and isfinite(value):
+        return value
+    return None
+
+
+def _tag_enrichment_trace(
+    entries: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    tagged: list[dict[str, Any]] = []
+    for entry in tuple(entries)[:_ENRICHMENT_TRACE_LIMIT]:
+        capability = _clean_trace_scalar(
+            "capability",
+            entry.get("capability", "enrichment"),
+        )
+        item: dict[str, Any] = {
+            "stage": "enrichment",
+            "dataset": capability or "enrichment",
+        }
+        for key in _ENRICHMENT_TRACE_FIELDS:
+            if key not in entry:
+                continue
+            value = _clean_trace_scalar(key, entry[key])
+            if value is not None:
+                item[key] = value
+        tagged.append(item)
+    return tuple(tagged)
+
+
+def _validate_previous_snapshot(
+    previous: RadarRunSnapshot,
+    effective_as_of: datetime,
+) -> None:
+    if previous.market != "cn":
+        raise ValueError("previous_snapshot must use market=cn")
+    if previous.as_of.tzinfo is None or previous.as_of.utcoffset() is None:
+        raise ValueError("previous_snapshot.as_of must be timezone-aware")
+    if previous.as_of.astimezone(timezone.utc) >= effective_as_of:
+        raise ValueError(
+            "previous_snapshot.as_of must be strictly earlier than as_of"
+        )
+
+
 class MarketRadarService:
     def __init__(
         self,
@@ -70,12 +168,31 @@ class MarketRadarService:
         provider: MarketRadarProvider,
         repository: MarketRadarRepository | None,
         ranking_config: RankingConfig,
+        enricher: Any | None = None,
+        candidate_selector: CandidateSelector | None = None,
+        enrichment_config: MarketRadarEnrichmentConfig | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.universe_loader = universe_loader
         self.provider = provider
         self.repository = repository
         self.ranking_config = ranking_config
+        self.enricher = enricher
+        self.candidate_selector = (
+            candidate_selector
+            if candidate_selector is not None or enricher is None
+            else CandidateSelector()
+        )
+        inherited_config = getattr(enricher, "config", None)
+        self.enrichment_config = (
+            enrichment_config
+            or (
+                inherited_config
+                if isinstance(inherited_config, MarketRadarEnrichmentConfig)
+                else None
+            )
+            or MarketRadarEnrichmentConfig()
+        )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def run(
@@ -85,9 +202,11 @@ class MarketRadarService:
         as_of: datetime | None = None,
         trigger: Literal["manual", "replay"] = "manual",
         persist: bool = True,
+        discovery_only: bool = False,
+        previous_snapshot: RadarRunSnapshot | None = None,
     ) -> RadarRunSnapshot:
         if market != "cn":
-            raise ValueError("Market Radar Phase 1 supports market=cn only")
+            raise ValueError("Market Radar supports market=cn only")
         repository = self.repository
         if persist and repository is None:
             raise ValueError("repository is required when persist=True")
@@ -95,13 +214,50 @@ class MarketRadarService:
         if requested_as_of.tzinfo is None or requested_as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
         effective_as_of = requested_as_of.astimezone(timezone.utc)
+        if previous_snapshot is not None:
+            _validate_previous_snapshot(previous_snapshot, effective_as_of)
 
         market_date = effective_as_of.astimezone(_CN_MARKET_TIMEZONE).date()
         universe, configured_history = self.universe_loader.load_with_history(
             market_date
         )
         batch = self.provider.fetch(market, effective_as_of, universe)
-        sectors = score_sectors(batch.observations, self.ranking_config)
+        enrichment = None
+        observations = list(batch.observations)
+        enrichment_enabled = not discovery_only and self.enricher is not None
+        if enrichment_enabled:
+            previous = previous_snapshot
+            if persist and previous is None:
+                previous = repository.get_latest_run(
+                    market="cn",
+                    before=effective_as_of,
+                )
+                if previous is not None:
+                    _validate_previous_snapshot(previous, effective_as_of)
+            selector = self.candidate_selector
+            if selector is None:
+                raise RuntimeError(
+                    "candidate_selector is required when enrichment is enabled"
+                )
+            candidates = selector.select(
+                universe,
+                batch.observations,
+                previous,
+                self.enrichment_config.candidate_limit,
+            )
+            enrichment = self.enricher.enrich(candidates, effective_as_of)
+            observations = _merge_observations(
+                batch.observations,
+                enrichment.observations,
+            )
+
+        sectors = score_sectors(observations, self.ranking_config)
+        provider_trace = tuple(batch.trace)
+        if enrichment is not None:
+            provider_trace = (
+                *provider_trace,
+                *_tag_enrichment_trace(enrichment.trace),
+            )
         snapshot = RadarRunSnapshot(
             run_key=(
                 f"{market}:"
@@ -112,11 +268,11 @@ class MarketRadarService:
             trigger=trigger,
             as_of=effective_as_of,
             quality=aggregate_run_quality(
-                item.quality for item in batch.observations
+                item.quality for item in observations
             ),
             scoring_version=self.ranking_config.scoring_version,
             sectors=sectors,
-            provider_trace=batch.trace,
+            provider_trace=provider_trace,
         )
         if persist:
             combined_universe = [
@@ -126,17 +282,25 @@ class MarketRadarService:
                     batch.discovered_sectors,
                 ),
             ]
-            run_id = repository.save_run_with_universe(
-                sorted(
-                    combined_universe,
-                    key=lambda item: (
-                        item.kind,
-                        item.sector_id,
-                        item.effective_from,
-                    ),
+            sorted_universe = sorted(
+                combined_universe,
+                key=lambda item: (
+                    item.kind,
+                    item.sector_id,
+                    item.effective_from,
                 ),
-                snapshot,
             )
+            if enrichment is None:
+                run_id = repository.save_run_with_universe(
+                    sorted_universe,
+                    snapshot,
+                )
+            else:
+                run_id = repository.save_enriched_run(
+                    sorted_universe,
+                    enrichment.constituent_evidence,
+                    snapshot,
+                )
             stored_snapshot = repository.get_run(run_id)
             if stored_snapshot is None:
                 raise RuntimeError(f"Persisted Market Radar run {run_id} was not found")
