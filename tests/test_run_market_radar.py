@@ -16,6 +16,9 @@ MARKET_RADAR_ENV = (
     "MARKET_RADAR_PROVIDER_LIMIT",
     "MARKET_RADAR_STALE_AFTER_SECONDS",
     "MARKET_RADAR_SCORING_VERSION",
+    "MARKET_RADAR_ENRICHMENT_LIMIT",
+    "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS",
+    "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY",
 )
 
 
@@ -44,6 +47,9 @@ def test_config_reads_market_radar_defaults(monkeypatch) -> None:
     assert config.market_radar_provider_limit == 1000
     assert config.market_radar_stale_after_seconds == 2700
     assert config.market_radar_scoring_version == "cn-v1"
+    assert config.market_radar_enrichment_limit == 60
+    assert config.market_radar_enrichment_budget_seconds == 180
+    assert config.market_radar_enrichment_max_concurrency == 6
 
 
 def test_config_reads_market_radar_environment(monkeypatch) -> None:
@@ -53,12 +59,18 @@ def test_config_reads_market_radar_environment(monkeypatch) -> None:
             "MARKET_RADAR_PROVIDER_LIMIT": "250",
             "MARKET_RADAR_STALE_AFTER_SECONDS": "600",
             "MARKET_RADAR_SCORING_VERSION": " cn-v1 ",
+            "MARKET_RADAR_ENRICHMENT_LIMIT": "75",
+            "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS": "240",
+            "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY": "4",
         },
     )
 
     assert config.market_radar_provider_limit == 250
     assert config.market_radar_stale_after_seconds == 600
     assert config.market_radar_scoring_version == "cn-v1"
+    assert config.market_radar_enrichment_limit == 75
+    assert config.market_radar_enrichment_budget_seconds == 240
+    assert config.market_radar_enrichment_max_concurrency == 4
 
 
 def test_config_clamps_and_falls_back_for_invalid_market_radar_values(
@@ -70,12 +82,18 @@ def test_config_clamps_and_falls_back_for_invalid_market_radar_values(
             "MARKET_RADAR_PROVIDER_LIMIT": "9",
             "MARKET_RADAR_STALE_AFTER_SECONDS": "not-an-int",
             "MARKET_RADAR_SCORING_VERSION": "   ",
+            "MARKET_RADAR_ENRICHMENT_LIMIT": "0",
+            "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS": "901",
+            "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY": "invalid",
         },
     )
 
     assert config.market_radar_provider_limit == 10
     assert config.market_radar_stale_after_seconds == 2700
     assert config.market_radar_scoring_version == "cn-v1"
+    assert config.market_radar_enrichment_limit == 1
+    assert config.market_radar_enrichment_budget_seconds == 900
+    assert config.market_radar_enrichment_max_concurrency == 6
 
 
 def test_build_service_composes_phase_one_dependencies(monkeypatch) -> None:
