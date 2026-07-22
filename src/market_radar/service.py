@@ -7,8 +7,9 @@ from typing import Any, Callable, Literal
 from zoneinfo import ZoneInfo
 
 from data_provider.base import sanitize_persisted_text
-from src.market_radar.candidates import CandidateSelector
+from src.market_radar.candidates import CandidateSelector, EnrichmentCandidate
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
+from src.market_radar.enrichment import EnrichmentBatch
 from src.market_radar.models import (
     RadarRunSnapshot,
     SectorDefinition,
@@ -110,6 +111,20 @@ def _merge_observations(
     return merged
 
 
+def _validate_unique_observations(
+    observations: Sequence[SectorObservation],
+    stage: str,
+) -> None:
+    seen: set[str] = set()
+    for observation in observations:
+        if observation.sector_id in seen:
+            raise ValueError(
+                f"duplicate {stage} observation sector_id: "
+                f"{observation.sector_id}"
+            )
+        seen.add(observation.sector_id)
+
+
 def _clean_trace_scalar(key: str, value: Any) -> str | int | float | bool | None:
     if isinstance(value, str):
         limit = _TRACE_ERROR_LIMIT if key == "error" else _TRACE_TEXT_LIMIT
@@ -160,6 +175,63 @@ def _validate_previous_snapshot(
         )
 
 
+def _validate_enrichment_output(
+    candidates: Sequence[EnrichmentCandidate],
+    enrichment: EnrichmentBatch,
+) -> None:
+    selected_by_id: dict[str, EnrichmentCandidate] = {}
+    selected_ids: list[str] = []
+    for candidate in candidates:
+        sector_id = candidate.sector.sector_id
+        if sector_id in selected_by_id:
+            raise ValueError(f"duplicate selected candidate sector_id: {sector_id}")
+        selected_by_id[sector_id] = candidate
+        selected_ids.append(sector_id)
+
+    output_ids = [item.sector_id for item in enrichment.observations]
+    if len(output_ids) != len(set(output_ids)):
+        raise ValueError("duplicate enrichment output sector_id")
+    if output_ids != selected_ids:
+        raise ValueError(
+            "enrichment observation sector IDs must exactly match selected candidates"
+        )
+
+    output_by_id = {
+        observation.sector_id: observation
+        for observation in enrichment.observations
+    }
+    for sector_id in selected_ids:
+        sector = selected_by_id[sector_id].sector
+        observation = output_by_id[sector_id]
+        for field_name in ("market", "sector_id", "kind", "name"):
+            if getattr(observation, field_name) != getattr(sector, field_name):
+                raise ValueError(
+                    f"enrichment observation {field_name} mismatch for {sector_id}"
+                )
+
+    evidence_sector_ids: set[str] = set()
+    evidence_keys: set[str] = set()
+    for evidence in enrichment.constituent_evidence:
+        if evidence.sector_id not in selected_by_id:
+            raise ValueError(
+                "constituent evidence sector_id was not selected: "
+                f"{evidence.sector_id}"
+            )
+        if (
+            evidence.sector_id in evidence_sector_ids
+            or evidence.set_key in evidence_keys
+        ):
+            raise ValueError("duplicate constituent evidence sector_id or set_key")
+        observation = output_by_id[evidence.sector_id]
+        if observation.raw_reference.get("constituent_set_key") != evidence.set_key:
+            raise ValueError(
+                "constituent evidence is not referenced by selected output: "
+                f"{evidence.sector_id}"
+            )
+        evidence_sector_ids.add(evidence.sector_id)
+        evidence_keys.add(evidence.set_key)
+
+
 class MarketRadarService:
     def __init__(
         self,
@@ -207,13 +279,28 @@ class MarketRadarService:
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar supports market=cn only")
+        if trigger == "replay":
+            raise ValueError(
+                "MarketRadarService.run does not perform live replay; use "
+                "MarketRadarReplayEngine.replay_persisted_run"
+            )
         repository = self.repository
         if persist and repository is None:
             raise ValueError("repository is required when persist=True")
-        requested_as_of = as_of if as_of is not None else self.clock()
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        requested_as_of = as_of if as_of is not None else now
         if requested_as_of.tzinfo is None or requested_as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
         effective_as_of = requested_as_of.astimezone(timezone.utc)
+        if (
+            effective_as_of.astimezone(_CN_MARKET_TIMEZONE).date()
+            != now.astimezone(_CN_MARKET_TIMEZONE).date()
+        ):
+            raise ValueError(
+                "as_of must use the same Asia/Shanghai calendar date as the clock"
+            )
         if previous_snapshot is not None:
             _validate_previous_snapshot(previous_snapshot, effective_as_of)
 
@@ -222,6 +309,7 @@ class MarketRadarService:
             market_date
         )
         batch = self.provider.fetch(market, effective_as_of, universe)
+        _validate_unique_observations(batch.observations, "discovery")
         enrichment = None
         observations = list(batch.observations)
         enrichment_enabled = not discovery_only and self.enricher is not None
@@ -246,11 +334,13 @@ class MarketRadarService:
                 self.enrichment_config.candidate_limit,
             )
             enrichment = self.enricher.enrich(candidates, effective_as_of)
+            _validate_enrichment_output(candidates, enrichment)
             observations = _merge_observations(
                 batch.observations,
                 enrichment.observations,
             )
 
+        _validate_unique_observations(observations, "final")
         sectors = score_sectors(observations, self.ranking_config)
         provider_trace = tuple(batch.trace)
         if enrichment is not None:

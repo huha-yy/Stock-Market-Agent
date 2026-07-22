@@ -16,6 +16,10 @@ from src.market_radar.models import (
     SectorDefinition,
     SectorObservation,
 )
+from src.market_radar.observation_builder import (
+    ConstituentEvidence,
+    canonical_constituent_set_key,
+)
 from src.market_radar.providers import ProviderBatch
 from src.market_radar.ranking import RankingConfig
 from src.market_radar.repository import MarketRadarRepository
@@ -255,6 +259,50 @@ def _previous_snapshot(as_of: datetime) -> RadarRunSnapshot:
     )
 
 
+def _evidence(
+    sector_id: str,
+    *,
+    source: str = "membership-fixture",
+    codes: tuple[str, ...] = ("000001", "600519"),
+) -> ConstituentEvidence:
+    return ConstituentEvidence(
+        market="cn",
+        sector_id=sector_id,
+        source=source,
+        data_date=NOW.date(),
+        observed_at=NOW,
+        codes=codes,
+        set_key=canonical_constituent_set_key("cn", sector_id, source, codes),
+    )
+
+
+def _assert_enrichment_rejected_before_rank_or_persistence(
+    monkeypatch,
+    *,
+    candidates: tuple[EnrichmentCandidate, ...],
+    enrichment: EnrichmentBatch,
+    match: str,
+) -> None:
+    repository = FakeRepository()
+    monkeypatch.setattr(
+        service_module,
+        "score_sectors",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid enrichment output must not be ranked"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _service(
+            repository=repository,
+            candidate_selector=RecordingSelector(candidates),
+            enricher=RecordingEnricher(enrichment),
+        ).run(previous_snapshot=_previous_snapshot(NOW - timedelta(hours=1)))
+
+    assert repository.enriched_writes == []
+    assert repository.snapshot is None
+
+
 def test_run_builds_stable_snapshot_and_persists_in_dependency_order() -> None:
     events: list[str] = []
     universe = FakeUniverse(events=events)
@@ -476,6 +524,146 @@ def test_duplicate_enrichment_output_aborts_before_ranking_or_persistence(
     assert repository.snapshot is None
 
 
+def test_enrichment_output_rejects_unknown_sector_before_rank_or_persistence(
+    monkeypatch,
+) -> None:
+    selected = _definition()
+    candidate = EnrichmentCandidate(
+        selected,
+        _observation(),
+        ("configured_seed",),
+    )
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(candidate,),
+        enrichment=EnrichmentBatch(
+            (_observation("industry:unknown", name="Unknown"),),
+            (),
+            (),
+        ),
+        match="enrichment observation sector IDs must exactly match selected candidates",
+    )
+
+
+def test_enrichment_output_rejects_missing_selected_sector_before_rank_or_persistence(
+    monkeypatch,
+) -> None:
+    first = EnrichmentCandidate(
+        _definition(),
+        _observation(),
+        ("configured_seed",),
+    )
+    second_definition = _definition("industry:second", name="Second")
+    second = EnrichmentCandidate(
+        second_definition,
+        _observation("industry:second", name="Second"),
+        ("current_industry_laggard",),
+    )
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(first, second),
+        enrichment=EnrichmentBatch((_observation(),), (), ()),
+        match="enrichment observation sector IDs must exactly match selected candidates",
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "field"),
+    [
+        ({"market": "hk"}, "market"),
+        ({"kind": "concept"}, "kind"),
+        ({"name": "Changed"}, "name"),
+    ],
+)
+def test_enrichment_output_rejects_candidate_identity_mismatch_before_rank(
+    monkeypatch,
+    updates: dict[str, str],
+    field: str,
+) -> None:
+    candidate = EnrichmentCandidate(
+        _definition(),
+        _observation(),
+        ("configured_seed",),
+    )
+    mismatched = _observation().model_copy(update=updates)
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(candidate,),
+        enrichment=EnrichmentBatch((mismatched,), (), ()),
+        match=f"enrichment observation {field} mismatch",
+    )
+
+
+def test_enrichment_output_rejects_evidence_for_unselected_sector_before_rank(
+    monkeypatch,
+) -> None:
+    candidate = EnrichmentCandidate(
+        _definition(),
+        _observation(),
+        ("configured_seed",),
+    )
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(candidate,),
+        enrichment=EnrichmentBatch(
+            (_observation(),),
+            (_evidence("industry:unselected"),),
+            (),
+        ),
+        match="constituent evidence sector_id was not selected",
+    )
+
+
+def test_enrichment_output_rejects_duplicate_evidence_before_rank(
+    monkeypatch,
+) -> None:
+    candidate = EnrichmentCandidate(
+        _definition(),
+        _observation(),
+        ("configured_seed",),
+    )
+    evidence = _evidence(candidate.sector.sector_id)
+    observation = _observation().model_copy(
+        update={"raw_reference": {"constituent_set_key": evidence.set_key}}
+    )
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(candidate,),
+        enrichment=EnrichmentBatch(
+            (observation,),
+            (evidence, evidence),
+            (),
+        ),
+        match="duplicate constituent evidence",
+    )
+
+
+def test_enrichment_output_rejects_evidence_not_referenced_by_selected_output(
+    monkeypatch,
+) -> None:
+    candidate = EnrichmentCandidate(
+        _definition(),
+        _observation(),
+        ("configured_seed",),
+    )
+
+    _assert_enrichment_rejected_before_rank_or_persistence(
+        monkeypatch,
+        candidates=(candidate,),
+        enrichment=EnrichmentBatch(
+            (_observation(),),
+            (_evidence(candidate.sector.sector_id),),
+            (),
+        ),
+        match="constituent evidence is not referenced by selected output",
+    )
+
+
 def test_enrichment_trace_is_bounded_tagged_and_drops_unknown_secret_fields() -> None:
     trace = tuple(
         {
@@ -500,7 +688,84 @@ def test_enrichment_trace_is_bounded_tagged_and_drops_unknown_secret_fields() ->
     assert "secret" not in str(enrichment_trace)
 
 
-def test_explicit_as_of_and_trigger_determine_key_without_reading_clock() -> None:
+@pytest.mark.parametrize(
+    "mode",
+    ["discovery_only", "no_enricher", "enriched"],
+)
+def test_duplicate_discovery_observations_abort_before_selection_rank_or_persist(
+    monkeypatch,
+    mode: str,
+) -> None:
+    duplicate = _observation()
+    provider = FakeProvider(
+        ProviderBatch(
+            observations=[duplicate, duplicate],
+            trace=[],
+        )
+    )
+    repository = FakeRepository()
+    selector = RecordingSelector()
+    enricher = RecordingEnricher(EnrichmentBatch((), (), ()))
+    monkeypatch.setattr(
+        service_module,
+        "score_sectors",
+        lambda *_args, **_kwargs: pytest.fail(
+            "duplicate discovery must not be ranked"
+        ),
+    )
+    service = _service(
+        provider=provider,
+        repository=repository,
+        candidate_selector=selector if mode == "enriched" else None,
+        enricher=enricher if mode == "enriched" else None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate discovery observation sector_id"):
+        service.run(discovery_only=mode == "discovery_only")
+
+    assert selector.calls == []
+    assert enricher.calls == []
+    assert repository.latest_calls == []
+    assert repository.snapshot is None
+
+
+def test_duplicate_final_observations_abort_before_rank_or_persist(
+    monkeypatch,
+) -> None:
+    observation = _observation()
+    candidate = EnrichmentCandidate(
+        _definition(),
+        observation,
+        ("configured_seed",),
+    )
+    repository = FakeRepository()
+    monkeypatch.setattr(
+        service_module,
+        "_merge_observations",
+        lambda *_args: [observation, observation],
+    )
+    monkeypatch.setattr(
+        service_module,
+        "score_sectors",
+        lambda *_args, **_kwargs: pytest.fail(
+            "duplicate final observations must not be ranked"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="duplicate final observation sector_id"):
+        _service(
+            repository=repository,
+            candidate_selector=RecordingSelector((candidate,)),
+            enricher=RecordingEnricher(
+                EnrichmentBatch((observation,), (), ())
+            ),
+        ).run(previous_snapshot=_previous_snapshot(NOW - timedelta(hours=1)))
+
+    assert repository.enriched_writes == []
+    assert repository.snapshot is None
+
+
+def test_explicit_same_market_date_as_of_reads_clock_once_and_determines_key() -> None:
     as_of = datetime(
         2026,
         7,
@@ -509,18 +774,75 @@ def test_explicit_as_of_and_trigger_determine_key_without_reading_clock() -> Non
         30,
         tzinfo=timezone(timedelta(hours=8)),
     )
+    calls = 0
 
-    def unexpected_clock() -> datetime:
-        raise AssertionError("clock must not be read when as_of is explicit")
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        return NOW
 
-    snapshot = _service(clock=unexpected_clock).run(
+    snapshot = _service(clock=clock).run(
         as_of=as_of,
-        trigger="replay",
         persist=False,
     )
 
-    assert snapshot.run_key == "cn:20260721T063000Z:replay"
+    assert calls == 1
+    assert snapshot.run_key == "cn:20260721T063000Z:manual"
     assert snapshot.as_of == as_of.astimezone(timezone.utc)
+
+
+def test_replay_trigger_rejects_before_live_or_repository_dependencies() -> None:
+    events: list[str] = []
+    repository = FakeRepository(events=events)
+
+    with pytest.raises(
+        ValueError,
+        match="MarketRadarReplayEngine.replay_persisted_run",
+    ):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=repository,
+        ).run(trigger="replay")
+
+    assert events == []
+    assert repository.latest_calls == []
+
+
+@pytest.mark.parametrize(
+    "as_of",
+    [NOW - timedelta(days=1), NOW + timedelta(days=1)],
+    ids=["historical", "future"],
+)
+def test_manual_run_rejects_different_market_date_before_dependencies(
+    as_of: datetime,
+) -> None:
+    events: list[str] = []
+    repository = FakeRepository(events=events)
+
+    with pytest.raises(ValueError, match="same Asia/Shanghai calendar date"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=repository,
+        ).run(as_of=as_of)
+
+    assert events == []
+    assert repository.latest_calls == []
+
+
+def test_run_rejects_naive_clock_before_dependencies() -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="clock must return a timezone-aware"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=FakeRepository(events=events),
+            clock=lambda: datetime(2026, 7, 21, 6, 0),
+        ).run()
+
+    assert events == []
 
 
 def test_run_canonicalizes_equivalent_instants_and_uses_cn_market_date() -> None:
@@ -708,15 +1030,20 @@ sectors:
 
     provider = RecordingProvider()
     repository = MarketRadarRepository(isolated_db)
+    first_as_of = datetime(2026, 7, 21, 6, tzinfo=timezone.utc)
+    second_as_of = datetime(2027, 7, 21, 6, tzinfo=timezone.utc)
+    current = [first_as_of]
     service = MarketRadarService(
         universe_loader=UniverseLoader(path),
         provider=provider,
         repository=repository,
         ranking_config=RankingConfig(),
+        clock=lambda: current[0],
     )
 
-    service.run(as_of=datetime(2026, 7, 21, 6, tzinfo=timezone.utc))
-    service.run(as_of=datetime(2027, 7, 21, 6, tzinfo=timezone.utc))
+    service.run(as_of=first_as_of)
+    current[0] = second_as_of
+    service.run(as_of=second_as_of)
 
     assert provider.active_etf_codes == [["512402"], ["512403"]]
     assert [
@@ -779,14 +1106,16 @@ sectors:
 
     provider = DiscoveryProvider()
     repository = MarketRadarRepository(isolated_db)
+    as_of = datetime(2026, 7, 21, 6, tzinfo=timezone.utc)
     service = MarketRadarService(
         universe_loader=UniverseLoader(path),
         provider=provider,
         repository=repository,
         ranking_config=RankingConfig(),
+        clock=lambda: as_of,
     )
 
-    service.run(as_of=datetime(2026, 7, 21, 6, tzinfo=timezone.utc))
+    service.run(as_of=as_of)
 
     past = repository.list_universe(date(2025, 12, 31))
     current = repository.list_universe(date(2026, 12, 31))
