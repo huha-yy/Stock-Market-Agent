@@ -209,11 +209,21 @@ class MarketRadarRepository:
                     session,
                     validated_evidence,
                 )
+                self._validate_effective_constituent_evidence_in_session(
+                    session,
+                    validated_evidence,
+                    snapshot,
+                )
                 return int(existing_id)
             self._sync_universe_in_session(session, sectors)
             self._save_constituent_evidence_in_session(
                 session,
                 validated_evidence,
+            )
+            self._validate_effective_constituent_evidence_in_session(
+                session,
+                validated_evidence,
+                snapshot,
             )
             return self._save_run_in_session(session, snapshot)
 
@@ -466,6 +476,53 @@ class MarketRadarRepository:
                 item,
                 _dump(list(item.codes)),
                 existing_set,
+                observation,
+            )
+
+    @classmethod
+    def _validate_effective_constituent_evidence_in_session(
+        cls,
+        session: Any,
+        evidence: Sequence[ConstituentEvidence],
+        snapshot: RadarRunSnapshot,
+    ) -> None:
+        observations_by_key: dict[str, SectorObservation] = {}
+        for sector in snapshot.sectors:
+            observation = SectorObservation.model_validate(sector.observation)
+            set_key = observation.raw_reference.get("constituent_set_key")
+            if isinstance(set_key, str) and set_key:
+                observations_by_key[set_key] = observation
+
+        for item in evidence:
+            observation = observations_by_key.get(item.set_key)
+            if observation is None:
+                raise ValueError(
+                    f"effective constituent evidence is not referenced for "
+                    f"{item.sector_id}"
+                )
+            set_row = session.get(RadarConstituentSetRecord, item.set_key)
+            observation_row = session.execute(
+                select(RadarConstituentObservationRecord).where(
+                    and_(
+                        RadarConstituentObservationRecord.market == item.market,
+                        RadarConstituentObservationRecord.sector_id
+                        == item.sector_id,
+                        RadarConstituentObservationRecord.data_date
+                        == item.data_date,
+                        RadarConstituentObservationRecord.source == item.source,
+                        RadarConstituentObservationRecord.set_key == item.set_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if set_row is None or observation_row is None:
+                raise ValueError(
+                    f"missing or mismatched effective constituent evidence for "
+                    f"{item.sector_id}"
+                )
+            effective = cls._evidence_from_rows(set_row, observation_row)
+            cls._validate_point_in_time_evidence(
+                effective,
+                snapshot,
                 observation,
             )
 

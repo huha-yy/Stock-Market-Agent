@@ -818,7 +818,118 @@ def test_same_identity_and_set_is_idempotent_and_preserves_first_observed_at(
     ) == first
 
 
-def test_existing_run_key_does_not_persist_unreferenced_retry_evidence(
+def test_effective_first_observation_blocks_reverse_time_run_and_allows_later_run(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first_observed = NOW + timedelta(minutes=2)
+    first = _constituent_evidence(observed_at=first_observed)
+    reverse_time = replace(first, observed_at=NOW)
+    later = replace(first, observed_at=NOW + timedelta(minutes=3))
+    repo.save_enriched_run(
+        [_sector_definition(name="Original")],
+        [first],
+        _enriched_snapshot(first, run_key="cn:20260721T060200Z:manual"),
+    )
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
+        repo.save_enriched_run(
+            [_sector_definition(name="Rejected")],
+            [reverse_time],
+            _enriched_snapshot(
+                reverse_time,
+                run_key="cn:20260721T060000Z:manual",
+            ),
+        )
+
+    assert repo.get_run_by_key("cn:20260721T060000Z:manual") is None
+    assert repo.list_universe(NOW.date()) == [
+        _sector_definition(name="Original")
+    ]
+
+    later_snapshot = _enriched_snapshot(
+        later,
+        run_key="cn:20260721T060300Z:manual",
+    )
+    later_id = repo.save_enriched_run(
+        [_sector_definition(name="Later")],
+        [later],
+        later_snapshot,
+    )
+
+    assert repo.get_run(later_id) == later_snapshot
+    assert repo.get_constituent_evidence(
+        first.market,
+        first.sector_id,
+        first.data_date,
+        first.source,
+    ) == first
+
+
+def test_existing_run_key_validates_effective_first_observation(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first = _constituent_evidence(observed_at=NOW + timedelta(minutes=2))
+    reverse_time = replace(first, observed_at=NOW)
+    repo.save_enriched_run(
+        [_sector_definition()],
+        [first],
+        _enriched_snapshot(first, run_key="cn:20260721T060200Z:manual"),
+    )
+    existing_snapshot = _enriched_snapshot(
+        reverse_time,
+        run_key="cn:20260721T060000Z:manual",
+    )
+    existing_id = repo.save_run(existing_snapshot)
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [reverse_time],
+            existing_snapshot,
+        )
+
+    assert repo.get_run(existing_id) == existing_snapshot
+
+
+def test_integrity_retry_validates_effective_winner_observed_at(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    caller = _constituent_evidence(observed_at=NOW)
+    winner = replace(caller, observed_at=NOW + timedelta(minutes=1))
+    snapshot = _enriched_snapshot(caller)
+    original_transaction = isolated_db._run_write_transaction
+    attempts = 0
+
+    def fail_once(operation_name, operation):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            original_transaction(
+                "concurrent-later-constituent-winner",
+                lambda session: repo._save_constituent_evidence_in_session(
+                    session, [winner]
+                ),
+            )
+            raise IntegrityError("INSERT", {}, RuntimeError("concurrent insert"))
+        return original_transaction(operation_name, operation)
+
+    monkeypatch.setattr(isolated_db, "_run_write_transaction", fail_once)
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [caller],
+            snapshot,
+        )
+
+    assert attempts == 2
+    assert repo.get_run_by_key(snapshot.run_key) is None
+    assert repo.list_universe(NOW.date()) == []
+
+
+def test_existing_run_key_rejects_unpersisted_retry_evidence(
     isolated_db,
 ) -> None:
     repo = MarketRadarRepository(isolated_db)
@@ -836,13 +947,16 @@ def test_existing_run_key_does_not_persist_unreferenced_retry_evidence(
         original_snapshot,
     )
 
-    retry_id = repo.save_enriched_run(
-        [_sector_definition(name="Changed")],
-        [changed],
-        changed_snapshot,
-    )
+    with pytest.raises(
+        ValueError,
+        match="missing or mismatched effective constituent evidence",
+    ):
+        repo.save_enriched_run(
+            [_sector_definition(name="Changed")],
+            [changed],
+            changed_snapshot,
+        )
 
-    assert retry_id == original_id
     assert repo.get_run(original_id) == original_snapshot
     assert repo.get_constituent_set(changed.set_key) is None
     assert repo.list_universe(NOW.date()) == [
