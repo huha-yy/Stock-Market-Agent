@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
@@ -10,6 +11,9 @@ from src.market_radar.models import (
     aggregate_run_quality,
 )
 from src.market_radar.ranking import RankingConfig, score_sectors
+
+if TYPE_CHECKING:
+    from src.market_radar.repository import MarketRadarRepository
 
 
 class ReplayFrame(BaseModel):
@@ -59,3 +63,20 @@ class MarketRadarReplayEngine:
             )
             previous = frame_as_of_utc
         return snapshots
+
+    def replay_persisted_run(
+        self,
+        repository: MarketRadarRepository,
+        run_key: str,
+    ) -> RadarRunSnapshot:
+        stored = repository.get_run_by_key(run_key)
+        if stored is None:
+            raise ValueError(f"stored Market Radar run not found: {run_key}")
+        repository.resolve_snapshot_constituent_evidence(stored)
+        observations = tuple(
+            SectorObservation.model_validate(sector.observation)
+            for sector in stored.sectors
+        )
+        return self.replay(
+            [ReplayFrame(as_of=stored.as_of, observations=observations)]
+        )[0]

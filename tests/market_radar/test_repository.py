@@ -5,10 +5,11 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import event, func, inspect, select
+from sqlalchemy import delete, event, func, inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from src.config import Config
@@ -19,9 +20,15 @@ from src.market_radar.models import (
     SectorObservation,
     SectorScore,
 )
+from src.market_radar.observation_builder import (
+    ConstituentEvidence,
+    canonical_constituent_set_key,
+)
 from src.market_radar.repository import MarketRadarRepository
 from src.storage import (
     DatabaseManager,
+    RadarConstituentObservationRecord,
+    RadarConstituentSetRecord,
     RadarRunRecord,
     RadarSectorSnapshotRecord,
     RadarUniverseRecord,
@@ -56,7 +63,20 @@ def _score(
     name: str = "Semiconductor",
     score: float = 70.0,
     observed_at: datetime = NOW,
+    constituent_set_key: str | None = None,
+    evidence_date: date | None = None,
+    membership_source: str = "membership-fixture",
 ) -> SectorScore:
+    raw_reference = {"provider": {"name": "fixture"}}
+    if constituent_set_key is not None:
+        raw_reference = {
+            "schema": "market-radar-observation-v2a",
+            "data_date": evidence_date or observed_at.date(),
+            "capabilities": {
+                "membership": {"source": membership_source},
+            },
+            "constituent_set_key": constituent_set_key,
+        }
     observation = SectorObservation(
         sector_id=sector_id,
         name=name,
@@ -67,7 +87,7 @@ def _score(
         quality="partial",
         return_1d_pct=2.5,
         missing_fields=TRACKED_METRICS[1:],
-        raw_reference={"provider": {"name": "fixture"}},
+        raw_reference=raw_reference,
     )
     return SectorScore(
         sector_id=sector_id,
@@ -104,6 +124,63 @@ def _snapshot(
         scoring_version="cn-v1",
         sectors=sectors or (_score(observed_at=as_of),),
         provider_trace=[{"source": "fixture", "result": {"status": "ok"}}],
+    )
+
+
+def _constituent_evidence(
+    *,
+    sector_id: str = "industry:semiconductor",
+    source: str = "membership-fixture",
+    data_date: date = NOW.date(),
+    observed_at: datetime = NOW,
+    codes: tuple[str, ...] = ("000001", "300750", "600519"),
+) -> ConstituentEvidence:
+    return ConstituentEvidence(
+        market="cn",
+        sector_id=sector_id,
+        source=source,
+        data_date=data_date,
+        observed_at=observed_at,
+        codes=codes,
+        set_key=canonical_constituent_set_key(
+            "cn",
+            sector_id,
+            source,
+            codes,
+        ),
+    )
+
+
+def _sector_definition(
+    *,
+    sector_id: str = "industry:semiconductor",
+    name: str = "Semiconductor",
+) -> SectorDefinition:
+    return SectorDefinition(
+        sector_id=sector_id,
+        kind="industry",
+        name=name,
+        effective_from=date(2026, 1, 1),
+    )
+
+
+def _enriched_snapshot(
+    evidence: ConstituentEvidence,
+    *,
+    run_key: str = "cn:20260721T060000Z:manual",
+) -> RadarRunSnapshot:
+    return _snapshot(
+        run_key=run_key,
+        as_of=evidence.observed_at,
+        sectors=(
+            _score(
+                evidence.sector_id,
+                observed_at=evidence.observed_at,
+                constituent_set_key=evidence.set_key,
+                evidence_date=evidence.data_date,
+                membership_source=evidence.source,
+            ),
+        ),
     )
 
 
@@ -146,7 +223,13 @@ def test_tables_are_created(isolated_db) -> None:
     inspector = inspect(isolated_db._engine)
     names = set(inspector.get_table_names())
 
-    assert {"radar_universe", "radar_runs", "radar_sector_snapshots"} <= names
+    assert {
+        "radar_universe",
+        "radar_constituent_sets",
+        "radar_constituent_observations",
+        "radar_runs",
+        "radar_sector_snapshots",
+    } <= names
     snapshot_columns = {
         column["name"]: column
         for column in inspector.get_columns("radar_sector_snapshots")
@@ -197,6 +280,50 @@ def test_tables_are_created(isolated_db) -> None:
         and tuple(item["referred_columns"]) == ("id",)
         and item["options"].get("ondelete") == "CASCADE"
         for item in foreign_keys
+    )
+
+    constituent_set_pk = inspector.get_pk_constraint("radar_constituent_sets")
+    assert tuple(constituent_set_pk["constrained_columns"]) == ("set_key",)
+    constituent_set_indexes = {
+        item["name"]: tuple(item["column_names"])
+        for item in inspector.get_indexes("radar_constituent_sets")
+    }
+    assert constituent_set_indexes["idx_radar_constituent_set_identity"] == (
+        "market",
+        "sector_id",
+        "source",
+    )
+
+    observation_uniques = {
+        item["name"]: tuple(item["column_names"])
+        for item in inspector.get_unique_constraints(
+            "radar_constituent_observations"
+        )
+    }
+    assert observation_uniques["uix_radar_constituent_observation_identity"] == (
+        "market",
+        "sector_id",
+        "data_date",
+        "source",
+    )
+    observation_indexes = {
+        item["name"]: tuple(item["column_names"])
+        for item in inspector.get_indexes("radar_constituent_observations")
+    }
+    assert observation_indexes[
+        "idx_radar_constituent_observation_history"
+    ] == ("market", "sector_id", "data_date")
+    assert observation_indexes["idx_radar_constituent_observation_set_key"] == (
+        "set_key",
+    )
+    constituent_foreign_keys = inspector.get_foreign_keys(
+        "radar_constituent_observations"
+    )
+    assert any(
+        tuple(item["constrained_columns"]) == ("set_key",)
+        and item["referred_table"] == "radar_constituent_sets"
+        and tuple(item["referred_columns"]) == ("set_key",)
+        for item in constituent_foreign_keys
     )
 
 
@@ -562,3 +689,456 @@ def test_save_run_rejects_mismatched_observation_before_writing(
 
     with isolated_db.get_session() as session:
         assert session.scalar(select(func.count(RadarRunRecord.id))) == 0
+
+
+def test_enriched_run_reuses_content_and_reads_immutable_evidence(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first = _constituent_evidence()
+    later = replace(
+        first,
+        data_date=first.data_date + timedelta(days=1),
+        observed_at=first.observed_at + timedelta(days=1),
+    )
+    first_snapshot = _enriched_snapshot(first)
+    later_snapshot = _enriched_snapshot(
+        later,
+        run_key="cn:20260722T060000Z:manual",
+    )
+
+    first_id = repo.save_enriched_run(
+        [_sector_definition()], [first], first_snapshot
+    )
+    later_id = repo.save_enriched_run(
+        [_sector_definition()], [later], later_snapshot
+    )
+
+    with isolated_db.get_session() as session:
+        assert session.scalar(
+            select(func.count(RadarConstituentSetRecord.set_key))
+        ) == 1
+        assert session.scalar(
+            select(func.count(RadarConstituentObservationRecord.id))
+        ) == 2
+        stored_observed_at = session.scalar(
+            select(RadarConstituentObservationRecord.observed_at).where(
+                RadarConstituentObservationRecord.data_date == first.data_date
+            )
+        )
+        assert stored_observed_at == first.observed_at.replace(tzinfo=None)
+        assert stored_observed_at.tzinfo is None
+    assert repo.get_run_by_key(first_snapshot.run_key) == first_snapshot
+    assert repo.get_run_by_key("missing") is None
+    assert repo.get_constituent_set(first.set_key) == later
+    assert repo.get_constituent_set("sha256:missing") is None
+    assert repo.get_constituent_evidence(
+        first.market,
+        first.sector_id,
+        first.data_date,
+        first.source,
+    ) == first
+    assert repo.resolve_run_constituent_evidence(first_id) == (first,)
+    assert repo.resolve_snapshot_constituent_evidence(later_snapshot) == (later,)
+    assert later_id != first_id
+
+
+def test_same_identity_and_set_is_idempotent_and_preserves_first_observed_at(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first = _constituent_evidence()
+    retry = replace(first, observed_at=first.observed_at + timedelta(minutes=5))
+
+    repo.save_enriched_run(
+        [_sector_definition()], [first], _enriched_snapshot(first)
+    )
+    repo.save_enriched_run(
+        [_sector_definition()],
+        [retry],
+        _enriched_snapshot(retry, run_key="cn:20260721T060500Z:manual"),
+    )
+
+    with isolated_db.get_session() as session:
+        assert session.scalar(
+            select(func.count(RadarConstituentSetRecord.set_key))
+        ) == 1
+        assert session.scalar(
+            select(func.count(RadarConstituentObservationRecord.id))
+        ) == 1
+    assert repo.get_constituent_evidence(
+        first.market,
+        first.sector_id,
+        first.data_date,
+        first.source,
+    ) == first
+
+
+def test_existing_run_key_does_not_persist_unreferenced_retry_evidence(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    original = _constituent_evidence()
+    changed = _constituent_evidence(
+        data_date=original.data_date + timedelta(days=1),
+        observed_at=original.observed_at + timedelta(days=1),
+        codes=("000001", "600519"),
+    )
+    original_snapshot = _enriched_snapshot(original)
+    changed_snapshot = _enriched_snapshot(changed)
+    original_id = repo.save_enriched_run(
+        [_sector_definition(name="Original")],
+        [original],
+        original_snapshot,
+    )
+
+    retry_id = repo.save_enriched_run(
+        [_sector_definition(name="Changed")],
+        [changed],
+        changed_snapshot,
+    )
+
+    assert retry_id == original_id
+    assert repo.get_run(original_id) == original_snapshot
+    assert repo.get_constituent_set(changed.set_key) is None
+    assert repo.list_universe(NOW.date()) == [
+        _sector_definition(name="Original")
+    ]
+
+
+def test_existing_run_key_still_surfaces_membership_identity_conflict(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    original = _constituent_evidence()
+    conflicting = _constituent_evidence(codes=("000001", "600519"))
+    repo.save_enriched_run(
+        [_sector_definition()],
+        [original],
+        _enriched_snapshot(original),
+    )
+
+    with pytest.raises(ValueError, match="conflicting constituent membership"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [conflicting],
+            _enriched_snapshot(conflicting),
+        )
+
+
+def test_conflicting_membership_rolls_back_universe_evidence_and_run(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    original = _constituent_evidence()
+    conflicting = _constituent_evidence(codes=("000001", "600519"))
+    original_snapshot = _enriched_snapshot(original)
+    rejected_snapshot = _enriched_snapshot(
+        conflicting,
+        run_key="cn:20260721T070000Z:manual",
+    )
+    repo.save_enriched_run(
+        [_sector_definition(name="Original")],
+        [original],
+        original_snapshot,
+    )
+
+    with pytest.raises(ValueError, match="conflicting constituent membership"):
+        repo.save_enriched_run(
+            [_sector_definition(name="Changed")],
+            [conflicting],
+            rejected_snapshot,
+        )
+
+    assert repo.get_run_by_key(rejected_snapshot.run_key) is None
+    assert repo.get_constituent_set(conflicting.set_key) is None
+    assert repo.list_universe(NOW.date()) == [
+        _sector_definition(name="Original")
+    ]
+    assert repo.get_run_by_key(original_snapshot.run_key) == original_snapshot
+
+
+def test_snapshot_insert_failure_rolls_back_whole_enriched_write(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    rejected_sector_id = "industry:reject-enriched-insert"
+    evidence = _constituent_evidence(sector_id=rejected_sector_id)
+    snapshot = _enriched_snapshot(evidence)
+    with isolated_db._engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER reject_enriched_sector_insert
+            BEFORE INSERT ON radar_sector_snapshots
+            WHEN NEW.sector_id = 'industry:reject-enriched-insert'
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected enriched sector');
+            END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="rejected enriched sector"):
+        repo.save_enriched_run(
+            [_sector_definition(sector_id=rejected_sector_id)],
+            [evidence],
+            snapshot,
+        )
+
+    with isolated_db.get_session() as session:
+        assert session.scalar(select(func.count(RadarUniverseRecord.id))) == 0
+        assert session.scalar(
+            select(func.count(RadarConstituentSetRecord.set_key))
+        ) == 0
+        assert session.scalar(
+            select(func.count(RadarConstituentObservationRecord.id))
+        ) == 0
+        assert session.scalar(select(func.count(RadarRunRecord.id))) == 0
+        assert session.scalar(
+            select(func.count(RadarSectorSnapshotRecord.id))
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        (
+            replace(_constituent_evidence(), set_key="sha256:" + "0" * 64),
+            "set_key",
+        ),
+        (
+            replace(
+                _constituent_evidence(),
+                codes=("600519", "000001", "300750"),
+            ),
+            "sorted canonical",
+        ),
+        (
+            replace(
+                _constituent_evidence(),
+                codes=("SH600519", "600519"),
+            ),
+            "canonical",
+        ),
+        (
+            replace(
+                _constituent_evidence(),
+                observed_at=NOW.replace(tzinfo=None),
+            ),
+            "timezone-aware",
+        ),
+    ],
+)
+def test_enriched_run_revalidates_evidence_before_any_write(
+    isolated_db,
+    invalid,
+    message,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+
+    with pytest.raises(ValueError, match=message):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [invalid],
+            _enriched_snapshot(invalid),
+        )
+
+    with isolated_db.get_session() as session:
+        assert session.scalar(select(func.count(RadarUniverseRecord.id))) == 0
+        assert session.scalar(select(func.count(RadarRunRecord.id))) == 0
+
+
+def test_enriched_run_rejects_missing_and_orphan_evidence(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+
+    with pytest.raises(ValueError, match="does not resolve"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [],
+            _enriched_snapshot(evidence),
+        )
+    with pytest.raises(ValueError, match="orphan constituent evidence"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            _snapshot(),
+        )
+
+
+def test_enriched_run_rejects_keyed_evidence_without_membership_source(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    score_data = _enriched_snapshot(evidence).sectors[0].model_dump(mode="json")
+    del score_data["observation"]["raw_reference"]["capabilities"]["membership"][
+        "source"
+    ]
+    snapshot = _snapshot(sectors=(SectorScore.model_validate(score_data),))
+
+    with pytest.raises(ValueError, match="source is required"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            snapshot,
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["sector", "source"])
+def test_enriched_run_rejects_cross_identity_evidence(
+    isolated_db,
+    mismatch,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence(
+        sector_id=(
+            "industry:other" if mismatch == "sector" else "industry:semiconductor"
+        )
+    )
+    snapshot = _enriched_snapshot(evidence)
+    if mismatch == "sector":
+        snapshot = _snapshot(
+            sectors=(
+                _score(
+                    constituent_set_key=evidence.set_key,
+                    evidence_date=evidence.data_date,
+                    membership_source=evidence.source,
+                ),
+            )
+        )
+    else:
+        snapshot = _snapshot(
+            sectors=(
+                _score(
+                    constituent_set_key=evidence.set_key,
+                    evidence_date=evidence.data_date,
+                    membership_source="different-source",
+                ),
+            )
+        )
+
+    with pytest.raises(ValueError, match=f"{mismatch}.*mismatch"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            snapshot,
+        )
+
+
+def test_existing_set_key_with_different_content_is_a_domain_error(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    with isolated_db.session_scope() as session:
+        session.add(
+            RadarConstituentSetRecord(
+                set_key=evidence.set_key,
+                market=evidence.market,
+                sector_id=evidence.sector_id,
+                source=evidence.source,
+                codes_json='["000002"]',
+                constituent_count=1,
+            )
+        )
+
+    with pytest.raises(ValueError, match="immutable constituent set mismatch"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            _enriched_snapshot(evidence),
+        )
+
+
+def test_integrity_retry_recovers_identical_concurrent_evidence(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot = _enriched_snapshot(evidence)
+    original_transaction = isolated_db._run_write_transaction
+    attempts = 0
+
+    def fail_once(operation_name, operation):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            original_transaction(
+                "concurrent-constituent-winner",
+                lambda session: repo._save_constituent_evidence_in_session(
+                    session, [evidence]
+                ),
+            )
+            raise IntegrityError("INSERT", {}, RuntimeError("concurrent insert"))
+        return original_transaction(operation_name, operation)
+
+    monkeypatch.setattr(isolated_db, "_run_write_transaction", fail_once)
+
+    run_id = repo.save_enriched_run(
+        [_sector_definition()], [evidence], snapshot
+    )
+
+    assert attempts == 2
+    assert repo.get_run(run_id) == snapshot
+
+
+def test_integrity_retry_surfaces_different_concurrent_membership(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    winner = _constituent_evidence()
+    conflicting = _constituent_evidence(codes=("000001", "600519"))
+    original_transaction = isolated_db._run_write_transaction
+    attempts = 0
+
+    def fail_once(operation_name, operation):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            original_transaction(
+                "concurrent-constituent-winner",
+                lambda session: repo._save_constituent_evidence_in_session(
+                    session, [winner]
+                ),
+            )
+            raise IntegrityError("INSERT", {}, RuntimeError("concurrent insert"))
+        return original_transaction(operation_name, operation)
+
+    monkeypatch.setattr(isolated_db, "_run_write_transaction", fail_once)
+
+    with pytest.raises(ValueError, match="conflicting constituent membership"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [conflicting],
+            _enriched_snapshot(conflicting),
+        )
+
+    assert attempts == 2
+    assert repo.get_run_by_key("cn:20260721T060000Z:manual") is None
+
+
+def test_legacy_snapshot_resolves_no_evidence(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    snapshot = _snapshot()
+    run_id = repo.save_run(snapshot)
+
+    assert repo.get_run_by_key(snapshot.run_key) == snapshot
+    assert repo.resolve_run_constituent_evidence(run_id) == ()
+    assert repo.resolve_snapshot_constituent_evidence(snapshot) == ()
+
+
+def test_resolving_a_run_rejects_a_missing_referenced_set(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    run_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        _enriched_snapshot(evidence),
+    )
+    with isolated_db.session_scope() as session:
+        session.execute(
+            delete(RadarConstituentSetRecord).where(
+                RadarConstituentSetRecord.set_key == evidence.set_key
+            )
+        )
+
+    with pytest.raises(ValueError, match="missing referenced constituent set"):
+        repo.resolve_run_constituent_evidence(run_id)
