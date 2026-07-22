@@ -96,8 +96,8 @@ def test_normalized_series_reject_non_monotonic_dates_and_non_finite_numbers() -
         BoardBarSeries(
             code="BK001",
             bars=[
-                BoardBar(date(2026, 7, 22), close=11.0, traded_amount=110.0),
-                BoardBar(date(2026, 7, 21), close=10.0, traded_amount=100.0),
+                BoardBar(data_date=date(2026, 7, 22), close=11.0, traded_amount=110.0),
+                BoardBar(data_date=date(2026, 7, 21), close=10.0, traded_amount=100.0),
             ],
         )
     with pytest.raises(ValidationError):
