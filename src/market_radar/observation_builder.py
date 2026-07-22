@@ -6,10 +6,12 @@ from datetime import date, datetime
 from hashlib import sha256
 import json
 from math import log
+import re
 from statistics import fmean, stdev
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from data_provider.base import sanitize_persisted_text
+from data_provider.base import normalize_stock_code, sanitize_persisted_text
 from src.market_radar.capabilities import (
     BoardBar,
     BoardBarSeries,
@@ -30,15 +32,21 @@ _RETURN_FIELDS = (
     "return_20d_pct",
     "benchmark_return_20d_pct",
 )
-_SENSITIVE_KEYS = (
-    "authorization",
-    "cookie",
-    "header",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
+_CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_CN_CODE_PATTERN = re.compile(r"^\d{6}$")
+_TRACE_FIELDS = (
+    "provider",
+    "result",
+    "duration_ms",
+    "code",
+    "selected",
+    "error",
 )
+_TRACE_LIMIT = 20
+_TEXT_LIMIT = 128
+_ERROR_LIMIT = 256
+_INVALID_CODE_LIMIT = 50
+_CANDIDATE_REASON_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -61,12 +69,29 @@ class ObservationBuildResult:
 @dataclass(frozen=True)
 class _Metrics:
     values: Mapping[str, Any]
+    forced_missing: frozenset[str]
     field_sources: Mapping[str, str]
     field_capabilities: Mapping[str, tuple[CapabilityResult, ...]]
-    coverage: Mapping[str, int | float]
+    coverage: Mapping[str, Any]
     membership_usable: bool
     membership_data_date: date | None
     membership_provenance: str | None
+    constituent_codes: tuple[str, ...]
+    terminal_date: date | None
+
+
+def _canonical_cn_codes(codes: Sequence[str]) -> tuple[str, ...]:
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for raw_code in codes:
+        code = normalize_stock_code(raw_code)
+        if _CN_CODE_PATTERN.fullmatch(code) is None:
+            raise ValueError(f"constituent code is not a canonical CN code: {raw_code}")
+        if code in seen:
+            raise ValueError(f"duplicate canonical constituent code: {code}")
+        seen.add(code)
+        canonical.append(code)
+    return tuple(sorted(canonical))
 
 
 def canonical_constituent_set_key(
@@ -75,17 +100,21 @@ def canonical_constituent_set_key(
     source: str,
     codes: Sequence[str],
 ) -> str:
-    canonical_codes = sorted(set(codes))
+    canonical_codes = _canonical_cn_codes(codes)
     payload = json.dumps(
         [market, sector_id, source, canonical_codes],
-        ensure_ascii=False,
+        ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{sha256(payload).hexdigest()}"
 
 
-def _valid_history(result: CapabilityResult[BoardBarSeries]) -> BoardBarSeries | None:
+def _valid_history(
+    result: CapabilityResult[BoardBarSeries], expected_code: str
+) -> BoardBarSeries | None:
     if result.status == "unavailable" or result.data is None or result.data_date is None:
+        return None
+    if result.data.code != expected_code:
         return None
     if not result.data.bars or result.data.bars[-1].data_date != result.data_date:
         return None
@@ -184,46 +213,62 @@ def _volatility_ratio(
     return stdev(board_returns) / benchmark_deviation
 
 
-def _safe_trace_value(value: Any, key: str = "") -> Any:
-    normalized_key = key.lower().replace("-", "_")
-    if any(marker in normalized_key for marker in _SENSITIVE_KEYS):
-        return None
-    if isinstance(value, Mapping):
-        result = {}
-        for nested_key, nested_value in value.items():
-            safe = _safe_trace_value(nested_value, str(nested_key))
-            if safe is not None:
-                result[str(nested_key)] = safe
-        return result
-    if isinstance(value, (tuple, list)):
-        return tuple(
-            safe
-            for item in value
-            if (safe := _safe_trace_value(item, key)) is not None
-        )
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        if isinstance(value, str):
-            lowered = value.lower()
-            if "traceback" in lowered or "most recent call last" in lowered:
-                return "redacted_exception"
-            return sanitize_persisted_text(value)
-        return value
-    return sanitize_persisted_text(value)
+def _bounded_text(value: Any, limit: int = _TEXT_LIMIT) -> str:
+    text = str(value or "")
+    lowered = text.casefold()
+    if "traceback" in lowered or "most recent call last" in lowered:
+        return "redacted_exception"
+    return sanitize_persisted_text(text, limit=limit)
+
+
+def _trace_summary(trace: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    summaries: list[dict[str, Any]] = []
+    for entry in trace[:_TRACE_LIMIT]:
+        if not isinstance(entry, Mapping):
+            continue
+        summary: dict[str, Any] = {}
+        for key in _TRACE_FIELDS:
+            if key not in entry:
+                continue
+            value = entry[key]
+            if key == "selected" and isinstance(value, bool):
+                summary[key] = value
+            elif key == "duration_ms" and isinstance(value, (int, float)):
+                summary[key] = value
+            elif isinstance(value, (str, int, float, bool)):
+                summary[key] = _bounded_text(
+                    value,
+                    _ERROR_LIMIT if key == "error" else _TEXT_LIMIT,
+                )
+        summaries.append(summary)
+    return tuple(summaries)
 
 
 def _capability_summary(result: CapabilityResult) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "status": result.status,
-        "source": result.source,
+        "source": _bounded_text(result.source),
         "observed_at": result.observed_at,
         "data_date": result.data_date,
         "bar_status": result.bar_status,
         "freshness_seconds": result.freshness_seconds,
-        "trace": _safe_trace_value(result.trace),
+        "trace": _trace_summary(result.trace),
     }
     if result.error:
-        summary["error"] = _safe_trace_value(result.error, "error")
+        summary["error"] = _bounded_text(result.error, _ERROR_LIMIT)
     return summary
+
+
+def _source_label(source: str) -> str:
+    return _bounded_text(source)
+
+
+def _combined_source(*sources: str) -> str:
+    return _bounded_text("+".join(_source_label(source) for source in sources))
+
+
+def _base_source(source: str) -> str:
+    return _bounded_text(f"base:{_source_label(source)}")
 
 
 class CnSectorObservationBuilder:
@@ -255,9 +300,7 @@ class CnSectorObservationBuilder:
         )
         evidence = self._constituent_evidence(
             base=base,
-            terminal_date=board_history.data_date,
             membership=membership,
-            quotes=quotes,
             metrics=metrics,
         )
         observation = self._assemble_observation(
@@ -291,9 +334,10 @@ class CnSectorObservationBuilder:
         observed_at: datetime,
     ) -> _Metrics:
         values: dict[str, Any] = {}
+        forced_missing: set[str] = set()
         sources: dict[str, str] = {}
         dependencies: dict[str, tuple[CapabilityResult, ...]] = {}
-        board = _valid_history(board_history)
+        board = _valid_history(board_history, base.sector_id)
         terminal_date = board_history.data_date if board is not None else None
 
         if board is not None:
@@ -306,7 +350,7 @@ class CnSectorObservationBuilder:
                     dependencies,
                     field,
                     value,
-                    board_history.source,
+                    _source_label(board_history.source),
                     (board_history,),
                 )
             self._publish(
@@ -315,7 +359,7 @@ class CnSectorObservationBuilder:
                 dependencies,
                 "turnover_ratio_20d",
                 _liquidity_ratio(board.bars),
-                board_history.source,
+                _source_label(board_history.source),
                 (board_history,),
             )
             self._publish(
@@ -324,17 +368,19 @@ class CnSectorObservationBuilder:
                 dependencies,
                 "distance_ma20_pct",
                 _ma20_distance(board.bars, board_history.bar_status),
-                board_history.source,
+                _source_label(board_history.source),
                 (board_history,),
             )
 
-        benchmark = _valid_history(benchmark_history)
+        benchmark = _valid_history(benchmark_history, benchmark_code)
         aligned = None
         if (
             board is not None
             and benchmark is not None
             and terminal_date == benchmark_history.data_date
-            and benchmark.code == benchmark_code
+            and board_history.observed_at == observed_at
+            and benchmark_history.observed_at == observed_at
+            and "return_20d_pct" in values
         ):
             aligned = _aligned_terminal_bars(board, benchmark)
         if aligned is not None:
@@ -346,7 +392,7 @@ class CnSectorObservationBuilder:
                 dependencies,
                 "benchmark_return_20d_pct",
                 benchmark_return,
-                benchmark_history.source,
+                _combined_source(board_history.source, benchmark_history.source),
                 (board_history, benchmark_history),
             )
             self._publish(
@@ -355,9 +401,14 @@ class CnSectorObservationBuilder:
                 dependencies,
                 "volatility_ratio_20d",
                 _volatility_ratio(board_rows, benchmark_rows),
-                f"{board_history.source}+{benchmark_history.source}",
+                _combined_source(board_history.source, benchmark_history.source),
                 (board_history, benchmark_history),
             )
+        if (
+            "return_20d_pct" in values
+            and "benchmark_return_20d_pct" not in values
+        ):
+            forced_missing.add("benchmark_return_20d_pct")
 
         flow = board_flow.data
         flow_usable = (
@@ -366,6 +417,7 @@ class CnSectorObservationBuilder:
             and flow is not None
             and board_flow.data_date == terminal_date
             and flow.flows[-1].data_date == terminal_date
+            and flow.code == base.sector_id
         )
         if flow_usable:
             for window in (1, 5, 20):
@@ -376,11 +428,11 @@ class CnSectorObservationBuilder:
                     dependencies,
                     field,
                     _flow_for_window(flow, window),
-                    board_flow.source,
+                    _source_label(board_flow.source),
                     (board_flow,),
                 )
 
-        coverage, membership_usable, membership_date, provenance = (
+        coverage, membership_usable, membership_date, provenance, constituent_codes = (
             self._constituent_metrics(
                 terminal_date=terminal_date,
                 membership=membership,
@@ -392,9 +444,17 @@ class CnSectorObservationBuilder:
             )
         )
 
-        final_return_5d = values.get("return_5d_pct", base.return_5d_pct)
-        final_flow_5d = values.get("capital_flow_5d", base.capital_flow_5d)
-        if final_return_5d is not None and final_flow_5d is not None:
+        compatible_divergence = (
+            "return_5d_pct" in values
+            and "capital_flow_5d" in values
+            and board_history.observed_at == observed_at
+            and board_flow.observed_at == observed_at
+            and board_history.data_date == terminal_date
+            and board_flow.data_date == terminal_date
+        )
+        if compatible_divergence:
+            final_return_5d = values["return_5d_pct"]
+            final_flow_5d = values["capital_flow_5d"]
             divergent = (
                 final_return_5d * final_flow_5d < 0
                 and abs(final_return_5d)
@@ -402,9 +462,9 @@ class CnSectorObservationBuilder:
                 and abs(final_flow_5d) >= self.config.flow_divergence_threshold_pct
             )
             values["price_flow_divergence"] = divergent
-            return_source = sources.get("return_5d_pct", base.source)
-            flow_source = sources.get("capital_flow_5d", base.source)
-            sources["price_flow_divergence"] = f"{return_source}+{flow_source}"
+            sources["price_flow_divergence"] = _combined_source(
+                sources["return_5d_pct"], sources["capital_flow_5d"]
+            )
             combined_dependencies = (
                 dependencies.get("return_5d_pct", ())
                 + dependencies.get("capital_flow_5d", ())
@@ -417,15 +477,20 @@ class CnSectorObservationBuilder:
                     for previous in combined_dependencies[:index]
                 )
             )
+        elif "return_5d_pct" in values or "capital_flow_5d" in values:
+            forced_missing.add("price_flow_divergence")
 
         return _Metrics(
             values=values,
+            forced_missing=frozenset(forced_missing),
             field_sources=sources,
             field_capabilities=dependencies,
             coverage=coverage,
             membership_usable=membership_usable,
             membership_data_date=membership_date,
             membership_provenance=provenance,
+            constituent_codes=constituent_codes,
+            terminal_date=terminal_date,
         )
 
     @staticmethod
@@ -454,47 +519,89 @@ class CnSectorObservationBuilder:
         values: dict[str, Any],
         sources: dict[str, str],
         dependencies: dict[str, tuple[CapabilityResult, ...]],
-    ) -> tuple[dict[str, int | float], bool, date | None, str | None]:
+    ) -> tuple[
+        dict[str, Any],
+        bool,
+        date | None,
+        str | None,
+        tuple[str, ...],
+    ]:
         membership_data = membership.data
         quote_data = quotes.data
-        total = len(membership_data.codes) if membership_data is not None else 0
-        coverage: dict[str, int | float] = {"total": total, "valid": 0, "ratio": 0.0}
+        try:
+            membership_codes = (
+                _canonical_cn_codes(membership_data.codes)
+                if membership_data is not None
+                else ()
+            )
+        except ValueError:
+            membership_codes = ()
+            membership_data = None
+        coverage = self._coverage(membership_codes, ())
         if (
             terminal_date is None
             or membership.status == "unavailable"
             or membership_data is None
         ):
-            return coverage, False, None, None
+            return coverage, False, None, None, membership_codes
 
         membership_date = membership_data.data_date
         provenance = None
         if membership_date is None:
             if (
-                membership.observed_at != observed_at
+                membership.status != "partial"
+                or membership.observed_at != observed_at
                 or quotes.status == "unavailable"
                 or quote_data is None
+                or quotes.observed_at != observed_at
                 or quotes.data_date != terminal_date
             ):
-                return coverage, False, None, None
+                return coverage, False, None, None, membership_codes
             evidence_date = quotes.data_date
             provenance = "partial_unversioned_current_membership"
         elif membership_date == terminal_date and membership.data_date == terminal_date:
             evidence_date = membership_date
         else:
-            return coverage, False, None, None
+            return coverage, False, None, None, membership_codes
 
         if (
             quotes.status == "unavailable"
             or quote_data is None
             or quotes.data_date != terminal_date
         ):
-            return coverage, True, evidence_date, provenance
+            return coverage, True, evidence_date, provenance, membership_codes
 
-        membership_codes = set(membership_data.codes)
-        valid_quotes = [quote for quote in quote_data.quotes if quote.code in membership_codes]
+        membership_set = set(membership_codes)
+        valid_by_code: dict[str, Any] = {}
+        duplicate_codes: set[str] = set()
+        for quote in quote_data.quotes:
+            try:
+                code = _canonical_cn_codes((quote.code,))[0]
+            except ValueError:
+                continue
+            if code not in membership_set:
+                continue
+            if (
+                quote.quoted_at > observed_at
+                or quote.quoted_at.astimezone(_CN_TIMEZONE).date() != terminal_date
+            ):
+                continue
+            if code in valid_by_code:
+                duplicate_codes.add(code)
+            else:
+                valid_by_code[code] = quote
+        valid_quotes = [
+            quote
+            for code, quote in valid_by_code.items()
+            if code not in duplicate_codes
+        ]
+        valid_codes = tuple(
+            sorted(code for code in valid_by_code if code not in duplicate_codes)
+        )
         valid = len(valid_quotes)
+        total = len(membership_codes)
         ratio = valid / total if total else 0.0
-        coverage = {"total": total, "valid": valid, "ratio": round(ratio, 4)}
+        coverage = self._coverage(membership_codes, valid_codes)
         gate = (
             total >= self.config.constituent_min_count
             and valid >= self.config.constituent_min_count
@@ -515,7 +622,7 @@ class CnSectorObservationBuilder:
                     dependencies,
                     field,
                     value,
-                    quotes.source,
+                    _combined_source(membership.source, quotes.source),
                     (membership, quotes),
                 )
             total_amount = sum(quote.traded_amount for quote in valid_quotes)
@@ -535,39 +642,56 @@ class CnSectorObservationBuilder:
                 dependencies,
                 "concentration_ratio",
                 concentration,
-                quotes.source,
+                _combined_source(membership.source, quotes.source),
                 (membership, quotes),
             )
-        return coverage, True, evidence_date, provenance
+        return coverage, True, evidence_date, provenance, membership_codes
+
+    @staticmethod
+    def _coverage(
+        membership_codes: Sequence[str], valid_codes: Sequence[str]
+    ) -> dict[str, Any]:
+        valid_set = set(valid_codes)
+        total = len(membership_codes)
+        valid = len(valid_set)
+        return {
+            "total": total,
+            "valid": valid,
+            "ratio": round(valid / total, 4) if total else 0.0,
+            "invalid_codes": [
+                code
+                for code in membership_codes
+                if code not in valid_set
+            ][:_INVALID_CODE_LIMIT],
+        }
 
     @staticmethod
     def _constituent_evidence(
         *,
         base: SectorObservation,
-        terminal_date: date | None,
         membership: CapabilityResult[ConstituentMembership],
-        quotes: CapabilityResult[ConstituentQuoteBatch],
         metrics: _Metrics,
     ) -> ConstituentEvidence | None:
         if (
-            terminal_date is None
+            metrics.terminal_date is None
             or not metrics.membership_usable
             or metrics.membership_data_date is None
             or membership.data is None
         ):
             return None
-        codes = tuple(sorted(membership.data.codes))
+        codes = metrics.constituent_codes
+        source = _source_label(membership.source)
         return ConstituentEvidence(
             market=base.market,
             sector_id=base.sector_id,
-            source=membership.source,
+            source=source,
             data_date=metrics.membership_data_date,
             observed_at=membership.observed_at,
             codes=codes,
             set_key=canonical_constituent_set_key(
                 base.market,
                 base.sector_id,
-                membership.source,
+                source,
                 codes,
             ),
         )
@@ -588,11 +712,13 @@ class CnSectorObservationBuilder:
         evidence: ConstituentEvidence | None,
     ) -> SectorObservation:
         payload = base.model_dump()
+        for field in metrics.forced_missing:
+            payload[field] = None
         payload.update(metrics.values)
         payload.update(
             observed_at=observed_at,
             source=_SOURCE,
-            quality=self._quality(board_history),
+            quality=self._quality(board_history, base.sector_id),
             freshness_seconds=self._freshness(base, payload, metrics),
         )
         payload["missing_fields"] = tuple(
@@ -606,13 +732,26 @@ class CnSectorObservationBuilder:
         )
         if metrics.membership_provenance is not None:
             membership_summary["provenance"] = metrics.membership_provenance
+        field_sources = {
+            field: metrics.field_sources.get(field, _base_source(base.source))
+            for field in SectorObservation.tracked_metric_fields
+            if payload.get(field) is not None
+        }
         payload["raw_reference"] = {
             "schema": _SCHEMA,
-            "candidate_reasons": candidate_reasons,
-            "benchmark_code": benchmark_code,
-            "data_date": board_history.data_date,
+            "candidate_reasons": tuple(
+                _bounded_text(reason)
+                for reason in candidate_reasons[:_CANDIDATE_REASON_LIMIT]
+            ),
+            "benchmark_code": _bounded_text(benchmark_code),
+            "data_date": metrics.terminal_date,
             "bar_status": self._bar_status(metrics),
-            "field_sources": dict(metrics.field_sources),
+            "field_sources": field_sources,
+            "base": {
+                "source": _bounded_text(base.source),
+                "observed_at": base.observed_at,
+                "freshness_seconds": base.freshness_seconds,
+            },
             "capabilities": {
                 "board_history": _capability_summary(board_history),
                 "benchmark_history": _capability_summary(benchmark_history),
@@ -626,8 +765,10 @@ class CnSectorObservationBuilder:
         return SectorObservation(**payload)
 
     @staticmethod
-    def _quality(board_history: CapabilityResult[BoardBarSeries]) -> str:
-        if _valid_history(board_history) is None:
+    def _quality(
+        board_history: CapabilityResult[BoardBarSeries], sector_id: str
+    ) -> str:
+        if _valid_history(board_history, sector_id) is None:
             return "unavailable"
         if board_history.status == "stale":
             return "stale"

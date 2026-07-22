@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
+import json
 from math import log
 from statistics import stdev
 
@@ -92,6 +94,7 @@ def _history(
     status: str = "ok",
     bar_status: str = "finalized",
     freshness: int = 3,
+    observed_at: datetime = NOW,
 ) -> CapabilityResult[BoardBarSeries]:
     row_dates = dates or _dates(len(closes))
     row_amounts = amounts or [100.0] * len(closes)
@@ -110,6 +113,7 @@ def _history(
         status=status,
         bar_status=bar_status,
         freshness=freshness,
+        observed_at=observed_at,
     )
 
 
@@ -119,13 +123,15 @@ def _flows(
     amounts: list[float] | None = None,
     dates: list[date] | None = None,
     bar_status: str = "finalized",
+    code: str = "industry:semiconductor",
+    observed_at: datetime = NOW,
 ) -> CapabilityResult[BoardFlowSeries]:
     row_dates = dates or _dates(21)[-len(values) :]
     row_amounts = amounts or [100.0] * len(values)
     return _capability(
         "board_flow",
         BoardFlowSeries(
-            code="industry:semiconductor",
+            code=code,
             flows=[
                 BoardFlow(
                     data_date=row_date,
@@ -138,6 +144,7 @@ def _flows(
         source="flow-fixture",
         data_date=row_dates[-1],
         bar_status=bar_status,
+        observed_at=observed_at,
     )
 
 
@@ -168,11 +175,16 @@ def _quotes(
     amounts: tuple[float, ...] = (),
     moves: tuple[int, ...] = (),
     status: str = "ok",
+    observed_at: datetime = NOW,
+    quoted_ats: tuple[datetime, ...] = (),
 ) -> CapabilityResult[ConstituentQuoteBatch]:
     codes = codes or tuple(f"{index:06d}" for index in range(1, 11))
     amounts = amounts or tuple(float(index) for index in range(1, len(codes) + 1))
     moves = moves or tuple((1, -1, 0)[index % 3] for index in range(len(codes)))
-    quoted_at = datetime.combine(data_date, datetime.min.time(), timezone.utc)
+    quoted_ats = quoted_ats or tuple(
+        datetime.combine(data_date, datetime.min.time(), timezone.utc)
+        for _ in codes
+    )
     return _capability(
         "constituent_quotes",
         ConstituentQuoteBatch(
@@ -184,13 +196,16 @@ def _quotes(
                     traded_amount=amount,
                     quoted_at=quoted_at,
                 )
-                for code, amount, move in zip(codes, amounts, moves)
+                for code, amount, move, quoted_at in zip(
+                    codes, amounts, moves, quoted_ats
+                )
             ]
         ),
         source="quote-fixture",
         data_date=data_date,
         status=status,
         bar_status="provisional",
+        observed_at=observed_at,
     )
 
 
@@ -383,6 +398,7 @@ def test_breadth_and_concentration_publish_at_exact_coverage_boundary() -> None:
         "total": 10,
         "valid": 8,
         "ratio": 0.8,
+        "invalid_codes": ("000009", "000010"),
     }
 
 
@@ -439,6 +455,47 @@ def test_unversioned_membership_requires_same_online_run_and_quote_terminal_date
     assert different_run.constituent_evidence is None
     assert different_run.observation.up_count is None
 
+    wrong_status = _build(
+        membership=_membership(codes, data_date=None, status="ok"),
+        quotes=_quotes(codes, data_date=terminal),
+    )
+    quote_from_different_run = _build(
+        membership=_membership(codes, data_date=None, status="partial"),
+        quotes=_quotes(
+            codes,
+            data_date=terminal,
+            observed_at=NOW - timedelta(seconds=1),
+        ),
+    )
+    assert wrong_status.constituent_evidence is None
+    assert quote_from_different_run.constituent_evidence is None
+
+
+def test_quote_rows_must_be_same_shanghai_date_and_not_future() -> None:
+    terminal = _dates(21)[-1]
+    codes = tuple(f"{index:06d}" for index in range(1, 7))
+    quoted_ats = (
+        datetime(2026, 7, 22, 1, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 2, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 4, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+        NOW + timedelta(seconds=1),
+    )
+
+    observation = _build(
+        membership=_membership(codes, data_date=terminal),
+        quotes=_quotes(codes, data_date=terminal, quoted_ats=quoted_ats),
+    ).observation
+
+    assert observation.up_count is None
+    assert observation.raw_reference["constituent_coverage"] == {
+        "total": 6,
+        "valid": 4,
+        "ratio": pytest.approx(4 / 6, abs=0.0001),
+        "invalid_codes": ("000005", "000006"),
+    }
+
 
 def test_constituent_evidence_is_canonical_and_content_addressed() -> None:
     terminal = _dates(21)[-1]
@@ -467,6 +524,49 @@ def test_constituent_evidence_is_canonical_and_content_addressed() -> None:
     assert result.observation.raw_reference["constituent_set_key"] == evidence.set_key
 
 
+def test_constituent_identity_normalizes_aliases_and_hashes_canonical_json() -> None:
+    terminal = _dates(21)[-1]
+    aliases = ("SH600519", "000001.SZ", "SZ300750")
+    canonical = ("000001", "300750", "600519")
+    expected_payload = json.dumps(
+        ["cn", "industry:semiconductor", "membership-fixture", list(canonical)],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    result = _build(
+        membership=_membership(aliases, data_date=terminal),
+        quotes=_quotes(canonical, data_date=terminal),
+    )
+
+    assert result.constituent_evidence is not None
+    assert result.constituent_evidence.codes == canonical
+    assert result.constituent_evidence.set_key == (
+        f"sha256:{sha256(expected_payload).hexdigest()}"
+    )
+
+
+def test_constituent_identity_rejects_alias_collisions_and_invalid_codes() -> None:
+    terminal = _dates(21)[-1]
+    aliases = ("SH600000", "600000", "000001", "000002", "000003")
+
+    with pytest.raises(ValueError, match="duplicate canonical"):
+        canonical_constituent_set_key(
+            "cn", "industry:semiconductor", "fixture", aliases
+        )
+    with pytest.raises(ValueError, match="canonical CN"):
+        canonical_constituent_set_key(
+            "cn", "industry:semiconductor", "fixture", ("not-a-code",)
+        )
+
+    result = _build(
+        membership=_membership(aliases, data_date=terminal),
+        quotes=_quotes(("600000", "000001", "000002", "000003"), data_date=terminal),
+    )
+    assert result.constituent_evidence is None
+    assert result.observation.up_count is None
+
+
 def test_versioned_membership_evidence_survives_unavailable_quotes() -> None:
     terminal = _dates(21)[-1]
     result = _build(
@@ -480,6 +580,7 @@ def test_versioned_membership_evidence_survives_unavailable_quotes() -> None:
         "total": 10,
         "valid": 0,
         "ratio": 0.0,
+        "invalid_codes": tuple(f"{index:06d}" for index in range(1, 11)),
     }
 
 
@@ -506,6 +607,75 @@ def test_divergence_is_false_at_noise_boundary_without_opposite_signs() -> None:
     assert same_sign.price_flow_divergence is False
     assert opposite_sign.capital_flow_5d == pytest.approx(-0.1)
     assert opposite_sign.price_flow_divergence is True
+
+
+def test_coupled_metrics_never_mix_base_and_enriched_vintages() -> None:
+    base = _base(
+        return_5d_pct=9.0,
+        capital_flow_5d=-0.2,
+        price_flow_divergence=True,
+        return_20d_pct=8.0,
+        benchmark_return_20d_pct=3.0,
+    )
+    mixed = _build(
+        base=base,
+        board_history=_history([100.0] * 16 + [105.0] * 5),
+        benchmark_history=_unavailable("benchmark_history"),
+        board_flow=_unavailable("board_flow"),
+    ).observation
+
+    assert mixed.return_5d_pct == pytest.approx(5.0)
+    assert mixed.capital_flow_5d == -0.2
+    assert mixed.price_flow_divergence is None
+    assert mixed.return_20d_pct is not None
+    assert mixed.benchmark_return_20d_pct is None
+    assert "price_flow_divergence" in mixed.missing_fields
+    assert "benchmark_return_20d_pct" in mixed.missing_fields
+
+    preserved = _build(
+        base=base,
+        board_history=_unavailable("board_history"),
+        benchmark_history=_unavailable("benchmark_history"),
+        board_flow=_unavailable("board_flow"),
+    ).observation
+    assert preserved.price_flow_divergence is True
+    assert preserved.return_20d_pct == 8.0
+    assert preserved.benchmark_return_20d_pct == 3.0
+
+
+def test_coupled_metrics_require_same_run_capabilities() -> None:
+    base = _base(price_flow_divergence=True, benchmark_return_20d_pct=7.0)
+    different_run = NOW - timedelta(seconds=1)
+    observation = _build(
+        base=base,
+        board_history=_history([100.0] * 21),
+        benchmark_history=_history(
+            [100.0] * 21,
+            code="000985",
+            observed_at=different_run,
+        ),
+        board_flow=_flows([1.0] * 20, observed_at=different_run),
+    ).observation
+
+    assert observation.return_5d_pct == 0.0
+    assert observation.capital_flow_5d == pytest.approx(1.0)
+    assert observation.price_flow_divergence is None
+    assert observation.benchmark_return_20d_pct is None
+    assert observation.volatility_ratio_20d is None
+
+
+def test_wrong_sector_history_and_flow_cannot_replace_base_values() -> None:
+    base = _base(return_1d_pct=7.0, capital_flow_1d=2.0)
+    observation = _build(
+        base=base,
+        board_history=_history([100.0] * 21, code="industry:other"),
+        board_flow=_flows([1.0] * 20, code="industry:other"),
+    ).observation
+
+    assert observation.return_1d_pct == 7.0
+    assert observation.capital_flow_1d == 2.0
+    assert observation.quality == "unavailable"
+    assert observation.freshness_seconds == base.freshness_seconds
 
 
 def test_failed_enrichment_preserves_base_values_and_recomputes_missing_fields() -> None:
@@ -583,3 +753,61 @@ def test_raw_reference_is_structured_v2a_and_drops_sensitive_trace_content() -> 
     assert "Bearer secret" not in serialized
     assert "Traceback" not in serialized
     assert "secret stack" not in serialized
+
+
+def test_provenance_is_allowlisted_bounded_and_covers_every_final_field() -> None:
+    trace = tuple(
+        {
+            "provider": "provider-" + "x" * 300,
+            "result": "failed",
+            "duration_ms": index,
+            "code": "000001",
+            "selected": False,
+            "error": "password=secret " + "e" * 500,
+            "credential": "credential-secret",
+            "sendkey": "sendkey-secret",
+            "nested": {"password": "nested-secret", "payload": "z" * 10_000},
+        }
+        for index in range(100)
+    )
+    board = _history([100.0] * 21).model_copy(update={"trace": trace})
+    base = _base(
+        source="password=base-secret",
+        catalyst_score=0.5,
+        raw_reference={"credential": "base-credential", "payload": "z" * 10_000},
+    )
+
+    raw = _build(base=base, board_history=board).observation.model_dump(mode="json")[
+        "raw_reference"
+    ]
+    persisted_trace = raw["capabilities"]["board_history"]["trace"]
+
+    assert len(persisted_trace) <= 20
+    assert all(
+        set(item)
+        <= {"provider", "result", "duration_ms", "code", "selected", "error"}
+        for item in persisted_trace
+    )
+    assert all(
+        len(value) <= 256
+        for item in persisted_trace
+        for value in item.values()
+        if isinstance(value, str)
+    )
+    assert raw["base"] == {
+        "source": "[REDACTED]",
+        "observed_at": NOW.isoformat(),
+        "freshness_seconds": 11,
+    }
+    final_metrics = {
+        field
+        for field in SectorObservation.tracked_metric_fields
+        if field not in _build(base=base, board_history=board).observation.missing_fields
+    }
+    assert set(raw["field_sources"]) == final_metrics
+    assert raw["field_sources"]["catalyst_score"] == "base:[REDACTED]"
+    serialized = str(raw)
+    assert "base-credential" not in serialized
+    assert "nested-secret" not in serialized
+    assert "sendkey-secret" not in serialized
+    assert len(serialized) < 20_000
