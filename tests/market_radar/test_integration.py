@@ -365,6 +365,22 @@ def test_public_api_is_explicit_and_complete() -> None:
     assert all(hasattr(market_radar, name) for name in PUBLIC_API)
 
 
+def test_market_radar_docs_cover_phase_2a_operational_contract() -> None:
+    text = (ROOT / "docs/market-radar.md").read_text(encoding="utf-8")
+    for token in (
+        "MARKET_RADAR_ENRICHMENT_LIMIT=60",
+        "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS=180",
+        "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY=6",
+        "--discovery-only",
+        "current Asia/Shanghai calendar date",
+        "persisted snapshot replay",
+        "zero live provider calls",
+        "does not initialize or read SQLite",
+        "000985",
+    ):
+        assert token in text
+
+
 def test_offline_manual_run_persists_and_replays_same_scoring_path(
     isolated_db,
 ) -> None:
