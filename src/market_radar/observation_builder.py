@@ -473,6 +473,11 @@ class CnSectorObservationBuilder:
             and board_history.data_date == terminal_date
             and board_flow.data_date == terminal_date
         )
+        current_divergence_components = {
+            field
+            for field in ("return_5d_pct", "capital_flow_5d")
+            if field in values
+        }
         if compatible_divergence:
             final_return_5d = values["return_5d_pct"]
             final_flow_5d = values["capital_flow_5d"]
@@ -518,10 +523,16 @@ class CnSectorObservationBuilder:
                     sources,
                     dependencies,
                 )
-            else:
-                self._clear_current_field(
-                    "price_flow_divergence", values, sources, dependencies
-                )
+            elif current_divergence_components:
+                for field in (
+                    "return_5d_pct",
+                    "capital_flow_5d",
+                    "price_flow_divergence",
+                ):
+                    if field not in current_divergence_components:
+                        self._clear_current_field(
+                            field, values, sources, dependencies
+                        )
 
         return _Metrics(
             values=values,

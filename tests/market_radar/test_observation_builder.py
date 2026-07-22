@@ -661,10 +661,54 @@ def test_incomplete_base_groups_keep_safe_current_standalone_fields() -> None:
     ).observation
 
     assert observation.return_5d_pct == pytest.approx(5.0)
-    assert observation.capital_flow_5d == -0.2
+    assert observation.capital_flow_5d is None
     assert observation.price_flow_divergence is None
     assert observation.return_20d_pct == pytest.approx(5.0)
     assert observation.benchmark_return_20d_pct is None
+    assert observation.raw_reference["field_sources"]["return_5d_pct"] == (
+        "board-fixture"
+    )
+    assert "capital_flow_5d" not in observation.raw_reference["field_sources"]
+    assert "price_flow_divergence" not in observation.raw_reference["field_sources"]
+
+
+def test_current_flow_clears_incomplete_base_return_and_divergence() -> None:
+    terminal = _dates(21)[-1]
+    base = _base(return_5d_pct=9.0, price_flow_divergence=False)
+    observation = _build(
+        base=base,
+        board_history=_history([100.0], dates=[terminal]),
+        board_flow=_flows([1.0] * 20),
+    ).observation
+
+    assert observation.return_5d_pct is None
+    assert observation.capital_flow_5d == pytest.approx(1.0)
+    assert observation.price_flow_divergence is None
+    assert observation.raw_reference["field_sources"]["capital_flow_5d"] == (
+        "flow-fixture"
+    )
+    assert "return_5d_pct" not in observation.raw_reference["field_sources"]
+    assert "price_flow_divergence" not in observation.raw_reference["field_sources"]
+
+
+def test_zero_current_components_preserve_incomplete_base_group() -> None:
+    terminal = _dates(21)[-1]
+    base = _base(return_5d_pct=9.0, price_flow_divergence=False)
+    observation = _build(
+        base=base,
+        board_history=_history([100.0], dates=[terminal]),
+        board_flow=_unavailable("board_flow"),
+    ).observation
+
+    assert observation.return_5d_pct == 9.0
+    assert observation.capital_flow_5d is None
+    assert observation.price_flow_divergence is False
+    assert observation.raw_reference["field_sources"]["return_5d_pct"] == (
+        "base:phase1"
+    )
+    assert observation.raw_reference["field_sources"][
+        "price_flow_divergence"
+    ] == "base:phase1"
 
 
 def test_complete_current_groups_replace_complete_base_groups() -> None:
