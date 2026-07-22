@@ -45,6 +45,7 @@ _TRACE_FIELDS = (
 _TRACE_LIMIT = 20
 _TEXT_LIMIT = 128
 _ERROR_LIMIT = 256
+_MAX_TRACE_DURATION_MS = 86_400_000
 _INVALID_CODE_LIMIT = 50
 _CANDIDATE_REASON_LIMIT = 20
 
@@ -69,7 +70,6 @@ class ObservationBuildResult:
 @dataclass(frozen=True)
 class _Metrics:
     values: Mapping[str, Any]
-    forced_missing: frozenset[str]
     field_sources: Mapping[str, str]
     field_capabilities: Mapping[str, tuple[CapabilityResult, ...]]
     coverage: Mapping[str, Any]
@@ -233,9 +233,17 @@ def _trace_summary(trace: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], 
             value = entry[key]
             if key == "selected" and isinstance(value, bool):
                 summary[key] = value
-            elif key == "duration_ms" and isinstance(value, (int, float)):
-                summary[key] = value
-            elif isinstance(value, (str, int, float, bool)):
+            elif key == "duration_ms" and not isinstance(value, bool):
+                if isinstance(value, int) and value >= 0:
+                    summary[key] = min(value, _MAX_TRACE_DURATION_MS)
+                elif (
+                    isinstance(value, float)
+                    and value >= 0
+                    and value not in {float("inf"), float("-inf")}
+                    and value == value
+                ):
+                    summary[key] = min(value, float(_MAX_TRACE_DURATION_MS))
+            elif key != "duration_ms" and isinstance(value, (str, int, float, bool)):
                 summary[key] = _bounded_text(
                     value,
                     _ERROR_LIMIT if key == "error" else _TEXT_LIMIT,
@@ -334,7 +342,6 @@ class CnSectorObservationBuilder:
         observed_at: datetime,
     ) -> _Metrics:
         values: dict[str, Any] = {}
-        forced_missing: set[str] = set()
         sources: dict[str, str] = {}
         dependencies: dict[str, tuple[CapabilityResult, ...]] = {}
         board = _valid_history(board_history, base.sector_id)
@@ -404,11 +411,25 @@ class CnSectorObservationBuilder:
                 _combined_source(board_history.source, benchmark_history.source),
                 (board_history, benchmark_history),
             )
-        if (
-            "return_20d_pct" in values
-            and "benchmark_return_20d_pct" not in values
-        ):
-            forced_missing.add("benchmark_return_20d_pct")
+        current_relative_complete = all(
+            field in values
+            for field in ("return_20d_pct", "benchmark_return_20d_pct")
+        )
+        base_relative_complete = all(
+            getattr(base, field) is not None
+            for field in ("return_20d_pct", "benchmark_return_20d_pct")
+        )
+        if not current_relative_complete and base_relative_complete:
+            self._discard_current_fields(
+                ("return_20d_pct", "benchmark_return_20d_pct"),
+                values,
+                sources,
+                dependencies,
+            )
+        elif not current_relative_complete and "return_20d_pct" in values:
+            self._clear_current_field(
+                "benchmark_return_20d_pct", values, sources, dependencies
+            )
 
         flow = board_flow.data
         flow_usable = (
@@ -477,12 +498,33 @@ class CnSectorObservationBuilder:
                     for previous in combined_dependencies[:index]
                 )
             )
-        elif "return_5d_pct" in values or "capital_flow_5d" in values:
-            forced_missing.add("price_flow_divergence")
+        else:
+            base_divergence_complete = all(
+                getattr(base, field) is not None
+                for field in (
+                    "return_5d_pct",
+                    "capital_flow_5d",
+                    "price_flow_divergence",
+                )
+            )
+            if base_divergence_complete:
+                self._discard_current_fields(
+                    (
+                        "return_5d_pct",
+                        "capital_flow_5d",
+                        "price_flow_divergence",
+                    ),
+                    values,
+                    sources,
+                    dependencies,
+                )
+            else:
+                self._clear_current_field(
+                    "price_flow_divergence", values, sources, dependencies
+                )
 
         return _Metrics(
             values=values,
-            forced_missing=frozenset(forced_missing),
             field_sources=sources,
             field_capabilities=dependencies,
             coverage=coverage,
@@ -492,6 +534,29 @@ class CnSectorObservationBuilder:
             constituent_codes=constituent_codes,
             terminal_date=terminal_date,
         )
+
+    @staticmethod
+    def _discard_current_fields(
+        fields: Sequence[str],
+        values: dict[str, Any],
+        sources: dict[str, str],
+        dependencies: dict[str, tuple[CapabilityResult, ...]],
+    ) -> None:
+        for field in fields:
+            values.pop(field, None)
+            sources.pop(field, None)
+            dependencies.pop(field, None)
+
+    @staticmethod
+    def _clear_current_field(
+        field: str,
+        values: dict[str, Any],
+        sources: dict[str, str],
+        dependencies: dict[str, tuple[CapabilityResult, ...]],
+    ) -> None:
+        values[field] = None
+        sources.pop(field, None)
+        dependencies.pop(field, None)
 
     @staticmethod
     def _publish(
@@ -712,8 +777,6 @@ class CnSectorObservationBuilder:
         evidence: ConstituentEvidence | None,
     ) -> SectorObservation:
         payload = base.model_dump()
-        for field in metrics.forced_missing:
-            payload[field] = None
         payload.update(metrics.values)
         payload.update(
             observed_at=observed_at,

@@ -609,7 +609,7 @@ def test_divergence_is_false_at_noise_boundary_without_opposite_signs() -> None:
     assert opposite_sign.price_flow_divergence is True
 
 
-def test_coupled_metrics_never_mix_base_and_enriched_vintages() -> None:
+def test_incomplete_current_groups_preserve_complete_base_groups_atomically() -> None:
     base = _base(
         return_5d_pct=9.0,
         capital_flow_5d=-0.2,
@@ -624,13 +624,21 @@ def test_coupled_metrics_never_mix_base_and_enriched_vintages() -> None:
         board_flow=_unavailable("board_flow"),
     ).observation
 
-    assert mixed.return_5d_pct == pytest.approx(5.0)
+    assert mixed.return_5d_pct == 9.0
     assert mixed.capital_flow_5d == -0.2
-    assert mixed.price_flow_divergence is None
-    assert mixed.return_20d_pct is not None
-    assert mixed.benchmark_return_20d_pct is None
-    assert "price_flow_divergence" in mixed.missing_fields
-    assert "benchmark_return_20d_pct" in mixed.missing_fields
+    assert mixed.price_flow_divergence is True
+    assert mixed.return_20d_pct == 8.0
+    assert mixed.benchmark_return_20d_pct == 3.0
+    assert {
+        mixed.raw_reference["field_sources"][field]
+        for field in (
+            "return_5d_pct",
+            "capital_flow_5d",
+            "price_flow_divergence",
+            "return_20d_pct",
+            "benchmark_return_20d_pct",
+        )
+    } == {"base:phase1"}
 
     preserved = _build(
         base=base,
@@ -641,6 +649,54 @@ def test_coupled_metrics_never_mix_base_and_enriched_vintages() -> None:
     assert preserved.price_flow_divergence is True
     assert preserved.return_20d_pct == 8.0
     assert preserved.benchmark_return_20d_pct == 3.0
+
+
+def test_incomplete_base_groups_keep_safe_current_standalone_fields() -> None:
+    base = _base(capital_flow_5d=-0.2, benchmark_return_20d_pct=3.0)
+    observation = _build(
+        base=base,
+        board_history=_history([100.0] * 16 + [105.0] * 5),
+        benchmark_history=_unavailable("benchmark_history"),
+        board_flow=_unavailable("board_flow"),
+    ).observation
+
+    assert observation.return_5d_pct == pytest.approx(5.0)
+    assert observation.capital_flow_5d == -0.2
+    assert observation.price_flow_divergence is None
+    assert observation.return_20d_pct == pytest.approx(5.0)
+    assert observation.benchmark_return_20d_pct is None
+
+
+def test_complete_current_groups_replace_complete_base_groups() -> None:
+    base = _base(
+        return_5d_pct=9.0,
+        capital_flow_5d=0.5,
+        price_flow_divergence=False,
+        return_20d_pct=8.0,
+        benchmark_return_20d_pct=3.0,
+    )
+    observation = _build(
+        base=base,
+        board_history=_history([100.0] * 16 + [105.0] * 5),
+        benchmark_history=_history([100.0] * 21, code="000985"),
+        board_flow=_flows([-0.1] * 20, amounts=[100.0] * 20),
+    ).observation
+
+    assert observation.return_5d_pct == pytest.approx(5.0)
+    assert observation.capital_flow_5d == pytest.approx(-0.1)
+    assert observation.price_flow_divergence is True
+    assert observation.return_20d_pct == pytest.approx(5.0)
+    assert observation.benchmark_return_20d_pct == 0.0
+    assert all(
+        not observation.raw_reference["field_sources"][field].startswith("base:")
+        for field in (
+            "return_5d_pct",
+            "capital_flow_5d",
+            "price_flow_divergence",
+            "return_20d_pct",
+            "benchmark_return_20d_pct",
+        )
+    )
 
 
 def test_coupled_metrics_require_same_run_capabilities() -> None:
@@ -811,3 +867,25 @@ def test_provenance_is_allowlisted_bounded_and_covers_every_final_field() -> Non
     assert "nested-secret" not in serialized
     assert "sendkey-secret" not in serialized
     assert len(serialized) < 20_000
+
+
+def test_trace_duration_is_finite_nonnegative_and_portably_bounded() -> None:
+    durations = (True, float("nan"), float("inf"), -1, 10**100, 12.5)
+    board = _history([100.0] * 21).model_copy(
+        update={
+            "trace": tuple(
+                {"provider": f"provider-{index}", "duration_ms": duration}
+                for index, duration in enumerate(durations)
+            )
+        }
+    )
+
+    raw = _build(board_history=board).observation.model_dump(mode="json")[
+        "raw_reference"
+    ]
+    trace = raw["capabilities"]["board_history"]["trace"]
+
+    assert all("duration_ms" not in trace[index] for index in range(4))
+    assert trace[4]["duration_ms"] == 86_400_000
+    assert trace[5]["duration_ms"] == 12.5
+    json.dumps(raw, allow_nan=False)
