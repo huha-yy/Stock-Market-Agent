@@ -206,7 +206,7 @@ def _confidence(item: SectorObservation) -> float:
     total_coverage_weight = sum(_COVERAGE_WEIGHTS.values())
     quality_multiplier = {
         "complete": 1.0,
-        "partial": 0.8,
+        "partial": 1.0,
         "stale": 0.4,
         "unavailable": 0.0,
     }[item.quality]
