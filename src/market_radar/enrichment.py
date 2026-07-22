@@ -183,9 +183,10 @@ class MarketRadarEnricher:
         )
         benchmark_values, benchmark_unfinished = scheduler.run(
             benchmark_codes,
-            lambda code: self._safe_provider_call(
+            lambda code: self._deadline_provider_call(
                 "benchmark_history",
                 as_of,
+                deadline,
                 self.provider.fetch_benchmark_history,
                 code,
                 as_of,
@@ -300,7 +301,7 @@ class MarketRadarEnricher:
         circuit: RunScopedCapabilityCircuit,
     ) -> _CandidateCapabilities:
         return _CandidateCapabilities(
-            board_history=self._candidate_provider_call(
+            board_history=self._deadline_provider_call(
                 "board_history",
                 as_of,
                 deadline,
@@ -309,7 +310,7 @@ class MarketRadarEnricher:
                 as_of,
                 attempt_policy=circuit,
             ),
-            board_flow=self._candidate_provider_call(
+            board_flow=self._deadline_provider_call(
                 "board_flow",
                 as_of,
                 deadline,
@@ -318,7 +319,7 @@ class MarketRadarEnricher:
                 as_of,
                 attempt_policy=circuit,
             ),
-            membership=self._candidate_provider_call(
+            membership=self._deadline_provider_call(
                 "constituents",
                 as_of,
                 deadline,
@@ -329,7 +330,7 @@ class MarketRadarEnricher:
             ),
         )
 
-    def _candidate_provider_call(
+    def _deadline_provider_call(
         self,
         capability: str,
         as_of: datetime,
@@ -346,6 +347,8 @@ class MarketRadarEnricher:
             method,
             *args,
             attempt_policy=attempt_policy,
+            deadline_monotonic=deadline,
+            monotonic=self.monotonic,
         )
 
     def _fetch_quote_union(
@@ -365,9 +368,10 @@ class MarketRadarEnricher:
             )
         completed, _ = self._scheduler(deadline).run(
             (codes,),
-            lambda requested: self._safe_provider_call(
+            lambda requested: self._deadline_provider_call(
                 "constituent_quotes",
                 as_of,
+                deadline,
                 self.provider.fetch_constituent_quotes,
                 requested,
                 as_of,
@@ -382,16 +386,23 @@ class MarketRadarEnricher:
         )
 
     @staticmethod
-    def _provider_accepts_attempt_policy(method: Callable[..., Any]) -> bool:
+    def _supported_provider_kwargs(
+        method: Callable[..., Any], values: Mapping[str, Any]
+    ) -> dict[str, Any]:
         try:
             parameters = inspect.signature(method).parameters.values()
         except (TypeError, ValueError):
-            return False
-        return any(
-            parameter.name == "attempt_policy"
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            return {}
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
+        return {
+            name: value
+            for name, value in values.items()
+            if accepts_kwargs or name in parameter_names
+        }
 
     @classmethod
     def _safe_provider_call(
@@ -401,11 +412,16 @@ class MarketRadarEnricher:
         method: Callable[..., Any],
         *args: Any,
         attempt_policy: RunScopedCapabilityCircuit,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult:
-        kwargs = (
-            {"attempt_policy": attempt_policy}
-            if cls._provider_accepts_attempt_policy(method)
-            else {}
+        kwargs = cls._supported_provider_kwargs(
+            method,
+            {
+                "attempt_policy": attempt_policy,
+                "deadline_monotonic": deadline_monotonic,
+                "monotonic": monotonic,
+            },
         )
         try:
             result = method(*args, **kwargs)

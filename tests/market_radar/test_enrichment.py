@@ -365,7 +365,7 @@ class _QuoteDeadlineClock:
 
     def __call__(self) -> float:
         self.calls += 1
-        return 0.0 if self.calls <= 9 else 10.0
+        return 0.0 if self.calls <= 10 else 10.0
 
 
 class _ManualClock:
@@ -374,6 +374,16 @@ class _ManualClock:
 
     def __call__(self) -> float:
         return self.now
+
+
+class _ExpireOnSubmitExecutor(_ImmediateExecutor):
+    def __init__(self, max_workers: int, clock: _ManualClock) -> None:
+        super().__init__(max_workers)
+        self.clock = clock
+
+    def submit(self, fn, *args):
+        self.clock.now = 10.0
+        return super().submit(fn, *args)
 
 
 def test_deadline_stops_submission_and_marks_unfinished_capabilities_unavailable() -> None:
@@ -467,6 +477,46 @@ def test_candidate_does_not_start_later_capabilities_after_deadline() -> None:
     assert any(
         item.get("result") == "deadline_exceeded" for item in batch.trace
     )
+
+
+def test_benchmark_worker_rechecks_deadline_when_execution_starts() -> None:
+    candidate = _candidate(1)
+    provider = _Provider({candidate.sector.sector_id: ("000001",)})
+    clock = _ManualClock()
+
+    batch = _enricher(
+        provider,
+        monotonic=clock,
+        executor_factory=lambda workers: _ExpireOnSubmitExecutor(workers, clock),
+    ).enrich((candidate,), AS_OF)
+
+    assert provider.benchmark_calls == []
+    benchmark = batch.observations[0].raw_reference["capabilities"][
+        "benchmark_history"
+    ]
+    assert benchmark["status"] == "unavailable"
+    assert benchmark["error"] == "deadline_exceeded"
+
+
+def test_quote_worker_rechecks_deadline_when_execution_starts() -> None:
+    provider = _Provider({})
+    clock = _ManualClock()
+    enricher = _enricher(
+        provider,
+        monotonic=clock,
+        executor_factory=lambda workers: _ExpireOnSubmitExecutor(workers, clock),
+    )
+
+    result = enricher._fetch_quote_union(
+        ("000001",),
+        AS_OF,
+        10.0,
+        RunScopedCapabilityCircuit(),
+    )
+
+    assert provider.quote_calls == []
+    assert result.status == "unavailable"
+    assert result.error == "deadline_exceeded"
 
 
 def test_run_circuit_is_capability_source_local_and_success_resets_count() -> None:

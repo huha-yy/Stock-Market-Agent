@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 import sys
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 import pandas as pd
 
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetcherManager
+from data_provider.realtime_types import RealtimeSource, UnifiedRealtimeQuote
 from src.market_radar.capability_provider import ProviderCapabilityAdapter
 from src.market_radar.enrichment import RunScopedCapabilityCircuit
 from src.market_radar.models import SectorDefinition
@@ -120,6 +123,188 @@ def test_run_scoped_circuit_opens_one_capability_source_and_keeps_fallback() -> 
         "circuit_open",
         "ok",
     ]
+
+
+def test_concurrent_capability_admission_stops_failing_source_at_threshold() -> None:
+    calls = {"A": 0, "B": 0}
+    calls_lock = Lock()
+
+    class FailingFetcher:
+        name = "A"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str):
+            assert all_waiting.wait(timeout=1.0)
+            with calls_lock:
+                calls["A"] += 1
+            raise RuntimeError("upstream failed")
+
+    class WorkingFetcher:
+        name = "B"
+        priority = 1
+
+        def get_sector_history(self, kind: str, name: str):
+            with calls_lock:
+                calls["B"] += 1
+            return pd.DataFrame(
+                {
+                    "data_date": ["2026-07-22"],
+                    "close": [1.0],
+                    "traded_amount": [2.0],
+                }
+            )
+
+    manager = DataFetcherManager(fetchers=[FailingFetcher(), WorkingFetcher()])
+    original_get_lock = manager._get_fetcher_call_lock
+    lock_requests = 0
+    lock_requests_guard = Lock()
+    all_waiting = Event()
+
+    def synchronized_get_lock(fetcher):
+        nonlocal lock_requests
+        lock = original_get_lock(fetcher)
+        if fetcher.name == "A":
+            with lock_requests_guard:
+                lock_requests += 1
+                if lock_requests >= 6:
+                    all_waiting.set()
+        return lock
+
+    manager._get_fetcher_call_lock = synchronized_get_lock
+    adapter = ProviderCapabilityAdapter(manager)
+    circuit = RunScopedCapabilityCircuit(failure_threshold=3)
+    start = Barrier(6)
+
+    def fetch_once():
+        start.wait()
+        result = adapter.fetch_board_history(
+            SECTOR, AS_OF, attempt_policy=circuit
+        )
+        return result
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = tuple(executor.map(lambda _: fetch_once(), range(6)))
+
+    assert calls == {"A": 3, "B": 6}
+    assert all(result.status == "ok" for result in results)
+    assert sum(
+        item.get("result") == "circuit_open"
+        for result in results
+        for item in result.trace
+    ) == 3
+
+
+def test_quote_circuit_opens_failed_source_and_keeps_fallback(
+    monkeypatch,
+) -> None:
+    calls = {"efinance": 0, "akshare_em": 0}
+
+    class FailingQuoteFetcher:
+        name = "EfinanceFetcher"
+        priority = 0
+
+        def get_realtime_quote(self, code: str):
+            calls["efinance"] += 1
+            raise RuntimeError("quote failed")
+
+    class WorkingQuoteFetcher:
+        name = "AkshareFetcher"
+        priority = 1
+
+        def get_realtime_quote(self, code: str, source: str = "em"):
+            calls["akshare_em"] += 1
+            return UnifiedRealtimeQuote(
+                code=code,
+                source=RealtimeSource.AKSHARE_EM,
+                price=10.0,
+                pre_close=9.0,
+                amount=100.0,
+                provider_timestamp="2026-07-22T14:30:00+08:00",
+                volume_ratio=1.0,
+                turnover_rate=1.0,
+                pe_ratio=10.0,
+                pb_ratio=1.0,
+                total_mv=100.0,
+                circ_mv=80.0,
+                amplitude=1.0,
+            )
+
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="efinance,akshare_em",
+            realtime_cache_ttl=600,
+        ),
+    )
+    adapter = ProviderCapabilityAdapter(
+        DataFetcherManager(
+            fetchers=[FailingQuoteFetcher(), WorkingQuoteFetcher()]
+        )
+    )
+    circuit = RunScopedCapabilityCircuit(failure_threshold=3)
+
+    results = [
+        adapter.fetch_constituent_quotes(
+            ("000001",), AS_OF, attempt_policy=circuit
+        )
+        for _ in range(4)
+    ]
+
+    assert calls == {"efinance": 3, "akshare_em": 4}
+    assert all(result.status in {"ok", "stale"} for result in results)
+    assert any(
+        item.get("provider") == "efinance"
+        and item.get("result") == "circuit_open"
+        for item in results[-1].trace
+    )
+    assert any(
+        item.get("provider") == "akshare_em"
+        and item.get("result") == "ok"
+        for item in results[-1].trace
+    )
+
+
+def test_quote_batch_stops_requesting_codes_after_deadline() -> None:
+    calls: list[str] = []
+
+    class AdvancingQuoteManager:
+        def get_realtime_quote(self, code: str, *, log_final_failure: bool = True):
+            calls.append(code)
+            clock.now = 10.0
+            return {
+                "code": code,
+                "price": 10.0,
+                "pre_close": 9.0,
+                "amount": 100.0,
+                "provider_timestamp": "2026-07-22T14:30:00+08:00",
+                "source": "fixture",
+            }
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+
+    result = ProviderCapabilityAdapter(
+        AdvancingQuoteManager()
+    ).fetch_constituent_quotes(
+        ("000001", "600000", "600519"),
+        AS_OF,
+        deadline_monotonic=10.0,
+        monotonic=clock,
+    )
+
+    assert calls == ["000001"]
+    assert result.status == "partial"
+    assert result.data is not None
+    assert tuple(quote.code for quote in result.data.quotes) == ("000001",)
+    assert any(
+        item.get("result") == "deadline_exceeded" for item in result.trace
+    )
 
 
 def test_manager_bounds_and_redacts_persisted_failure_text() -> None:

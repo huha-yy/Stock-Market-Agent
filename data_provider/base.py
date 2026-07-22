@@ -706,6 +706,7 @@ class DataFetcherManager:
         "benchmark_history": "get_index_history",
     }
     _MARKET_RADAR_ERROR_LIMIT = 256
+    _MARKET_RADAR_TRACE_LIMIT = 1000
 
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
@@ -1794,7 +1795,16 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        attempt_policy: Any = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        attempt_trace: Optional[List[Dict[str, Any]]] = None,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1909,6 +1919,30 @@ class DataFetcherManager:
         primary_fallback_from: Optional[str] = None
         
         for source_index, source in enumerate(source_priority):
+            if (
+                deadline_monotonic is not None
+                and monotonic() >= deadline_monotonic
+            ):
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    provider=source,
+                    result="deadline_exceeded",
+                    code=stock_code,
+                )
+                break
+            if (
+                attempt_policy is not None
+                and not attempt_policy.should_attempt(
+                    "constituent_quotes", source
+                )
+            ):
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    provider=source,
+                    result="circuit_open",
+                    code=stock_code,
+                )
+                continue
             attempt_start = time.time()
             fallback_to = source_priority[source_index + 1] if source_index + 1 < len(source_priority) else None
             fetcher = None
@@ -1978,6 +2012,16 @@ class DataFetcherManager:
                 provider_name = fetcher.name if fetcher is not None else source
                 
                 if quote is not None and quote.has_basic_data():
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(
+                            "constituent_quotes", source, "ok"
+                        )
+                    self._append_market_radar_attempt_trace(
+                        attempt_trace,
+                        provider=source,
+                        result="ok",
+                        code=stock_code,
+                    )
                     record_provider_run(
                         data_type="realtime_quote",
                         provider=provider_name,
@@ -2015,6 +2059,16 @@ class DataFetcherManager:
                         if not self._quote_needs_supplement(primary_quote):
                             break
                 else:
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(
+                            "constituent_quotes", source, "empty"
+                        )
+                    self._append_market_radar_attempt_trace(
+                        attempt_trace,
+                        provider=source,
+                        result="empty",
+                        code=stock_code,
+                    )
                     record_provider_run(
                         data_type="realtime_quote",
                         provider=provider_name,
@@ -2032,6 +2086,17 @@ class DataFetcherManager:
             except Exception as e:
                 error_msg = f"[{source}] 失败: {str(e)}"
                 error_type, error_reason = summarize_exception(e)
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(
+                        "constituent_quotes", source, "failed"
+                    )
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    provider=source,
+                    result="failed",
+                    code=stock_code,
+                    error=error_reason,
+                )
                 record_provider_run(
                     data_type="realtime_quote",
                     provider=getattr(fetcher, "name", source),
@@ -3724,6 +3789,20 @@ class DataFetcherManager:
     def _safe_market_radar_text(cls, value: Any) -> str:
         return sanitize_persisted_text(value, cls._MARKET_RADAR_ERROR_LIMIT)
 
+    @classmethod
+    def _append_market_radar_attempt_trace(
+        cls,
+        trace: Optional[List[Dict[str, Any]]],
+        **values: Any,
+    ) -> None:
+        if trace is None or len(trace) >= cls._MARKET_RADAR_TRACE_LIMIT:
+            return
+        entry: Dict[str, Any] = {}
+        for key in ("provider", "result", "code", "error"):
+            if key in values and values[key] is not None:
+                entry[key] = cls._safe_market_radar_text(values[key])
+        trace.append(entry)
+
     @staticmethod
     def _implements_market_radar_capability(
         fetcher: BaseFetcher,
@@ -3757,6 +3836,99 @@ class DataFetcherManager:
             **kwargs,
         )
 
+    def _attempt_market_radar_source(
+        self,
+        fetcher: BaseFetcher,
+        *,
+        capability: str,
+        method_name: str,
+        kind: str,
+        name: str,
+        as_of: Optional[datetime],
+        target_date: Optional[date],
+        attempt_policy: Any,
+    ) -> Tuple[Any | None, Dict[str, Any], str, Optional[date]]:
+        from src.market_radar.capability_provider import (
+            provider_capability_data_date,
+            validate_provider_capability_payload,
+        )
+
+        provider = self._safe_market_radar_text(
+            getattr(fetcher, "name", type(fetcher).__name__)
+        )[:80]
+        started = time.monotonic()
+        with self._get_fetcher_call_lock(fetcher):
+            if (
+                attempt_policy is not None
+                and not attempt_policy.should_attempt(capability, provider)
+            ):
+                return None, {
+                    "provider": provider,
+                    "result": "circuit_open",
+                    "duration_ms": 0,
+                }, "", None
+            try:
+                args = (name,) if capability == "benchmark_history" else (kind, name)
+                payload = self._call_market_radar_capability(
+                    fetcher, method_name, args, as_of
+                )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                is_valid, reason = validate_provider_capability_payload(
+                    capability, payload, as_of=as_of
+                )
+                if is_valid:
+                    terminal = provider_capability_data_date(capability, payload)
+                    if target_date is not None and terminal is None:
+                        result = "partial"
+                        error = "unversioned_current_membership"
+                    elif (
+                        target_date is not None
+                        and terminal is not None
+                        and terminal < target_date
+                    ):
+                        result = "stale"
+                        error = "provider terminal date precedes requested as_of"
+                    else:
+                        result = "ok"
+                        error = ""
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(capability, provider, result)
+                    entry: Dict[str, Any] = {
+                        "provider": provider,
+                        "result": result,
+                        "duration_ms": duration_ms,
+                    }
+                    if error:
+                        entry["error"] = error
+                    return payload, entry, "", terminal
+
+                result = "empty" if reason == "empty result" else "invalid"
+                last_error = self._safe_market_radar_text(
+                    f"{provider} returned {reason}"
+                )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, result)
+                return None, {
+                    "provider": provider,
+                    "result": result,
+                    "duration_ms": duration_ms,
+                    "error": last_error,
+                }, last_error, None
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                safe_reason = self._safe_market_radar_text(error_reason)
+                last_error = self._safe_market_radar_text(
+                    f"{provider} ({error_type}) {safe_reason}"
+                )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, "failed")
+                return None, {
+                    "provider": provider,
+                    "result": "failed",
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "error": safe_reason,
+                }, last_error, None
+
     def get_market_radar_capability_with_meta(
         self,
         capability: str,
@@ -3777,12 +3949,6 @@ class DataFetcherManager:
         if kind not in allowed_kinds:
             raise ValueError(f"unsupported sector kind: {kind}")
 
-        # Keep provider alias and unit knowledge at the normalization boundary.
-        from src.market_radar.capability_provider import (
-            provider_capability_data_date,
-            validate_provider_capability_payload,
-        )
-
         source_chain: List[Dict[str, Any]] = []
         last_error = ""
         stale_candidate: Optional[Tuple[date, Any, int]] = None
@@ -3799,121 +3965,33 @@ class DataFetcherManager:
                 method_name,
             ):
                 continue
-            started = time.monotonic()
-            provider = self._safe_market_radar_text(
-                getattr(fetcher, "name", type(fetcher).__name__)
-            )[:80]
-            if (
-                attempt_policy is not None
-                and not attempt_policy.should_attempt(capability, provider)
-            ):
-                source_chain.append(
-                    {
-                        "provider": provider,
-                        "result": "circuit_open",
-                        "duration_ms": 0,
-                    }
-                )
-                continue
-            try:
-                args = (name,) if capability == "benchmark_history" else (kind, name)
-                payload = self._call_market_radar_capability(
+            payload, entry, attempt_error, terminal = (
+                self._attempt_market_radar_source(
                     fetcher,
-                    method_name,
-                    args,
-                    as_of,
-                )
-                duration_ms = int((time.monotonic() - started) * 1000)
-                is_valid, reason = validate_provider_capability_payload(
-                    capability,
-                    payload,
+                    capability=capability,
+                    method_name=method_name,
+                    kind=kind,
+                    name=name,
                     as_of=as_of,
+                    target_date=target_date,
+                    attempt_policy=attempt_policy,
                 )
-                if is_valid:
-                    terminal = provider_capability_data_date(capability, payload)
-                    if target_date is not None and terminal is None:
-                        source_chain.append(
-                            {
-                                "provider": provider,
-                                "result": "partial",
-                                "duration_ms": duration_ms,
-                                "error": "unversioned_current_membership",
-                            }
-                        )
-                        if attempt_policy is not None:
-                            attempt_policy.record_attempt(
-                                capability, provider, "partial"
-                            )
-                        if partial_candidate is None:
-                            partial_candidate = (payload, len(source_chain) - 1)
-                        continue
-                    if (
-                        target_date is not None
-                        and terminal is not None
-                        and terminal < target_date
-                    ):
-                        source_chain.append(
-                            {
-                                "provider": provider,
-                                "result": "stale",
-                                "duration_ms": duration_ms,
-                                "error": "provider terminal date precedes requested as_of",
-                            }
-                        )
-                        if attempt_policy is not None:
-                            attempt_policy.record_attempt(
-                                capability, provider, "stale"
-                            )
-                        if stale_candidate is None or terminal > stale_candidate[0]:
-                            stale_candidate = (
-                                terminal,
-                                payload,
-                                len(source_chain) - 1,
-                            )
-                        continue
-                    source_chain.append(
-                        {
-                            "provider": provider,
-                            "result": "ok",
-                            "duration_ms": duration_ms,
-                        }
+            )
+            source_chain.append(entry)
+            result = entry["result"]
+            if attempt_error:
+                last_error = attempt_error
+            if result == "ok":
+                return payload, source_chain, ""
+            if result == "partial" and partial_candidate is None:
+                partial_candidate = (payload, len(source_chain) - 1)
+            elif result == "stale" and terminal is not None:
+                if stale_candidate is None or terminal > stale_candidate[0]:
+                    stale_candidate = (
+                        terminal,
+                        payload,
+                        len(source_chain) - 1,
                     )
-                    if attempt_policy is not None:
-                        attempt_policy.record_attempt(capability, provider, "ok")
-                    return payload, source_chain, ""
-
-                result = "empty" if reason == "empty result" else "invalid"
-                last_error = self._safe_market_radar_text(
-                    f"{provider} returned {reason}"
-                )
-                source_chain.append(
-                    {
-                        "provider": provider,
-                        "result": result,
-                        "duration_ms": duration_ms,
-                        "error": last_error,
-                    }
-                )
-                if attempt_policy is not None:
-                    attempt_policy.record_attempt(capability, provider, result)
-            except Exception as exc:
-                error_type, error_reason = summarize_exception(exc)
-                safe_reason = self._safe_market_radar_text(error_reason)
-                last_error = self._safe_market_radar_text(
-                    f"{provider} ({error_type}) {safe_reason}"
-                )
-                source_chain.append(
-                    {
-                        "provider": provider,
-                        "result": "failed",
-                        "duration_ms": int(
-                            (time.monotonic() - started) * 1000
-                        ),
-                        "error": safe_reason,
-                    }
-                )
-                if attempt_policy is not None:
-                    attempt_policy.record_attempt(capability, provider, "failed")
         if stale_candidate is not None:
             _, payload, trace_index = stale_candidate
             source_chain[trace_index]["selected"] = True

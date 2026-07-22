@@ -5,7 +5,8 @@ from datetime import date, datetime
 import inspect
 import math
 import re
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+import time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -26,6 +27,7 @@ from src.market_radar.models import SectorDefinition
 
 _CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _ERROR_LIMIT = 256
+_TRACE_LIMIT = 1000
 _DATE_ALIASES = ("data_date", "trade_date", "date", "数据日期", "交易日期", "日期")
 _CLOSE_ALIASES = ("close", "close_price", "收盘", "收盘价")
 _CODE_ALIASES = ("code", "stock_code", "symbol", "代码", "股票代码", "证券代码")
@@ -79,7 +81,13 @@ class MarketRadarEnrichmentProvider(Protocol):
         raise NotImplementedError
 
     def fetch_constituent_quotes(
-        self, codes: tuple[str, ...], as_of: datetime, *, attempt_policy: Any = None
+        self,
+        codes: tuple[str, ...],
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[ConstituentQuoteBatch]:
         raise NotImplementedError
 
@@ -283,7 +291,7 @@ def provider_capability_data_date(
 
 def _safe_trace(trace: Any) -> tuple[Mapping[str, Any], ...]:
     cleaned = []
-    for item in trace or ():
+    for item in tuple(trace or ())[:_TRACE_LIMIT]:
         if not isinstance(item, Mapping):
             continue
         entry: dict[str, Any] = {}
@@ -649,6 +657,8 @@ class ProviderCapabilityAdapter:
         as_of: datetime,
         *,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[ConstituentQuoteBatch]:
         self._require_as_of(as_of)
         try:
@@ -664,11 +674,46 @@ class ProviderCapabilityAdapter:
 
         parsed: list[tuple[ConstituentQuote, str, bool, int]] = []
         trace: list[dict[str, Any]] = []
+        deadline_exceeded = False
         for requested_code in normalized_codes:
+            if (
+                deadline_monotonic is not None
+                and monotonic() >= deadline_monotonic
+            ):
+                trace.append(
+                    {
+                        "provider": "constituent_quotes",
+                        "result": "deadline_exceeded",
+                        "code": requested_code,
+                    }
+                )
+                deadline_exceeded = True
+                break
             try:
-                raw_quote = self.manager.get_realtime_quote(
+                method = self.manager.get_realtime_quote
+                parameters = inspect.signature(method).parameters.values()
+                parameter_names = {parameter.name for parameter in parameters}
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                optional = {
+                    "attempt_policy": attempt_policy,
+                    "deadline_monotonic": deadline_monotonic,
+                    "monotonic": monotonic,
+                    "attempt_trace": trace,
+                }
+                kwargs = {
+                    "log_final_failure": False,
+                    **{
+                        name: value
+                        for name, value in optional.items()
+                        if accepts_kwargs or name in parameter_names
+                    },
+                }
+                raw_quote = method(
                     requested_code,
-                    log_final_failure=False,
+                    **kwargs,
                 )
                 if raw_quote is None:
                     raise ValueError("empty quote")
@@ -716,7 +761,11 @@ class ProviderCapabilityAdapter:
                 "constituent_quotes",
                 as_of,
                 trace=trace,
-                error="no valid constituent quotes",
+                error=(
+                    "deadline_exceeded"
+                    if deadline_exceeded
+                    else "no valid constituent quotes"
+                ),
             )
 
         terminal = max(item[0].quoted_at.astimezone(_CN_TIMEZONE).date() for item in parsed)
@@ -741,5 +790,5 @@ class ProviderCapabilityAdapter:
             bar_status=self._bar_status(terminal, as_of),
             freshness_seconds=max(item[3] for item in same_date),
             trace=_safe_trace(trace),
-            error=None,
+            error="deadline_exceeded" if deadline_exceeded else None,
         )

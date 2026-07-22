@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from data_provider import akshare_fetcher as akshare_module
 from data_provider.akshare_fetcher import AkshareFetcher
 
 
@@ -28,6 +29,47 @@ def _fetcher(monkeypatch, akshare) -> AkshareFetcher:
         ),
     )
     return fetcher
+
+
+def test_realtime_em_spot_call_uses_bounded_timeout_wrapper(monkeypatch) -> None:
+    captured = []
+    raw_calls = []
+
+    def raw_spot():
+        raw_calls.append(True)
+        return pd.DataFrame()
+
+    def bounded_call(func, *args, **kwargs):
+        captured.append((func, args, kwargs))
+        return pd.DataFrame()
+
+    fake_akshare = SimpleNamespace(stock_zh_a_spot_em=raw_spot)
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(akshare_module, "_akshare_call_with_timeout", bounded_call)
+    monkeypatch.setattr(
+        akshare_module,
+        "_realtime_cache",
+        {"data": None, "timestamp": 0, "ttl": 1200},
+    )
+    fetcher = AkshareFetcher.__new__(AkshareFetcher)
+    fetcher._history_call_timeout = 7
+    monkeypatch.setattr(fetcher, "_set_random_user_agent", lambda: None)
+    monkeypatch.setattr(fetcher, "_enforce_rate_limit", lambda: None)
+
+    result = fetcher._get_stock_realtime_quote_em("000001")
+
+    assert result is None
+    assert raw_calls == []
+    assert captured == [
+        (
+            raw_spot,
+            (),
+            {
+                "timeout": 7,
+                "call_name": "ak.stock_zh_a_spot_em",
+            },
+        )
+    ]
 
 
 def test_sector_history_dispatches_explicit_industry_and_concept_endpoints(
