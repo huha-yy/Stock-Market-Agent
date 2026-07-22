@@ -51,11 +51,12 @@ class CandidateSelector:
 
         ordered_ids = self._seed_and_previous_order(seed_ids, previous_ids)
         seen_ids = set(ordered_ids)
+        current_queues = self._current_extreme_queues(by_id)
+        self._collect_current_reasons(current_queues, reasons)
         self._consume_current_queues(
-            self._current_extreme_queues(by_id),
+            current_queues,
             ordered_ids,
             seen_ids,
-            reasons,
             limit,
         )
 
@@ -230,17 +231,26 @@ class CandidateSelector:
         return (False, -value if reverse else value, sector_id)
 
     @staticmethod
+    def _collect_current_reasons(
+        queues: Sequence[tuple[str, Sequence[str]]],
+        reasons: dict[str, list[str]],
+    ) -> None:
+        for reason, queue in queues:
+            for sector_id in queue:
+                if reason not in reasons[sector_id]:
+                    reasons[sector_id].append(reason)
+
+    @staticmethod
     def _consume_current_queues(
         queues: Sequence[tuple[str, Sequence[str]]],
         ordered_ids: list[str],
         seen_ids: set[str],
-        reasons: dict[str, list[str]],
         limit: int,
     ) -> None:
         positions = [0] * len(queues)
         while len(ordered_ids) < limit:
             made_progress = False
-            for index, (reason, queue) in enumerate(queues):
+            for index, (_, queue) in enumerate(queues):
                 while positions[index] < len(queue):
                     sector_id = queue[positions[index]]
                     positions[index] += 1
@@ -248,7 +258,6 @@ class CandidateSelector:
                         continue
                     ordered_ids.append(sector_id)
                     seen_ids.add(sector_id)
-                    reasons[sector_id].append(reason)
                     made_progress = True
                     break
                 if len(ordered_ids) >= limit:

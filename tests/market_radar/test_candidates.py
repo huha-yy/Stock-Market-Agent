@@ -107,11 +107,11 @@ def test_selector_prioritizes_seeds_then_prior_states_then_round_robin_extremes(
         "concept:prior-improving",
     ]
     assert selected[0].observation is None
-    assert [item.reasons[-1] for item in selected[3:]] == [
-        "current_industry_leader",
-        "current_industry_laggard",
-        "current_concept_leader",
-        "current_concept_laggard",
+    assert [item.sector.sector_id for item in selected[3:]] == [
+        "industry:leader",
+        "industry:laggard",
+        "concept:leader",
+        "concept:laggard",
     ]
 
 
@@ -153,7 +153,56 @@ def test_selector_synthesizes_discovery_definition_without_rewriting_observation
         effective_from=NOW.date(),
     )
     assert selected[0].observation is discovered
-    assert selected[0].reasons == ("current_concept_leader",)
+    assert selected[0].reasons == (
+        "current_concept_leader",
+        "current_concept_laggard",
+    )
+
+
+def test_selector_collects_current_reasons_for_configured_and_prior_candidates() -> None:
+    selected = CandidateSelector().select(
+        universe=(definition("industry:configured"),),
+        observations=(
+            observation("industry:configured", daily_return=2.0),
+            observation("industry:previous", daily_return=1.0),
+        ),
+        previous_snapshot=snapshot(
+            score("industry:configured", "leading"),
+            score("industry:previous", "improving"),
+        ),
+        limit=2,
+    )
+
+    assert selected[0].reasons == (
+        "configured_seed",
+        "previous_leading",
+        "current_industry_leader",
+        "current_industry_laggard",
+    )
+    assert selected[1].reasons == (
+        "previous_improving",
+        "current_industry_leader",
+        "current_industry_laggard",
+    )
+
+
+def test_selector_collects_current_reasons_before_priority_cutoff() -> None:
+    selected = CandidateSelector().select(
+        universe=(definition("industry:configured-a"), definition("industry:configured-b")),
+        observations=(
+            observation("industry:configured-a", daily_return=2.0),
+            observation("industry:configured-b", daily_return=1.0),
+        ),
+        previous_snapshot=None,
+        limit=1,
+    )
+
+    assert selected[0].reasons == (
+        "configured_seed",
+        "current_industry_leader",
+        "current_industry_laggard",
+    )
+    assert len(selected[0].reasons) == len(set(selected[0].reasons))
 
 
 def test_selector_sorts_missing_daily_returns_after_finite_values_with_sector_id_ties() -> None:
