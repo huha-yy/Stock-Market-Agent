@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import sys
 from threading import Barrier, Event, Lock
 from types import SimpleNamespace
@@ -328,7 +328,8 @@ def test_quote_circuit_classifies_adapter_invalid_results_before_success(
     adapter = ProviderCapabilityAdapter(
         DataFetcherManager(
             fetchers=[StructurallyInvalidFetcher(), WorkingFetcher()]
-        )
+        ),
+        clock=lambda: AS_OF,
     )
     circuit = RunScopedCapabilityCircuit(failure_threshold=3)
 
@@ -983,6 +984,51 @@ def test_flow_membership_and_quotes_normalize_without_native_aliases_leaking() -
     assert tuple(item.code for item in quotes.data.quotes) == ("000001",)
     assert quotes.data_date == date(2026, 7, 22)
     assert quotes.trace[0]["code"] == "000001"
+
+
+def test_live_quote_uses_acquisition_time_as_its_point_in_time_boundary() -> None:
+    acquired_at = AS_OF + timedelta(seconds=60)
+
+    class QuoteManager:
+        def get_realtime_quote(self, code: str, *, log_final_failure: bool = True):
+            return {
+                "code": code,
+                "price": 10.5,
+                "pre_close": 10.0,
+                "amount": 5000.0,
+                "provider_timestamp": (AS_OF + timedelta(seconds=30)).isoformat(),
+                "source": "fixture_quote",
+            }
+
+    result = ProviderCapabilityAdapter(
+        QuoteManager(), clock=lambda: acquired_at
+    ).fetch_constituent_quotes(("000001",), AS_OF)
+
+    assert result.status == "ok"
+    assert result.observed_at == acquired_at
+    assert result.data is not None
+    assert result.data.quotes[0].quoted_at == AS_OF + timedelta(seconds=30)
+
+
+def test_live_quote_rejects_clock_rollback_before_run_start() -> None:
+    class QuoteManager:
+        def get_realtime_quote(self, code: str, *, log_final_failure: bool = True):
+            return {
+                "code": code,
+                "price": 10.5,
+                "pre_close": 10.0,
+                "amount": 5000.0,
+                "provider_timestamp": (AS_OF - timedelta(seconds=30)).isoformat(),
+                "source": "fixture_quote",
+            }
+
+    result = ProviderCapabilityAdapter(
+        QuoteManager(), clock=lambda: AS_OF - timedelta(seconds=60)
+    ).fetch_constituent_quotes(("000001",), AS_OF)
+
+    assert result.status == "unavailable"
+    assert result.data is None
+    assert any(item.get("result") == "invalid" for item in result.trace)
 
 
 def test_akshare_unversioned_membership_remains_usable_as_partial(

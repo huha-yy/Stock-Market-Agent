@@ -47,7 +47,7 @@ Concept sectors follow the same selection and normalized evidence contract as in
 
 ## Current Snapshot And Replay
 
-All instants are timezone-aware and market dates use `Asia/Shanghai`. A live run captures the current time once and uses that value as its final observation anchor. Omitting `as_of` uses this captured time. When a caller supplies `as_of`, it must represent the exact same UTC instant; any caller-selected earlier or later instant is rejected, including another instant on the same Asia/Shanghai date. The live service also rejects `trigger="replay"`.
+All instants are timezone-aware and market dates use `Asia/Shanghai`. A live run first captures a start anchor for request validation, universe selection, discovery, and previous-snapshot lookup. Omitting `as_of` uses this captured start; when a caller supplies `as_of`, it must represent the exact same UTC instant as that start anchor. Caller-selected historical or future instants are rejected, including another instant on the same Asia/Shanghai date. Realtime quote acquisition may advance the final observation anchor to the latest accepted evidence acquisition time. The persisted snapshot and enriched observations use that final anchor, which is never earlier than any accepted evidence timestamp. The live service also rejects `trigger="replay"`.
 
 Replay is a separate persisted snapshot replay path. It reads the stored sector observations, reuses the deterministic scoring path, and makes zero live provider calls. Referenced constituent evidence remains resolvable for audit. There is no historical provider backfill, and current membership is never used to reconstruct an old observation.
 

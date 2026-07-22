@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import inspect
 import math
 import re
@@ -358,8 +358,23 @@ def _source_from_trace(trace: Any, fallback: str) -> str:
 
 
 class ProviderCapabilityAdapter:
-    def __init__(self, manager: Any) -> None:
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.manager = manager
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _acquisition_time(self, as_of: datetime) -> datetime:
+        acquired_at = self.clock()
+        self._require_as_of(acquired_at)
+        requested_at = as_of.astimezone(timezone.utc)
+        acquired_at = acquired_at.astimezone(timezone.utc)
+        if acquired_at < requested_at:
+            raise ValueError("quote acquisition time precedes requested as_of")
+        return acquired_at
 
     @staticmethod
     def _require_as_of(as_of: datetime) -> None:
@@ -768,6 +783,7 @@ class ProviderCapabilityAdapter:
         parsed: list[tuple[ConstituentQuote, str, bool, int]] = []
         trace: list[dict[str, Any]] = []
         deadline_exceeded = False
+        observed_at = as_of.astimezone(timezone.utc)
         for requested_code in normalized_codes:
             if (
                 deadline_monotonic is not None
@@ -798,7 +814,9 @@ class ProviderCapabilityAdapter:
                     "attempt_trace": trace,
                     "result_validator": lambda raw: bool(
                         self._parse_constituent_quote(
-                            raw, requested_code, as_of
+                            raw,
+                            requested_code,
+                            self._acquisition_time(as_of),
                         )
                     ),
                 }
@@ -829,11 +847,13 @@ class ProviderCapabilityAdapter:
                     if manager_deadline:
                         break
                     raise ValueError("empty quote")
+                acquired_at = self._acquisition_time(as_of)
                 parsed_quote = self._parse_constituent_quote(
-                    raw_quote, requested_code, as_of
+                    raw_quote, requested_code, acquired_at
                 )
                 quote, source, _, _ = parsed_quote
                 parsed.append(parsed_quote)
+                observed_at = max(observed_at, acquired_at)
                 trace.append(
                     {"provider": source, "result": "ok", "code": quote.code}
                 )
@@ -880,9 +900,9 @@ class ProviderCapabilityAdapter:
             status=status,
             data=batch,
             source=_bounded_text(source)[:80] or "realtime_quote",
-            observed_at=as_of,
+            observed_at=observed_at,
             data_date=terminal,
-            bar_status=self._bar_status(terminal, as_of),
+            bar_status=self._bar_status(terminal, observed_at),
             freshness_seconds=max(item[3] for item in same_date),
             trace=_safe_trace(trace),
             error="deadline_exceeded" if deadline_exceeded else None,

@@ -84,13 +84,14 @@ def _result(
     data_date: date | None = date(2026, 7, 22),
     trace: tuple[dict[str, object], ...] = (),
     error: str | None = None,
+    observed_at: datetime = AS_OF,
 ) -> CapabilityResult:
     return CapabilityResult(
         capability=capability,
         status=status,
         data=data,
         source=source,
-        observed_at=AS_OF,
+        observed_at=observed_at,
         data_date=data_date,
         bar_status=None if data_date is None else "finalized",
         freshness_seconds=0,
@@ -220,6 +221,41 @@ def test_enricher_fetches_benchmark_once_and_deduplicates_quote_codes() -> None:
         assert quotes["status"] == "partial"
         assert quotes["source"] == "authoritative-quotes"
         assert quotes["trace"] == ({"provider": "quotes-a", "result": "ok"},)
+
+
+def test_enricher_advances_observation_anchor_to_quote_acquisition_time() -> None:
+    candidate = _candidate(1)
+    acquired_at = AS_OF + timedelta(seconds=60)
+    quoted_at = AS_OF + timedelta(seconds=30)
+
+    class AdvancingQuoteProvider(_Provider):
+        def fetch_constituent_quotes(self, codes, as_of):
+            return _result(
+                "constituent_quotes",
+                ConstituentQuoteBatch(
+                    quotes=(
+                        ConstituentQuote(
+                            code=codes[0],
+                            current_price=11.0,
+                            previous_close=10.0,
+                            traded_amount=100.0,
+                            quoted_at=quoted_at,
+                        ),
+                    )
+                ),
+                observed_at=acquired_at,
+            )
+
+    batch = _enricher(
+        AdvancingQuoteProvider({candidate.sector.sector_id: ("000001",)})
+    ).enrich((candidate,), AS_OF)
+
+    assert batch.as_of == acquired_at
+    assert batch.observations[0].observed_at == acquired_at
+    assert batch.observations[0].up_count == 1
+    assert batch.observations[0].benchmark_return_20d_pct is not None
+    assert batch.observations[0].capital_flow_5d is not None
+    assert batch.observations[0].price_flow_divergence is False
 
 
 def test_enricher_honors_limit_without_deduplicating_selected_candidates() -> None:

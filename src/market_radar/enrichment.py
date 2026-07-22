@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import inspect
 from threading import Lock
 import time
@@ -39,6 +39,7 @@ class EnrichmentBatch:
     observations: tuple[SectorObservation, ...]
     constituent_evidence: tuple[ConstituentEvidence, ...]
     trace: tuple[Mapping[str, Any], ...]
+    as_of: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -168,7 +169,7 @@ class MarketRadarEnricher:
         self._require_aware(as_of)
         selected = tuple(candidates[: self.config.candidate_limit])
         if not selected:
-            return EnrichmentBatch((), (), ())
+            return EnrichmentBatch((), (), (), as_of)
 
         deadline = self.monotonic() + self.config.total_budget_seconds
         circuit = RunScopedCapabilityCircuit()
@@ -223,6 +224,23 @@ class MarketRadarEnricher:
         quote_result = self._fetch_quote_union(
             union_codes, as_of, deadline, circuit
         )
+        observation_anchor = max(
+            (
+                as_of,
+                quote_result.observed_at,
+                *(result.observed_at for result in benchmarks.values()),
+                *(
+                    result.observed_at
+                    for capabilities in candidate_capabilities.values()
+                    for result in (
+                        capabilities.board_history,
+                        capabilities.board_flow,
+                        capabilities.membership,
+                    )
+                ),
+            ),
+            key=lambda value: value.astimezone(timezone.utc),
+        ).astimezone(timezone.utc)
 
         observations: list[SectorObservation] = []
         evidence: list[ConstituentEvidence] = []
@@ -251,11 +269,11 @@ class MarketRadarEnricher:
                 or self.config.default_benchmark_code
             )
             sector_quotes = self._slice_quotes(
-                capabilities.membership, quote_result, as_of
+                capabilities.membership, quote_result, observation_anchor
             )
             result = self.builder.build(
                 base=candidate.observation
-                or self._missing_base(candidate, as_of),
+                or self._missing_base(candidate, observation_anchor),
                 candidate_reasons=candidate.reasons,
                 benchmark_code=benchmark_code,
                 board_history=capabilities.board_history,
@@ -263,7 +281,7 @@ class MarketRadarEnricher:
                 board_flow=capabilities.board_flow,
                 membership=capabilities.membership,
                 quotes=sector_quotes,
-                observed_at=as_of,
+                observed_at=observation_anchor,
             )
             observations.append(result.observation)
             if result.constituent_evidence is not None:
@@ -283,6 +301,7 @@ class MarketRadarEnricher:
             observations=tuple(observations),
             constituent_evidence=tuple(evidence),
             trace=tuple(trace[:_TRACE_LIMIT]),
+            as_of=observation_anchor,
         )
 
     def _scheduler(self, deadline: float) -> _BoundedScheduler:

@@ -393,8 +393,7 @@ class CnSectorObservationBuilder:
             board is not None
             and benchmark is not None
             and terminal_date == benchmark_history.data_date
-            and board_history.observed_at == observed_at
-            and benchmark_history.observed_at == observed_at
+            and board_history.observed_at == benchmark_history.observed_at
             and "return_20d_pct" in values
         ):
             aligned = _aligned_terminal_bars(board, benchmark)
@@ -476,8 +475,7 @@ class CnSectorObservationBuilder:
         compatible_divergence = (
             "return_5d_pct" in values
             and "capital_flow_5d" in values
-            and board_history.observed_at == observed_at
-            and board_flow.observed_at == observed_at
+            and board_history.observed_at == board_flow.observed_at
             and board_history.data_date == terminal_date
             and board_flow.data_date == terminal_date
         )

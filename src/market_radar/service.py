@@ -278,6 +278,38 @@ def _validate_enrichment_output(
         evidence_keys.add(evidence.set_key)
 
 
+def _resolve_enrichment_as_of(
+    effective_as_of: datetime,
+    enrichment: EnrichmentBatch,
+) -> datetime:
+    if any(
+        item.observed_at.tzinfo is None or item.observed_at.utcoffset() is None
+        for item in enrichment.constituent_evidence
+    ):
+        raise ValueError(
+            "constituent evidence observed_at must be timezone-aware"
+        )
+    evidence_times = tuple(
+        item.observed_at.astimezone(timezone.utc)
+        for item in (
+            *enrichment.observations,
+            *enrichment.constituent_evidence,
+        )
+    )
+    if enrichment.as_of is None:
+        return max((effective_as_of, *evidence_times))
+    if enrichment.as_of.tzinfo is None or enrichment.as_of.utcoffset() is None:
+        raise ValueError("enrichment.as_of must be timezone-aware")
+    final_as_of = enrichment.as_of.astimezone(timezone.utc)
+    if final_as_of < effective_as_of:
+        raise ValueError("enrichment.as_of must not precede the run start")
+    if any(
+        observed_at > final_as_of for observed_at in evidence_times
+    ):
+        raise ValueError("enrichment evidence is after enrichment.as_of")
+    return final_as_of
+
+
 class MarketRadarService:
     def __init__(
         self,
@@ -353,6 +385,7 @@ class MarketRadarService:
         batch = self.provider.fetch(market, effective_as_of, universe)
         _validate_unique_observations(batch.observations, "discovery")
         enrichment = None
+        snapshot_as_of = effective_as_of
         observations = list(batch.observations)
         enrichment_enabled = not discovery_only and self.enricher is not None
         if enrichment_enabled:
@@ -377,6 +410,9 @@ class MarketRadarService:
             )
             enrichment = self.enricher.enrich(candidates, effective_as_of)
             _validate_enrichment_output(candidates, enrichment)
+            snapshot_as_of = _resolve_enrichment_as_of(
+                effective_as_of, enrichment
+            )
             observations = _merge_observations(
                 batch.observations,
                 enrichment.observations,
@@ -391,12 +427,12 @@ class MarketRadarService:
         snapshot = RadarRunSnapshot(
             run_key=(
                 f"{market}:"
-                f"{effective_as_of.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}:"
+                f"{snapshot_as_of:%Y%m%dT%H%M%SZ}:"
                 f"{trigger}"
             ),
             market="cn",
             trigger=trigger,
-            as_of=effective_as_of,
+            as_of=snapshot_as_of,
             quality=aggregate_run_quality(
                 item.quality for item in observations
             ),

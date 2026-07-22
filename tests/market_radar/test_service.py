@@ -264,13 +264,14 @@ def _evidence(
     *,
     source: str = "membership-fixture",
     codes: tuple[str, ...] = ("000001", "600519"),
+    observed_at: datetime = NOW,
 ) -> ConstituentEvidence:
     return ConstituentEvidence(
         market="cn",
         sector_id=sector_id,
         source=source,
         data_date=NOW.date(),
-        observed_at=NOW,
+        observed_at=observed_at,
         codes=codes,
         set_key=canonical_constituent_set_key("cn", sector_id, source, codes),
     )
@@ -425,6 +426,93 @@ def test_enriched_run_selects_merges_ranks_once_and_persists_atomically(
         "board_history",
         "quotes",
     ]
+
+
+def test_enriched_run_persists_final_observation_anchor() -> None:
+    acquired_at = NOW + timedelta(seconds=60)
+    candidate = EnrichmentCandidate(
+        _definition(), _observation(), ("configured_seed",)
+    )
+    evidence = _evidence(
+        candidate.sector.sector_id,
+        observed_at=acquired_at,
+    )
+    enriched = _observation().model_copy(
+        update={
+            "observed_at": acquired_at,
+            "raw_reference": {"constituent_set_key": evidence.set_key},
+        }
+    )
+    repository = FakeRepository()
+
+    snapshot = _service(
+        repository=repository,
+        candidate_selector=RecordingSelector((candidate,)),
+        enricher=RecordingEnricher(
+            EnrichmentBatch(
+                observations=(enriched,),
+                constituent_evidence=(evidence,),
+                trace=(),
+                as_of=acquired_at,
+            )
+        ),
+    ).run(as_of=NOW)
+
+    assert snapshot.as_of == acquired_at
+    assert snapshot.run_key == "cn:20260721T060100Z:manual"
+    assert repository.enriched_writes == [
+        (repository.universe, (evidence,), snapshot)
+    ]
+
+
+def test_enriched_run_derives_missing_batch_anchor_from_observations() -> None:
+    acquired_at = NOW + timedelta(seconds=60)
+    candidate = EnrichmentCandidate(
+        _definition(), _observation(), ("configured_seed",)
+    )
+    enriched = _observation().model_copy(update={"observed_at": acquired_at})
+
+    snapshot = _service(
+        candidate_selector=RecordingSelector((candidate,)),
+        enricher=RecordingEnricher(
+            EnrichmentBatch(
+                observations=(enriched,),
+                constituent_evidence=(),
+                trace=(),
+            )
+        ),
+    ).run(as_of=NOW)
+
+    assert snapshot.as_of == acquired_at
+    assert snapshot.run_key == "cn:20260721T060100Z:manual"
+
+
+def test_enriched_run_rejects_naive_constituent_evidence_time() -> None:
+    candidate = EnrichmentCandidate(
+        _definition(), _observation(), ("configured_seed",)
+    )
+    evidence = _evidence(
+        candidate.sector.sector_id,
+        observed_at=NOW.replace(tzinfo=None),
+    )
+    enriched = _observation().model_copy(
+        update={"raw_reference": {"constituent_set_key": evidence.set_key}}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="constituent evidence observed_at must be timezone-aware",
+    ):
+        _service(
+            candidate_selector=RecordingSelector((candidate,)),
+            enricher=RecordingEnricher(
+                EnrichmentBatch(
+                    observations=(enriched,),
+                    constituent_evidence=(evidence,),
+                    trace=(),
+                )
+            ),
+        ).run(as_of=NOW, persist=False)
 
 
 def test_explicit_previous_wins_and_nonpersistent_run_never_reads_repository() -> None:
