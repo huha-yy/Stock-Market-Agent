@@ -265,6 +265,97 @@ def test_quote_circuit_opens_failed_source_and_keeps_fallback(
     )
 
 
+def test_quote_circuit_classifies_adapter_invalid_results_before_success(
+    monkeypatch,
+) -> None:
+    calls = {"efinance": 0, "akshare_em": 0}
+
+    def quote(
+        code: str,
+        source: RealtimeSource,
+        *,
+        provider_timestamp: str = "2026-07-22T14:30:00+08:00",
+        amount: float = 100.0,
+    ) -> UnifiedRealtimeQuote:
+        return UnifiedRealtimeQuote(
+            code=code,
+            source=source,
+            price=10.0,
+            pre_close=9.0,
+            amount=amount,
+            provider_timestamp=provider_timestamp,
+            volume_ratio=1.0,
+            turnover_rate=1.0,
+            pe_ratio=10.0,
+            pb_ratio=1.0,
+            total_mv=100.0,
+            circ_mv=80.0,
+            amplitude=1.0,
+        )
+
+    class StructurallyInvalidFetcher:
+        name = "EfinanceFetcher"
+        priority = 0
+
+        def get_realtime_quote(self, code: str):
+            calls["efinance"] += 1
+            if calls["efinance"] == 1:
+                return quote("600519", RealtimeSource.EFINANCE)
+            if calls["efinance"] == 2:
+                return quote(
+                    code,
+                    RealtimeSource.EFINANCE,
+                    provider_timestamp="2026-07-22T17:00:00+08:00",
+                )
+            return quote(code, RealtimeSource.EFINANCE, amount=-1.0)
+
+    class WorkingFetcher:
+        name = "AkshareFetcher"
+        priority = 1
+
+        def get_realtime_quote(self, code: str, source: str = "em"):
+            calls["akshare_em"] += 1
+            return quote(code, RealtimeSource.AKSHARE_EM)
+
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="efinance,akshare_em",
+            realtime_cache_ttl=600,
+        ),
+    )
+    adapter = ProviderCapabilityAdapter(
+        DataFetcherManager(
+            fetchers=[StructurallyInvalidFetcher(), WorkingFetcher()]
+        )
+    )
+    circuit = RunScopedCapabilityCircuit(failure_threshold=3)
+
+    results = [
+        adapter.fetch_constituent_quotes(
+            ("000001",), AS_OF, attempt_policy=circuit
+        )
+        for _ in range(4)
+    ]
+
+    assert calls == {"efinance": 3, "akshare_em": 4}
+    assert all(result.status in {"ok", "stale"} for result in results)
+    assert all(
+        not any(
+            item.get("provider") == "efinance"
+            and item.get("result") == "ok"
+            for item in result.trace
+        )
+        for result in results
+    )
+    assert any(
+        item.get("provider") == "efinance"
+        and item.get("result") == "circuit_open"
+        for item in results[-1].trace
+    )
+
+
 def test_quote_batch_stops_requesting_codes_after_deadline() -> None:
     calls: list[str] = []
 
@@ -305,6 +396,164 @@ def test_quote_batch_stops_requesting_codes_after_deadline() -> None:
     assert any(
         item.get("result") == "deadline_exceeded" for item in result.trace
     )
+
+
+def test_manager_internal_deadline_is_not_rewritten_as_invalid(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class NoCallFetcher:
+        name = "EfinanceFetcher"
+        priority = 0
+
+        def get_realtime_quote(self, code: str):
+            calls.append(code)
+            raise AssertionError("provider must not be called after deadline")
+
+    class SequenceClock:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __call__(self):
+            return next(self.values, 10.0)
+
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="efinance",
+            realtime_cache_ttl=600,
+        ),
+    )
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[NoCallFetcher()])
+    ).fetch_constituent_quotes(
+        ("000001",),
+        AS_OF,
+        deadline_monotonic=10.0,
+        monotonic=SequenceClock((0.0, 10.0)),
+    )
+
+    assert calls == []
+    assert result.status == "unavailable"
+    assert result.error == "deadline_exceeded"
+    assert result.trace[0]["result"] == "deadline_exceeded"
+    assert not any(item.get("result") == "invalid" for item in result.trace)
+
+
+def test_partial_quotes_preserve_manager_internal_deadline(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class WorkingFetcher:
+        name = "EfinanceFetcher"
+        priority = 0
+
+        def get_realtime_quote(self, code: str):
+            calls.append(code)
+            return UnifiedRealtimeQuote(
+                code=code,
+                source=RealtimeSource.EFINANCE,
+                price=10.0,
+                pre_close=9.0,
+                amount=100.0,
+                provider_timestamp="2026-07-22T14:30:00+08:00",
+                volume_ratio=1.0,
+                turnover_rate=1.0,
+                pe_ratio=10.0,
+                pb_ratio=1.0,
+                total_mv=100.0,
+                circ_mv=80.0,
+                amplitude=1.0,
+            )
+
+    class SequenceClock:
+        def __init__(self):
+            self.values = iter((0.0, 0.0, 0.0, 10.0))
+
+        def __call__(self):
+            return next(self.values, 10.0)
+
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="efinance",
+            realtime_cache_ttl=600,
+        ),
+    )
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[WorkingFetcher()])
+    ).fetch_constituent_quotes(
+        ("000001", "600000"),
+        AS_OF,
+        deadline_monotonic=10.0,
+        monotonic=SequenceClock(),
+    )
+
+    assert calls == ["000001"]
+    assert result.status == "partial"
+    assert result.error == "deadline_exceeded"
+    assert result.data is not None
+    assert tuple(item.code for item in result.data.quotes) == ("000001",)
+    assert result.trace[0]["result"] == "deadline_exceeded"
+
+
+def test_capability_deadline_is_rechecked_after_waiting_for_source_lock() -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    class Fetcher:
+        name = "A"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str):
+            calls.append((kind, name))
+            return pd.DataFrame(
+                {
+                    "data_date": ["2026-07-22"],
+                    "close": [1.0],
+                    "traded_amount": [2.0],
+                }
+            )
+
+    fetcher = Fetcher()
+    manager = DataFetcherManager(fetchers=[fetcher])
+    source_lock = manager._get_fetcher_call_lock(fetcher)
+    lock_requested = Event()
+    original_get_lock = manager._get_fetcher_call_lock
+
+    def instrumented_get_lock(item):
+        lock_requested.set()
+        return original_get_lock(item)
+
+    manager._get_fetcher_call_lock = instrumented_get_lock
+    source_lock.acquire()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                ProviderCapabilityAdapter(manager).fetch_board_history,
+                SECTOR,
+                AS_OF,
+                deadline_monotonic=10.0,
+                monotonic=lambda: clock.now,
+            )
+            assert lock_requested.wait(timeout=1.0)
+            clock.now = 10.0
+            source_lock.release()
+            result = future.result(timeout=1.0)
+    finally:
+        try:
+            source_lock.release()
+        except RuntimeError:
+            pass
+
+    assert calls == []
+    assert result.status == "unavailable"
+    assert result.error == "deadline_exceeded"
+    assert result.trace[0]["result"] == "deadline_exceeded"
 
 
 def test_manager_bounds_and_redacts_persisted_failure_text() -> None:

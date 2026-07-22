@@ -61,22 +61,46 @@ _FLOW_FACTORS = {
 
 class MarketRadarEnrichmentProvider(Protocol):
     def fetch_board_history(
-        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
+        self,
+        sector: SectorDefinition,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardBarSeries]:
         raise NotImplementedError
 
     def fetch_benchmark_history(
-        self, code: str, as_of: datetime, *, attempt_policy: Any = None
+        self,
+        code: str,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardBarSeries]:
         raise NotImplementedError
 
     def fetch_board_flow(
-        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
+        self,
+        sector: SectorDefinition,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardFlowSeries]:
         raise NotImplementedError
 
     def fetch_constituents(
-        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
+        self,
+        sector: SectorDefinition,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[ConstituentMembership]:
         raise NotImplementedError
 
@@ -383,6 +407,8 @@ class ProviderCapabilityAdapter:
         name: str,
         as_of: datetime,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[Any | None, Any, str]:
         method = self.manager.get_market_radar_capability_with_meta
         kwargs: dict[str, Any] = {"kind": kind, "name": name}
@@ -396,6 +422,10 @@ class ProviderCapabilityAdapter:
             kwargs["as_of"] = as_of
         if "attempt_policy" in parameter_names or accepts_kwargs:
             kwargs["attempt_policy"] = attempt_policy
+        if "deadline_monotonic" in parameter_names or accepts_kwargs:
+            kwargs["deadline_monotonic"] = deadline_monotonic
+        if "monotonic" in parameter_names or accepts_kwargs:
+            kwargs["monotonic"] = monotonic
         return method(capability, **kwargs)
 
     def _bar_result(
@@ -439,6 +469,8 @@ class ProviderCapabilityAdapter:
         as_of: datetime,
         *,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardBarSeries]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -450,6 +482,8 @@ class ProviderCapabilityAdapter:
                 name=sector.name,
                 as_of=as_of,
                 attempt_policy=attempt_policy,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
             )
             if payload is None:
                 return self._unavailable(
@@ -478,6 +512,8 @@ class ProviderCapabilityAdapter:
         as_of: datetime,
         *,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardBarSeries]:
         self._require_as_of(as_of)
         try:
@@ -493,6 +529,8 @@ class ProviderCapabilityAdapter:
                 name=benchmark_code,
                 as_of=as_of,
                 attempt_policy=attempt_policy,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
             )
             if payload is None:
                 return self._unavailable(
@@ -515,6 +553,8 @@ class ProviderCapabilityAdapter:
         as_of: datetime,
         *,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardFlowSeries]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -526,6 +566,8 @@ class ProviderCapabilityAdapter:
                 name=sector.name,
                 as_of=as_of,
                 attempt_policy=attempt_policy,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
             )
             if payload is None:
                 return self._unavailable(
@@ -574,6 +616,8 @@ class ProviderCapabilityAdapter:
         as_of: datetime,
         *,
         attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[ConstituentMembership]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -585,6 +629,8 @@ class ProviderCapabilityAdapter:
                 name=sector.name,
                 as_of=as_of,
                 attempt_policy=attempt_policy,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
             )
             if payload is None:
                 return self._unavailable(
@@ -651,6 +697,53 @@ class ProviderCapabilityAdapter:
         except TypeError:
             return {}
 
+    @classmethod
+    def _parse_constituent_quote(
+        cls,
+        raw_quote: Any,
+        requested_code: str,
+        as_of: datetime,
+    ) -> tuple[ConstituentQuote, str, bool, int]:
+        row = cls._quote_mapping(raw_quote)
+        quoted_at = _aware_datetime(_value(row, _QUOTE_TIME_ALIASES))
+        if quoted_at > as_of:
+            raise ValueError("quote time is later than requested as_of")
+        code = _canonical_cn_code(_value(row, _CODE_ALIASES))
+        if code != requested_code:
+            raise ValueError("provider quote code does not match requested code")
+        current = _finite_number(
+            _value(row, _CURRENT_PRICE_ALIASES), "current price"
+        )
+        if current <= 0:
+            raise ValueError("current price must be positive")
+        previous = _finite_number(
+            _value(row, _PREVIOUS_CLOSE_ALIASES), "previous close"
+        )
+        if previous <= 0:
+            raise ValueError("previous close must be positive")
+        amount = _scaled_value(row, _AMOUNT_FACTORS, "traded amount")
+        if amount < 0:
+            raise ValueError("traded amount must be nonnegative")
+        quote = ConstituentQuote(
+            code=code,
+            current_price=current,
+            previous_close=previous,
+            traded_amount=amount,
+            quoted_at=quoted_at,
+        )
+        source_value = row.get("source", "realtime_quote")
+        source = getattr(source_value, "value", source_value)
+        stale = bool(row.get("is_stale", False))
+        stale_seconds = int(row.get("stale_seconds") or 0)
+        return quote, str(source), stale, max(0, stale_seconds)
+
+    @staticmethod
+    def _prioritize_deadline_trace(trace: list[dict[str, Any]]) -> None:
+        for index, item in enumerate(trace):
+            if item.get("result") == "deadline_exceeded":
+                trace.insert(0, trace.pop(index))
+                return
+
     def fetch_constituent_quotes(
         self,
         codes: tuple[str, ...],
@@ -680,12 +773,13 @@ class ProviderCapabilityAdapter:
                 deadline_monotonic is not None
                 and monotonic() >= deadline_monotonic
             ):
-                trace.append(
+                trace.insert(
+                    0,
                     {
                         "provider": "constituent_quotes",
                         "result": "deadline_exceeded",
                         "code": requested_code,
-                    }
+                    },
                 )
                 deadline_exceeded = True
                 break
@@ -702,6 +796,11 @@ class ProviderCapabilityAdapter:
                     "deadline_monotonic": deadline_monotonic,
                     "monotonic": monotonic,
                     "attempt_trace": trace,
+                    "result_validator": lambda raw: bool(
+                        self._parse_constituent_quote(
+                            raw, requested_code, as_of
+                        )
+                    ),
                 }
                 kwargs = {
                     "log_final_failure": False,
@@ -711,41 +810,35 @@ class ProviderCapabilityAdapter:
                         if accepts_kwargs or name in parameter_names
                     },
                 }
+                deadline_count = sum(
+                    item.get("result") == "deadline_exceeded"
+                    for item in trace
+                )
                 raw_quote = method(
                     requested_code,
                     **kwargs,
                 )
+                manager_deadline = sum(
+                    item.get("result") == "deadline_exceeded"
+                    for item in trace
+                ) > deadline_count
+                if manager_deadline:
+                    deadline_exceeded = True
+                    self._prioritize_deadline_trace(trace)
                 if raw_quote is None:
+                    if manager_deadline:
+                        break
                     raise ValueError("empty quote")
-                row = self._quote_mapping(raw_quote)
-                quoted_at = _aware_datetime(_value(row, _QUOTE_TIME_ALIASES))
-                if quoted_at > as_of:
-                    raise ValueError("quote time is later than requested as_of")
-                code = _canonical_cn_code(_value(row, _CODE_ALIASES))
-                if code != requested_code:
-                    raise ValueError("provider quote code does not match requested code")
-                current = _finite_number(
-                    _value(row, _CURRENT_PRICE_ALIASES), "current price"
+                parsed_quote = self._parse_constituent_quote(
+                    raw_quote, requested_code, as_of
                 )
-                previous = _finite_number(
-                    _value(row, _PREVIOUS_CLOSE_ALIASES), "previous close"
-                )
-                amount = _scaled_value(row, _AMOUNT_FACTORS, "traded amount")
-                quote = ConstituentQuote(
-                    code=code,
-                    current_price=current,
-                    previous_close=previous,
-                    traded_amount=amount,
-                    quoted_at=quoted_at,
-                )
-                source_value = row.get("source", "realtime_quote")
-                source = getattr(source_value, "value", source_value)
-                stale = bool(row.get("is_stale", False))
-                stale_seconds = int(row.get("stale_seconds") or 0)
-                parsed.append((quote, str(source), stale, max(0, stale_seconds)))
+                quote, source, _, _ = parsed_quote
+                parsed.append(parsed_quote)
                 trace.append(
-                    {"provider": str(source), "result": "ok", "code": code}
+                    {"provider": source, "result": "ok", "code": quote.code}
                 )
+                if manager_deadline:
+                    break
             except Exception as exc:
                 trace.append(
                     {
@@ -778,7 +871,9 @@ class ProviderCapabilityAdapter:
         sources = tuple(dict.fromkeys(item[1] for item in same_date))
         source = sources[0] if len(sources) == 1 else "mixed_realtime_quotes"
         status = "ok" if len(same_date) == len(normalized_codes) else "partial"
-        if any(item[2] for item in same_date):
+        if deadline_exceeded:
+            status = "partial"
+        elif any(item[2] for item in same_date):
             status = "stale"
         return CapabilityResult[ConstituentQuoteBatch](
             capability="constituent_quotes",

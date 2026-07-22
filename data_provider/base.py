@@ -1804,6 +1804,7 @@ class DataFetcherManager:
         deadline_monotonic: Optional[float] = None,
         monotonic: Callable[[], float] = time.monotonic,
         attempt_trace: Optional[List[Dict[str, Any]]] = None,
+        result_validator: Optional[Callable[[Any], bool]] = None,
     ):
         """
         获取实时行情数据（自动故障切换）
@@ -1925,6 +1926,7 @@ class DataFetcherManager:
             ):
                 self._append_market_radar_attempt_trace(
                     attempt_trace,
+                    priority=True,
                     provider=source,
                     result="deadline_exceeded",
                     code=stock_code,
@@ -2012,6 +2014,40 @@ class DataFetcherManager:
                 provider_name = fetcher.name if fetcher is not None else source
                 
                 if quote is not None and quote.has_basic_data():
+                    validation_error = ""
+                    if result_validator is not None:
+                        try:
+                            if not result_validator(quote):
+                                validation_error = "quote result validation failed"
+                        except Exception as exc:
+                            _, reason = summarize_exception(exc)
+                            validation_error = self._safe_market_radar_text(reason)
+                    if validation_error:
+                        if attempt_policy is not None:
+                            attempt_policy.record_attempt(
+                                "constituent_quotes", source, "invalid"
+                            )
+                        self._append_market_radar_attempt_trace(
+                            attempt_trace,
+                            provider=source,
+                            result="invalid",
+                            code=stock_code,
+                            error=validation_error,
+                        )
+                        record_provider_run(
+                            data_type="realtime_quote",
+                            provider=provider_name,
+                            operation="get_realtime_quote",
+                            success=False,
+                            latency_ms=int((time.time() - attempt_start) * 1000),
+                            error_type="invalid",
+                            error_message=validation_error,
+                            fallback_to=fallback_to,
+                            record_count=0,
+                        )
+                        if primary_quote is None:
+                            failed_sources.append(source)
+                        continue
                     if attempt_policy is not None:
                         attempt_policy.record_attempt(
                             "constituent_quotes", source, "ok"
@@ -3793,15 +3829,22 @@ class DataFetcherManager:
     def _append_market_radar_attempt_trace(
         cls,
         trace: Optional[List[Dict[str, Any]]],
+        *,
+        priority: bool = False,
         **values: Any,
     ) -> None:
-        if trace is None or len(trace) >= cls._MARKET_RADAR_TRACE_LIMIT:
+        if trace is None:
             return
         entry: Dict[str, Any] = {}
         for key in ("provider", "result", "code", "error"):
             if key in values and values[key] is not None:
                 entry[key] = cls._safe_market_radar_text(values[key])
-        trace.append(entry)
+        if priority:
+            if len(trace) >= cls._MARKET_RADAR_TRACE_LIMIT:
+                trace.pop()
+            trace.insert(0, entry)
+        elif len(trace) < cls._MARKET_RADAR_TRACE_LIMIT:
+            trace.append(entry)
 
     @staticmethod
     def _implements_market_radar_capability(
@@ -3847,6 +3890,8 @@ class DataFetcherManager:
         as_of: Optional[datetime],
         target_date: Optional[date],
         attempt_policy: Any,
+        deadline_monotonic: Optional[float],
+        monotonic: Callable[[], float],
     ) -> Tuple[Any | None, Dict[str, Any], str, Optional[date]]:
         from src.market_radar.capability_provider import (
             provider_capability_data_date,
@@ -3858,6 +3903,15 @@ class DataFetcherManager:
         )[:80]
         started = time.monotonic()
         with self._get_fetcher_call_lock(fetcher):
+            if (
+                deadline_monotonic is not None
+                and monotonic() >= deadline_monotonic
+            ):
+                return None, {
+                    "provider": provider,
+                    "result": "deadline_exceeded",
+                    "duration_ms": 0,
+                }, "deadline_exceeded", None
             if (
                 attempt_policy is not None
                 and not attempt_policy.should_attempt(capability, provider)
@@ -3937,6 +3991,8 @@ class DataFetcherManager:
         name: str,
         as_of: Optional[datetime] = None,
         attempt_policy: Any = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Tuple[Any | None, List[Dict[str, Any]], str]:
         """Fetch one enrichment capability with an ordered, bounded trace."""
         method_name = self._MARKET_RADAR_CAPABILITY_METHODS.get(capability)
@@ -3975,6 +4031,8 @@ class DataFetcherManager:
                     as_of=as_of,
                     target_date=target_date,
                     attempt_policy=attempt_policy,
+                    deadline_monotonic=deadline_monotonic,
+                    monotonic=monotonic,
                 )
             )
             source_chain.append(entry)
@@ -3983,6 +4041,8 @@ class DataFetcherManager:
                 last_error = attempt_error
             if result == "ok":
                 return payload, source_chain, ""
+            if result == "deadline_exceeded":
+                break
             if result == "partial" and partial_candidate is None:
                 partial_candidate = (payload, len(source_chain) - 1)
             elif result == "stale" and terminal is not None:
