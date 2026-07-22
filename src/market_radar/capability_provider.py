@@ -59,27 +59,27 @@ _FLOW_FACTORS = {
 
 class MarketRadarEnrichmentProvider(Protocol):
     def fetch_board_history(
-        self, sector: SectorDefinition, as_of: datetime
+        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
     ) -> CapabilityResult[BoardBarSeries]:
         raise NotImplementedError
 
     def fetch_benchmark_history(
-        self, code: str, as_of: datetime
+        self, code: str, as_of: datetime, *, attempt_policy: Any = None
     ) -> CapabilityResult[BoardBarSeries]:
         raise NotImplementedError
 
     def fetch_board_flow(
-        self, sector: SectorDefinition, as_of: datetime
+        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
     ) -> CapabilityResult[BoardFlowSeries]:
         raise NotImplementedError
 
     def fetch_constituents(
-        self, sector: SectorDefinition, as_of: datetime
+        self, sector: SectorDefinition, as_of: datetime, *, attempt_policy: Any = None
     ) -> CapabilityResult[ConstituentMembership]:
         raise NotImplementedError
 
     def fetch_constituent_quotes(
-        self, codes: tuple[str, ...], as_of: datetime
+        self, codes: tuple[str, ...], as_of: datetime, *, attempt_policy: Any = None
     ) -> CapabilityResult[ConstituentQuoteBatch]:
         raise NotImplementedError
 
@@ -374,11 +374,20 @@ class ProviderCapabilityAdapter:
         kind: str,
         name: str,
         as_of: datetime,
+        attempt_policy: Any = None,
     ) -> tuple[Any | None, Any, str]:
         method = self.manager.get_market_radar_capability_with_meta
         kwargs: dict[str, Any] = {"kind": kind, "name": name}
-        if "as_of" in inspect.signature(method).parameters:
+        parameters = inspect.signature(method).parameters.values()
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        parameter_names = {parameter.name for parameter in parameters}
+        if "as_of" in parameter_names or accepts_kwargs:
             kwargs["as_of"] = as_of
+        if "attempt_policy" in parameter_names or accepts_kwargs:
+            kwargs["attempt_policy"] = attempt_policy
         return method(capability, **kwargs)
 
     def _bar_result(
@@ -420,6 +429,8 @@ class ProviderCapabilityAdapter:
         self,
         sector: SectorDefinition,
         as_of: datetime,
+        *,
+        attempt_policy: Any = None,
     ) -> CapabilityResult[BoardBarSeries]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -430,6 +441,7 @@ class ProviderCapabilityAdapter:
                 kind=sector.kind,
                 name=sector.name,
                 as_of=as_of,
+                attempt_policy=attempt_policy,
             )
             if payload is None:
                 return self._unavailable(
@@ -456,6 +468,8 @@ class ProviderCapabilityAdapter:
         self,
         code: str,
         as_of: datetime,
+        *,
+        attempt_policy: Any = None,
     ) -> CapabilityResult[BoardBarSeries]:
         self._require_as_of(as_of)
         try:
@@ -470,6 +484,7 @@ class ProviderCapabilityAdapter:
                 kind="index",
                 name=benchmark_code,
                 as_of=as_of,
+                attempt_policy=attempt_policy,
             )
             if payload is None:
                 return self._unavailable(
@@ -490,6 +505,8 @@ class ProviderCapabilityAdapter:
         self,
         sector: SectorDefinition,
         as_of: datetime,
+        *,
+        attempt_policy: Any = None,
     ) -> CapabilityResult[BoardFlowSeries]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -500,6 +517,7 @@ class ProviderCapabilityAdapter:
                 kind=sector.kind,
                 name=sector.name,
                 as_of=as_of,
+                attempt_policy=attempt_policy,
             )
             if payload is None:
                 return self._unavailable(
@@ -546,6 +564,8 @@ class ProviderCapabilityAdapter:
         self,
         sector: SectorDefinition,
         as_of: datetime,
+        *,
+        attempt_policy: Any = None,
     ) -> CapabilityResult[ConstituentMembership]:
         self._require_as_of(as_of)
         trace: Any = ()
@@ -556,6 +576,7 @@ class ProviderCapabilityAdapter:
                 kind=sector.kind,
                 name=sector.name,
                 as_of=as_of,
+                attempt_policy=attempt_policy,
             )
             if payload is None:
                 return self._unavailable(
@@ -626,6 +647,8 @@ class ProviderCapabilityAdapter:
         self,
         codes: tuple[str, ...],
         as_of: datetime,
+        *,
+        attempt_policy: Any = None,
     ) -> CapabilityResult[ConstituentQuoteBatch]:
         self._require_as_of(as_of)
         try:

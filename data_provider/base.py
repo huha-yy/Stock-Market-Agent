@@ -3764,6 +3764,7 @@ class DataFetcherManager:
         kind: str,
         name: str,
         as_of: Optional[datetime] = None,
+        attempt_policy: Any = None,
     ) -> Tuple[Any | None, List[Dict[str, Any]], str]:
         """Fetch one enrichment capability with an ordered, bounded trace."""
         method_name = self._MARKET_RADAR_CAPABILITY_METHODS.get(capability)
@@ -3802,6 +3803,18 @@ class DataFetcherManager:
             provider = self._safe_market_radar_text(
                 getattr(fetcher, "name", type(fetcher).__name__)
             )[:80]
+            if (
+                attempt_policy is not None
+                and not attempt_policy.should_attempt(capability, provider)
+            ):
+                source_chain.append(
+                    {
+                        "provider": provider,
+                        "result": "circuit_open",
+                        "duration_ms": 0,
+                    }
+                )
+                continue
             try:
                 args = (name,) if capability == "benchmark_history" else (kind, name)
                 payload = self._call_market_radar_capability(
@@ -3827,6 +3840,10 @@ class DataFetcherManager:
                                 "error": "unversioned_current_membership",
                             }
                         )
+                        if attempt_policy is not None:
+                            attempt_policy.record_attempt(
+                                capability, provider, "partial"
+                            )
                         if partial_candidate is None:
                             partial_candidate = (payload, len(source_chain) - 1)
                         continue
@@ -3843,6 +3860,10 @@ class DataFetcherManager:
                                 "error": "provider terminal date precedes requested as_of",
                             }
                         )
+                        if attempt_policy is not None:
+                            attempt_policy.record_attempt(
+                                capability, provider, "stale"
+                            )
                         if stale_candidate is None or terminal > stale_candidate[0]:
                             stale_candidate = (
                                 terminal,
@@ -3857,6 +3878,8 @@ class DataFetcherManager:
                             "duration_ms": duration_ms,
                         }
                     )
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(capability, provider, "ok")
                     return payload, source_chain, ""
 
                 result = "empty" if reason == "empty result" else "invalid"
@@ -3871,6 +3894,8 @@ class DataFetcherManager:
                         "error": last_error,
                     }
                 )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, result)
             except Exception as exc:
                 error_type, error_reason = summarize_exception(exc)
                 safe_reason = self._safe_market_radar_text(error_reason)
@@ -3887,6 +3912,8 @@ class DataFetcherManager:
                         "error": safe_reason,
                     }
                 )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, "failed")
         if stale_candidate is not None:
             _, payload, trace_index = stale_candidate
             source_chain[trace_index]["selected"] = True

@@ -9,6 +9,7 @@ import pandas as pd
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetcherManager
 from src.market_radar.capability_provider import ProviderCapabilityAdapter
+from src.market_radar.enrichment import RunScopedCapabilityCircuit
 from src.market_radar.models import SectorDefinition
 
 
@@ -76,6 +77,49 @@ def test_manager_continues_after_empty_wrong_date_and_non_finite_payloads() -> N
     assert data is valid_second_source_payload
     assert [item["result"] for item in trace] == ["empty", "invalid", "ok"]
     assert error == ""
+
+
+def test_run_scoped_circuit_opens_one_capability_source_and_keeps_fallback() -> None:
+    calls = {"A": 0, "B": 0}
+
+    class FailingFetcher:
+        name = "A"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str):
+            calls["A"] += 1
+            raise RuntimeError("upstream failed")
+
+    class WorkingFetcher:
+        name = "B"
+        priority = 1
+
+        def get_sector_history(self, kind: str, name: str):
+            calls["B"] += 1
+            return pd.DataFrame(
+                {
+                    "data_date": ["2026-07-22"],
+                    "close": [1.0],
+                    "traded_amount": [2.0],
+                }
+            )
+
+    adapter = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[FailingFetcher(), WorkingFetcher()])
+    )
+    circuit = RunScopedCapabilityCircuit(failure_threshold=3)
+
+    results = [
+        adapter.fetch_board_history(SECTOR, AS_OF, attempt_policy=circuit)
+        for _ in range(4)
+    ]
+
+    assert calls == {"A": 3, "B": 4}
+    assert all(result.status == "ok" for result in results)
+    assert [item["result"] for item in results[-1].trace] == [
+        "circuit_open",
+        "ok",
+    ]
 
 
 def test_manager_bounds_and_redacts_persisted_failure_text() -> None:
