@@ -556,6 +556,108 @@ def test_capability_deadline_is_rechecked_after_waiting_for_source_lock() -> Non
     assert result.trace[0]["result"] == "deadline_exceeded"
 
 
+def test_manager_passes_deadline_and_clock_only_to_supported_capability_method() -> None:
+    captured = {}
+    clock = lambda: 3.0
+
+    class DeadlineAwareFetcher:
+        name = "DeadlineAwareFetcher"
+        priority = 0
+
+        def get_sector_history(
+            self,
+            kind: str,
+            name: str,
+            *,
+            as_of=None,
+            deadline_monotonic=None,
+            monotonic=None,
+        ):
+            captured.update(
+                as_of=as_of,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
+            )
+            return pd.DataFrame(
+                {"日期": ["2026-07-22"], "收盘": [1.0], "成交额": [2.0]}
+            )
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[DeadlineAwareFetcher()])
+    ).fetch_board_history(
+        SECTOR,
+        AS_OF,
+        deadline_monotonic=10.0,
+        monotonic=clock,
+    )
+
+    assert result.status == "ok"
+    assert captured == {
+        "as_of": AS_OF,
+        "deadline_monotonic": 10.0,
+        "monotonic": clock,
+    }
+
+
+def test_actual_akshare_compound_deadline_traces_through_manager_and_adapter(
+    monkeypatch,
+) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def flow(**kwargs):
+        calls.append("flow")
+        clock.now = 10.0
+        return pd.DataFrame(
+            {
+                "日期": ["2026-07-22"],
+                "主力净流入-净额": [100.0],
+            }
+        )
+
+    def history(**kwargs):
+        calls.append("history")
+        return pd.DataFrame(
+            {"日期": ["2026-07-22"], "收盘": [1.0], "成交额": [500.0]}
+        )
+
+    fake_akshare = SimpleNamespace(
+        stock_sector_fund_flow_hist=flow,
+        stock_board_industry_hist_em=history,
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher._akshare_call_with_timeout",
+        lambda func, *args, **kwargs: func(
+            *args,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"timeout", "call_name"}
+            },
+        ),
+    )
+    fetcher = AkshareFetcher.__new__(AkshareFetcher)
+    fetcher._history_call_timeout = 7
+    monkeypatch.setattr(fetcher, "_set_random_user_agent", lambda: None)
+    monkeypatch.setattr(fetcher, "_enforce_rate_limit", lambda: None)
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[fetcher])
+    ).fetch_board_flow(
+        SECTOR,
+        AS_OF,
+        deadline_monotonic=10.0,
+        monotonic=lambda: clock.now,
+    )
+
+    assert calls == ["flow"]
+    assert result.status == "unavailable"
+    assert result.error == "deadline_exceeded"
+    assert result.trace[0]["result"] == "deadline_exceeded"
+    assert not any(item.get("result") == "invalid" for item in result.trace)
+
+
 def test_manager_bounds_and_redacts_persisted_failure_text() -> None:
     class FailingFetcher:
         name = "FailingFetcher"

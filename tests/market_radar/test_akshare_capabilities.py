@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from data_provider import akshare_fetcher as akshare_module
 from data_provider.akshare_fetcher import AkshareFetcher
@@ -197,3 +198,130 @@ def test_benchmark_history_uses_index_endpoint_and_preserves_000985(monkeypatch)
 
     assert result.iloc[-1]["收盘"] == 1.0
     assert calls[0]["symbol"] == "000985"
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda fetcher, clock: fetcher.get_sector_history(
+            "industry",
+            "semiconductor",
+            deadline_monotonic=10.0,
+            monotonic=clock,
+        ),
+        lambda fetcher, clock: fetcher.get_index_history(
+            "000985",
+            deadline_monotonic=10.0,
+            monotonic=clock,
+        ),
+        lambda fetcher, clock: fetcher.get_sector_flow(
+            "industry",
+            "semiconductor",
+            deadline_monotonic=10.0,
+            monotonic=clock,
+        ),
+        lambda fetcher, clock: fetcher.get_sector_constituents(
+            "industry",
+            "semiconductor",
+            deadline_monotonic=10.0,
+            monotonic=clock,
+        ),
+    ],
+    ids=["board", "index", "flow", "constituents"],
+)
+def test_capability_does_not_call_akshare_after_rate_limit_crosses_deadline(
+    invoke, monkeypatch
+) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def endpoint(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame()
+
+    fake_akshare = SimpleNamespace(
+        stock_board_industry_hist_em=endpoint,
+        index_zh_a_hist=endpoint,
+        stock_sector_fund_flow_hist=endpoint,
+        stock_board_industry_cons_em=endpoint,
+    )
+    fetcher = _fetcher(monkeypatch, fake_akshare)
+    monkeypatch.setattr(
+        fetcher,
+        "_enforce_rate_limit",
+        lambda: setattr(clock, "now", 10.0),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        invoke(fetcher, lambda: clock.now)
+
+    assert calls == []
+
+
+def test_flow_does_not_start_history_call_after_first_call_consumes_budget(
+    monkeypatch,
+) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def flow(**kwargs):
+        calls.append("flow")
+        clock.now = 10.0
+        return pd.DataFrame(
+            {
+                "日期": ["2026-07-22"],
+                "主力净流入-净额": [100.0],
+            }
+        )
+
+    def history(**kwargs):
+        calls.append("history")
+        return pd.DataFrame(
+            {"日期": ["2026-07-22"], "收盘": [1.0], "成交额": [500.0]}
+        )
+
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(
+            stock_sector_fund_flow_hist=flow,
+            stock_board_industry_hist_em=history,
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        fetcher.get_sector_flow(
+            "industry",
+            "semiconductor",
+            deadline_monotonic=10.0,
+            monotonic=lambda: clock.now,
+        )
+
+    assert calls == ["flow"]
+
+
+def test_akshare_timeout_is_capped_to_positive_remaining_budget(monkeypatch) -> None:
+    captured = []
+    result = pd.DataFrame(
+        {"日期": ["2026-07-22"], "收盘": [1.0], "成交额": [2.0]}
+    )
+
+    def bounded_call(func, *args, **kwargs):
+        captured.append(kwargs)
+        return result
+
+    fake_akshare = SimpleNamespace(index_zh_a_hist=lambda **kwargs: result)
+    fetcher = _fetcher(monkeypatch, fake_akshare)
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher._akshare_call_with_timeout",
+        bounded_call,
+    )
+
+    actual = fetcher.get_index_history(
+        "000985",
+        deadline_monotonic=10.0,
+        monotonic=lambda: 7.25,
+    )
+
+    assert actual is result
+    assert captured[0]["timeout"] == pytest.approx(2.75)
+    assert captured[0]["timeout"] > 0

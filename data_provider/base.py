@@ -458,6 +458,8 @@ class BaseFetcher(ABC):
         name: str,
         *,
         as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native sector history when supported."""
         return None
@@ -468,6 +470,8 @@ class BaseFetcher(ABC):
         name: str,
         *,
         as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native sector capital flow when supported."""
         return None
@@ -478,6 +482,8 @@ class BaseFetcher(ABC):
         name: str,
         *,
         as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native current sector membership when supported."""
         return None
@@ -487,6 +493,8 @@ class BaseFetcher(ABC):
         code: str,
         *,
         as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native index history when identity is explicit."""
         return None
@@ -3863,15 +3871,26 @@ class DataFetcherManager:
         method_name: str,
         args: tuple[Any, ...],
         as_of: Optional[datetime],
+        deadline_monotonic: Optional[float],
+        monotonic: Callable[[], float],
     ) -> Any:
         method = getattr(fetcher, method_name)
         parameters = inspect.signature(method).parameters.values()
-        accepts_as_of = any(
-            parameter.name == "as_of"
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
-        kwargs = {"as_of": as_of} if accepts_as_of else {}
+        optional = {
+            "as_of": as_of,
+            "deadline_monotonic": deadline_monotonic,
+            "monotonic": monotonic,
+        }
+        kwargs = {
+            name: value
+            for name, value in optional.items()
+            if accepts_kwargs or name in parameter_names
+        }
         return self._call_fetcher_method(
             fetcher,
             method_name,
@@ -3924,9 +3943,23 @@ class DataFetcherManager:
             try:
                 args = (name,) if capability == "benchmark_history" else (kind, name)
                 payload = self._call_market_radar_capability(
-                    fetcher, method_name, args, as_of
+                    fetcher,
+                    method_name,
+                    args,
+                    as_of,
+                    deadline_monotonic,
+                    monotonic,
                 )
                 duration_ms = int((time.monotonic() - started) * 1000)
+                if (
+                    deadline_monotonic is not None
+                    and monotonic() >= deadline_monotonic
+                ):
+                    return None, {
+                        "provider": provider,
+                        "result": "deadline_exceeded",
+                        "duration_ms": duration_ms,
+                    }, "deadline_exceeded", None
                 is_valid, reason = validate_provider_capability_payload(
                     capability, payload, as_of=as_of
                 )
@@ -3969,6 +4002,17 @@ class DataFetcherManager:
                     "error": last_error,
                 }, last_error, None
             except Exception as exc:
+                if (
+                    deadline_monotonic is not None
+                    and monotonic() >= deadline_monotonic
+                ):
+                    return None, {
+                        "provider": provider,
+                        "result": "deadline_exceeded",
+                        "duration_ms": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                    }, "deadline_exceeded", None
                 error_type, error_reason = summarize_exception(exc)
                 safe_reason = self._safe_market_radar_text(error_reason)
                 last_error = self._safe_market_radar_text(

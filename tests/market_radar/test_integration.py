@@ -372,11 +372,16 @@ def test_market_radar_docs_cover_phase_2a_operational_contract() -> None:
         "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS=180",
         "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY=6",
         "--discovery-only",
-        "current Asia/Shanghai calendar date",
+        "exact same UTC instant",
+        "including another instant on the same Asia/Shanghai date",
         "persisted snapshot replay",
         "zero live provider calls",
         "does not initialize or read SQLite",
         "000985",
+        "undated membership is excluded from dated breadth, concentration",
+        "never inferred from board history or constituent quotes",
+        "Tencent and Sina",
+        "never substitutes the local fetch time",
     ):
         assert token in text
 

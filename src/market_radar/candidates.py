@@ -199,27 +199,56 @@ class CandidateSelector:
             if candidate.observation is not None
         )
 
-        def queue(kind: str, reverse: bool) -> tuple[str, ...]:
+        def queues(kind: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
             rows = [
                 (sector_id, observation.return_1d_pct)
                 for sector_id, observation in observations
                 if observation.kind == kind
             ]
-            return tuple(
+            if len(rows) == 1:
+                sector_id, value = rows[0]
+                if value is not None and isfinite(value) and value >= 0:
+                    return (sector_id,), ()
+                return (), (sector_id,)
+
+            finite = sorted(
+                (
+                    (sector_id, value)
+                    for sector_id, value in rows
+                    if value is not None and isfinite(value)
+                ),
+                key=lambda item: CandidateSelector._return_sort_key(
+                    item[0], item[1], True
+                ),
+            )
+            leader_count = (len(finite) + 1) // 2
+            leaders = tuple(sector_id for sector_id, _ in finite[:leader_count])
+            laggards = tuple(
                 sector_id
                 for sector_id, _ in sorted(
-                    rows,
+                    finite[leader_count:],
                     key=lambda item: CandidateSelector._return_sort_key(
-                        item[0], item[1], reverse
+                        item[0], item[1], False
                     ),
                 )
             )
+            missing = tuple(
+                sorted(
+                    sector_id
+                    for sector_id, value in rows
+                    if value is None or not isfinite(value)
+                )
+            )
+            return leaders, (*laggards, *missing)
+
+        industry_leaders, industry_laggards = queues("industry")
+        concept_leaders, concept_laggards = queues("concept")
 
         return (
-            ("current_industry_leader", queue("industry", reverse=True)),
-            ("current_industry_laggard", queue("industry", reverse=False)),
-            ("current_concept_leader", queue("concept", reverse=True)),
-            ("current_concept_laggard", queue("concept", reverse=False)),
+            ("current_industry_leader", industry_leaders),
+            ("current_industry_laggard", industry_laggards),
+            ("current_concept_leader", concept_leaders),
+            ("current_concept_laggard", concept_laggards),
         )
 
     @staticmethod

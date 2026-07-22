@@ -94,8 +94,8 @@ def test_missing_data_lowers_confidence_without_becoming_zero_strength() -> None
 
     assert result.factors.trend_momentum > 0
     assert result.gross_score == 54.4444
-    assert result.confidence == 0.4487
-    assert result.state == "neutral"
+    assert result.confidence == 0.359
+    assert result.state == "insufficient_data"
 
 
 def test_stale_quality_is_insufficient_even_while_fresh() -> None:
@@ -226,7 +226,7 @@ def test_zero_is_rankable_evidence_while_missing_is_not() -> None:
 
     assert by_id["industry:zero"].factors.trend_momentum == 12.5
     assert by_id["industry:missing"].factors.trend_momentum == 0.0
-    assert by_id["industry:zero"].confidence == 0.0641
+    assert by_id["industry:zero"].confidence == 0.0513
     assert by_id["industry:missing"].confidence == 0.0
 
 
@@ -343,6 +343,7 @@ def test_phase2a_full_market_evidence_without_catalyst_has_approved_confidence()
         "industry:enriched",
         quality="partial",
         catalyst_score=None,
+        raw_reference={"schema": "market-radar-observation-v2a"},
     )
 
     result = score_sectors([enriched], RankingConfig())[0]
@@ -350,7 +351,7 @@ def test_phase2a_full_market_evidence_without_catalyst_has_approved_confidence()
     assert result.confidence == 0.9231
 
 
-def test_phase1_sparse_partial_confidence_is_coverage_based() -> None:
+def test_phase1_sparse_partial_confidence_keeps_legacy_quality_multiplier() -> None:
     sparse = observation(
         "Sparse",
         "industry:sparse",
@@ -374,7 +375,8 @@ def test_phase1_sparse_partial_confidence_is_coverage_based() -> None:
 
     result = score_sectors([sparse], RankingConfig())[0]
 
-    assert result.confidence == round(expected_coverage, 4)
+    assert result.confidence == round(expected_coverage * 0.8, 4)
+    assert result.state == "insufficient_data"
 
 
 def test_relative_inputs_contribute_independent_cumulative_coverage() -> None:

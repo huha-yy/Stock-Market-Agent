@@ -293,6 +293,15 @@ def test_replay_scores_are_exactly_the_direct_ranking_output() -> None:
     assert list(snapshot.sectors) == score_sectors(observations, config)
 
 
+def test_legacy_partial_replay_keeps_phase1_confidence_and_state() -> None:
+    snapshot = MarketRadarReplayEngine(RankingConfig()).replay(
+        [ReplayFrame(as_of=START, observations=[observation(START, 1.0)])]
+    )[0]
+
+    assert snapshot.sectors[0].confidence == 0.0513
+    assert snapshot.sectors[0].state == "insufficient_data"
+
+
 @pytest.mark.parametrize(
     ("observations", "expected"),
     [

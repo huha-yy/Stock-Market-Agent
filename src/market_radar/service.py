@@ -23,21 +23,24 @@ from src.market_radar.universe import UniverseLoader
 
 
 _CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
-_ENRICHMENT_TRACE_LIMIT = 1200
+_PROVIDER_TRACE_LIMIT = 1200
 _TRACE_TEXT_LIMIT = 128
 _TRACE_ERROR_LIMIT = 256
-_ENRICHMENT_TRACE_FIELDS = frozenset(
-    {
-        "sector_id",
-        "capability",
-        "provider",
-        "result",
-        "source",
-        "code",
-        "selected",
-        "duration_ms",
-        "error",
-    }
+_TRACE_NUMBER_LIMIT = 86_400_000
+_PROVIDER_TRACE_FIELDS = (
+    "dataset",
+    "stage",
+    "sector_id",
+    "sector",
+    "capability",
+    "provider",
+    "result",
+    "source",
+    "code",
+    "selected",
+    "duration_ms",
+    "duration",
+    "error",
 )
 
 
@@ -132,33 +135,76 @@ def _clean_trace_scalar(key: str, value: Any) -> str | int | float | bool | None
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
-        return value
+        if key in {"duration", "duration_ms"} and value < 0:
+            return None
+        return max(-_TRACE_NUMBER_LIMIT, min(value, _TRACE_NUMBER_LIMIT))
     if isinstance(value, float) and isfinite(value):
-        return value
+        if key in {"duration", "duration_ms"} and value < 0:
+            return None
+        return max(
+            -float(_TRACE_NUMBER_LIMIT),
+            min(value, float(_TRACE_NUMBER_LIMIT)),
+        )
     return None
 
 
-def _tag_enrichment_trace(
-    entries: Sequence[Mapping[str, Any]],
+def _sanitize_trace_entry(
+    entry: Mapping[str, Any],
+    *,
+    enrichment: bool,
+) -> dict[str, Any]:
+    values = dict(entry)
+    if enrichment:
+        values["stage"] = "enrichment"
+        values["dataset"] = entry.get("capability", "enrichment")
+    item: dict[str, Any] = {}
+    for key in _PROVIDER_TRACE_FIELDS:
+        if key not in values:
+            continue
+        value = _clean_trace_scalar(key, values[key])
+        if value is not None:
+            item[key] = value
+    return item
+
+
+def _sanitize_provider_trace(
+    discovery: Sequence[Mapping[str, Any]],
+    enrichment: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any], ...]:
-    tagged: list[dict[str, Any]] = []
-    for entry in tuple(entries)[:_ENRICHMENT_TRACE_LIMIT]:
-        capability = _clean_trace_scalar(
-            "capability",
-            entry.get("capability", "enrichment"),
-        )
-        item: dict[str, Any] = {
-            "stage": "enrichment",
-            "dataset": capability or "enrichment",
-        }
-        for key in _ENRICHMENT_TRACE_FIELDS:
-            if key not in entry:
+    selected: list[tuple[int, dict[str, Any], bool]] = []
+    index = 0
+    for entries, is_enrichment in (
+        (discovery, False),
+        (enrichment, True),
+    ):
+        for entry in entries:
+            current_index = index
+            index += 1
+            if not isinstance(entry, Mapping):
                 continue
-            value = _clean_trace_scalar(key, entry[key])
-            if value is not None:
-                item[key] = value
-        tagged.append(item)
-    return tuple(tagged)
+            item = _sanitize_trace_entry(entry, enrichment=is_enrichment)
+            if not item:
+                continue
+            is_deadline = (
+                item.get("result") == "deadline_exceeded"
+                or item.get("error") == "deadline_exceeded"
+            )
+            if len(selected) < _PROVIDER_TRACE_LIMIT:
+                selected.append((current_index, item, is_deadline))
+                continue
+            if not is_deadline:
+                continue
+            replacement = next(
+                (
+                    position
+                    for position in range(len(selected) - 1, -1, -1)
+                    if not selected[position][2]
+                ),
+                None,
+            )
+            if replacement is not None:
+                selected[replacement] = (current_index, item, True)
+    return tuple(item for _, item, _ in sorted(selected, key=lambda value: value[0]))
 
 
 def _validate_previous_snapshot(
@@ -284,23 +330,19 @@ class MarketRadarService:
                 "MarketRadarService.run does not perform live replay; use "
                 "MarketRadarReplayEngine.replay_persisted_run"
             )
-        repository = self.repository
-        if persist and repository is None:
-            raise ValueError("repository is required when persist=True")
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
-        requested_as_of = as_of if as_of is not None else now
-        if requested_as_of.tzinfo is None or requested_as_of.utcoffset() is None:
-            raise ValueError("as_of must be timezone-aware")
-        effective_as_of = requested_as_of.astimezone(timezone.utc)
-        if (
-            effective_as_of.astimezone(_CN_MARKET_TIMEZONE).date()
-            != now.astimezone(_CN_MARKET_TIMEZONE).date()
-        ):
-            raise ValueError(
-                "as_of must use the same Asia/Shanghai calendar date as the clock"
-            )
+        effective_as_of = now.astimezone(timezone.utc)
+        if as_of is not None:
+            if as_of.tzinfo is None or as_of.utcoffset() is None:
+                raise ValueError("as_of must be timezone-aware")
+            requested_as_of = as_of.astimezone(timezone.utc)
+            if requested_as_of != effective_as_of:
+                raise ValueError("as_of must be the exact same instant as the clock")
+        repository = self.repository
+        if persist and repository is None:
+            raise ValueError("repository is required when persist=True")
         if previous_snapshot is not None:
             _validate_previous_snapshot(previous_snapshot, effective_as_of)
 
@@ -342,12 +384,10 @@ class MarketRadarService:
 
         _validate_unique_observations(observations, "final")
         sectors = score_sectors(observations, self.ranking_config)
-        provider_trace = tuple(batch.trace)
-        if enrichment is not None:
-            provider_trace = (
-                *provider_trace,
-                *_tag_enrichment_trace(enrichment.trace),
-            )
+        provider_trace = _sanitize_provider_trace(
+            batch.trace,
+            enrichment.trace if enrichment is not None else (),
+        )
         snapshot = RadarRunSnapshot(
             run_key=(
                 f"{market}:"

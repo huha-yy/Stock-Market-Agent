@@ -133,10 +133,18 @@ def _return_for_window(bars: Sequence[BoardBar], window: int) -> float | None:
     return (current / prior - 1) * 100
 
 
-def _flow_for_window(series: BoardFlowSeries, window: int) -> float | None:
-    if len(series.flows) < window:
+def _flow_for_window(
+    series: BoardFlowSeries,
+    board_bars: Sequence[BoardBar],
+    window: int,
+) -> float | None:
+    if len(series.flows) < window or len(board_bars) < window:
         return None
     rows = series.flows[-window:]
+    if tuple(row.data_date for row in rows) != tuple(
+        row.data_date for row in board_bars[-window:]
+    ):
+        return None
     denominator = sum(row.traded_amount for row in rows)
     if denominator <= 0:
         return None
@@ -448,7 +456,7 @@ class CnSectorObservationBuilder:
                     sources,
                     dependencies,
                     field,
-                    _flow_for_window(flow, window),
+                    _flow_for_window(flow, board.bars, window),
                     _source_label(board_flow.source),
                     (board_flow,),
                 )
@@ -622,30 +630,20 @@ class CnSectorObservationBuilder:
             return coverage, False, None, None, membership_codes
 
         membership_date = membership_data.data_date
-        provenance = None
-        if membership_date is None:
-            if (
-                membership.status != "partial"
-                or membership.observed_at != observed_at
-                or quotes.status == "unavailable"
-                or quote_data is None
-                or quotes.observed_at != observed_at
-                or quotes.data_date != terminal_date
-            ):
-                return coverage, False, None, None, membership_codes
-            evidence_date = quotes.data_date
-            provenance = "partial_unversioned_current_membership"
-        elif membership_date == terminal_date and membership.data_date == terminal_date:
-            evidence_date = membership_date
-        else:
+        if (
+            membership_date is None
+            or membership_date != terminal_date
+            or membership.data_date != terminal_date
+        ):
             return coverage, False, None, None, membership_codes
+        evidence_date = membership_date
 
         if (
             quotes.status == "unavailable"
             or quote_data is None
             or quotes.data_date != terminal_date
         ):
-            return coverage, True, evidence_date, provenance, membership_codes
+            return coverage, True, evidence_date, None, membership_codes
 
         membership_set = set(membership_codes)
         valid_by_code: dict[str, Any] = {}
@@ -721,7 +719,7 @@ class CnSectorObservationBuilder:
                 _combined_source(membership.source, quotes.source),
                 (membership, quotes),
             )
-        return coverage, True, evidence_date, provenance, membership_codes
+        return coverage, True, evidence_date, None, membership_codes
 
     @staticmethod
     def _coverage(

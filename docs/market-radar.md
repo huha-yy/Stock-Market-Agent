@@ -32,7 +32,9 @@ Phase 2A works without new configuration. The following optional integer setting
 
 The formula thresholds remain code-owned and versioned; these settings are not exposed in Web settings because Phase 2A has no Web administration surface.
 
-AkShare currently implements board history, benchmark history, industry flow, and current industry/concept membership. Concept flow has no equivalent capability and is explicitly `unavailable`. Constituent realtime quotes use the existing `DataFetcherManager` fallback chain, which may use configured realtime sources that return a valid same-date quote. Tushare and TickFlow do not currently override the optional normalized board-capability methods. Future implementations may participate only when they satisfy the same normalized field, date, and provenance contracts. An empty, malformed, non-finite, or wrong-date result advances that individual capability to its next implemented provider; a history failure does not discard valid flow or constituent evidence.
+AkShare currently implements board history, benchmark history, industry flow, and current industry/concept membership. Its current membership endpoints do not supply an authoritative observation date. Those codes may remain visible as partial provenance, but undated membership is excluded from dated breadth, concentration, constituent-set keys, and persisted constituent evidence; its date is never inferred from board history or constituent quotes. Concept flow has no equivalent capability and is explicitly `unavailable`.
+
+Constituent realtime quotes use the existing `DataFetcherManager` fallback chain. The default A-share path accepts AkShare Tencent and Sina quotes when the provider payload supplies an authoritative Asia/Shanghai timestamp, previous close, current price, and traded amount. It never substitutes the local fetch time for a missing provider timestamp. A malformed or missing timestamp or previous close leaves that quote unusable and continues fallback; EFinance/Eastmoney may therefore remain invalid for this capability when those authoritative fields are absent. Tushare and TickFlow do not currently override the optional normalized board-capability methods. Future implementations may participate only when they satisfy the same normalized field, date, and provenance contracts. An empty, malformed, non-finite, or wrong-date result advances that individual capability to its next implemented provider; a history failure does not discard valid flow or provider-dated constituent evidence.
 
 ## Two-Stage Flow
 
@@ -45,7 +47,7 @@ Concept sectors follow the same selection and normalized evidence contract as in
 
 ## Current Snapshot And Replay
 
-All instants are timezone-aware and market dates use `Asia/Shanghai`. Online discovery and enrichment accept only the current Asia/Shanghai calendar date. The service rejects a historical live `as_of`, even if a caller supplies one, rather than attaching current provider data to a past observation. The live service also rejects `trigger="replay"`.
+All instants are timezone-aware and market dates use `Asia/Shanghai`. A live run captures the current time once and uses that value as its final observation anchor. Omitting `as_of` uses this captured time. When a caller supplies `as_of`, it must represent the exact same UTC instant; any caller-selected earlier or later instant is rejected, including another instant on the same Asia/Shanghai date. The live service also rejects `trigger="replay"`.
 
 Replay is a separate persisted snapshot replay path. It reads the stored sector observations, reuses the deterministic scoring path, and makes zero live provider calls. Referenced constituent evidence remains resolvable for audit. There is no historical provider backfill, and current membership is never used to reconstruct an old observation.
 
@@ -79,7 +81,7 @@ The flow and price windows must end on the same `data_date`. The denominator mus
 
 ### Breadth And Concentration
 
-Each valid same-date constituent quote is classified by current price versus previous close as `up_count`, `down_count`, or `flat_count`. All three publish together only when there are at least 5 valid quotes and those quotes cover at least 80% of the normalized constituent set. Otherwise all three stay missing; an absent quote is not counted as flat.
+Each valid same-date constituent quote is classified by current price versus previous close as `up_count`, `down_count`, or `flat_count`. Membership must carry its own provider date and exactly match the terminal board session; matching quotes cannot date an undated membership. All three publish together only when there are at least 5 valid quotes and those quotes cover at least 80% of the normalized constituent set. Otherwise all three stay missing; an absent quote is not counted as flat.
 
 Under the same breadth gate:
 
@@ -121,7 +123,7 @@ A stale critical board price makes the enriched observation `stale`; no usable b
 
 ## Persistence And Audit
 
-With `--persist`, constituent membership is stored as immutable, content-addressed evidence. Its key is SHA-256 over market, sector ID, source, and the sorted canonical constituent codes. Identical content reuses the same row; conflicting content for the same sector, source, and observation date is rejected rather than overwritten or backdated.
+With `--persist`, only provider-dated constituent membership that exactly matches the terminal board session is stored as immutable, content-addressed evidence. Its key is SHA-256 over market, sector ID, source, and the sorted canonical constituent codes. Identical content reuses the same row; conflicting content for the same sector, source, and observation date is rejected rather than overwritten or backdated. Undated current membership remains observation-only and cannot produce a constituent-set reference.
 
 The sector snapshot references its constituent-set key. One atomic transaction writes the effective-dated universe, constituent sets and observations, radar run, and sector snapshots; any validation or storage conflict rolls back the whole run. Existing Phase 1 records remain readable.
 

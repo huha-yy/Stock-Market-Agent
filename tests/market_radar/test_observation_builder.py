@@ -231,19 +231,22 @@ def _build(
     membership: CapabilityResult[ConstituentMembership] | None = None,
     quotes: CapabilityResult[ConstituentQuoteBatch] | None = None,
     config: MarketRadarEnrichmentConfig | None = None,
+    observed_at: datetime = NOW,
 ) -> ObservationBuildResult:
-    history = board_history or _history([100.0] * 21)
+    history = board_history or _history([100.0] * 21, observed_at=observed_at)
     terminal = history.data_date or _dates(21)[-1]
     return CnSectorObservationBuilder(config).build(
         base=base or _base(),
         candidate_reasons=("configured_seed", "previous_leader"),
         benchmark_code="000985",
         board_history=history,
-        benchmark_history=benchmark_history or _history([100.0] * 21, code="000985"),
-        board_flow=board_flow or _flows([1.0] * 20),
-        membership=membership or _membership(data_date=terminal),
-        quotes=quotes or _quotes(data_date=terminal),
-        observed_at=NOW,
+        benchmark_history=benchmark_history
+        or _history([100.0] * 21, code="000985", observed_at=observed_at),
+        board_flow=board_flow or _flows([1.0] * 20, observed_at=observed_at),
+        membership=membership
+        or _membership(data_date=terminal, observed_at=observed_at),
+        quotes=quotes or _quotes(data_date=terminal, observed_at=observed_at),
+        observed_at=observed_at,
     )
 
 
@@ -290,6 +293,36 @@ def test_flow_requires_exact_rows_and_matching_terminal_date() -> None:
     assert wrong_date.observation.capital_flow_1d is None
     assert wrong_date.observation.capital_flow_5d is None
     assert wrong_date.observation.capital_flow_20d is None
+
+
+def test_flow_20d_rejects_an_interior_session_gap_but_keeps_exact_short_windows() -> None:
+    board_dates = _dates(22)
+    shifted_flow_dates = [board_dates[1], *board_dates[3:]]
+
+    observation = _build(
+        board_history=_history([100.0] * 22, dates=board_dates),
+        board_flow=_flows([1.0] * 20, dates=shifted_flow_dates),
+    ).observation
+
+    assert observation.capital_flow_1d == pytest.approx(1.0)
+    assert observation.capital_flow_5d == pytest.approx(1.0)
+    assert observation.capital_flow_20d is None
+    assert observation.price_flow_divergence is False
+
+
+def test_shifted_flow_5d_window_is_missing_while_exact_1d_still_publishes() -> None:
+    board_dates = _dates(22)
+    shifted_flow_dates = [*board_dates[1:17], *board_dates[18:22]]
+
+    observation = _build(
+        board_history=_history([100.0] * 22, dates=board_dates),
+        board_flow=_flows([1.0] * 20, dates=shifted_flow_dates),
+    ).observation
+
+    assert observation.capital_flow_1d == pytest.approx(1.0)
+    assert observation.capital_flow_5d is None
+    assert observation.capital_flow_20d is None
+    assert observation.price_flow_divergence is None
 
 
 def test_provisional_and_finalized_ma20_use_approved_windows() -> None:
@@ -426,49 +459,68 @@ def test_breadth_ignores_extra_quotes_and_enforces_date_membership_and_minimum()
         assert observation.concentration_ratio is None
 
 
-def test_unversioned_membership_requires_same_online_run_and_quote_terminal_date() -> None:
-    terminal = _dates(21)[-1]
+@pytest.mark.parametrize(
+    ("observed_at", "terminal", "quoted_at"),
+    (
+        (
+            datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc),
+            date(2026, 7, 17),
+            datetime(2026, 7, 17, 6, 59, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 7, 20, 0, 30, tzinfo=timezone.utc),
+            date(2026, 7, 17),
+            datetime(2026, 7, 17, 6, 59, tzinfo=timezone.utc),
+        ),
+    ),
+    ids=("weekend", "premarket_with_prior_quote"),
+)
+def test_undated_membership_never_publishes_dated_metrics_or_evidence(
+    observed_at: datetime,
+    terminal: date,
+    quoted_at: datetime,
+) -> None:
     codes = tuple(f"{index:06d}" for index in range(1, 7))
+    board_dates = [terminal - timedelta(days=20 - index) for index in range(21)]
     current = _build(
-        membership=_membership(codes, data_date=None, status="partial"),
-        quotes=_quotes(codes, data_date=terminal),
-    )
-
-    assert isinstance(current.constituent_evidence, ConstituentEvidence)
-    assert current.constituent_evidence.data_date == terminal
-    assert current.observation.raw_reference["capabilities"]["membership"][
-        "membership_data_date"
-    ] is None
-    assert current.observation.raw_reference["capabilities"]["membership"][
-        "provenance"
-    ] == "partial_unversioned_current_membership"
-
-    different_run = _build(
+        board_history=_history(
+            [100.0] * 21,
+            dates=board_dates,
+            observed_at=observed_at,
+        ),
         membership=_membership(
             codes,
             data_date=None,
             status="partial",
-            observed_at=NOW - timedelta(seconds=1),
+            observed_at=observed_at,
         ),
-        quotes=_quotes(codes, data_date=terminal),
-    )
-    assert different_run.constituent_evidence is None
-    assert different_run.observation.up_count is None
-
-    wrong_status = _build(
-        membership=_membership(codes, data_date=None, status="ok"),
-        quotes=_quotes(codes, data_date=terminal),
-    )
-    quote_from_different_run = _build(
-        membership=_membership(codes, data_date=None, status="partial"),
         quotes=_quotes(
             codes,
             data_date=terminal,
-            observed_at=NOW - timedelta(seconds=1),
+            observed_at=observed_at,
+            quoted_ats=(quoted_at,) * len(codes),
         ),
+        observed_at=observed_at,
     )
-    assert wrong_status.constituent_evidence is None
-    assert quote_from_different_run.constituent_evidence is None
+
+    assert current.constituent_evidence is None
+    assert current.observation.up_count is None
+    assert current.observation.down_count is None
+    assert current.observation.flat_count is None
+    assert current.observation.concentration_ratio is None
+    assert current.observation.raw_reference["constituent_set_key"] is None
+    assert current.observation.raw_reference["constituent_coverage"] == {
+        "total": len(codes),
+        "valid": 0,
+        "ratio": 0.0,
+        "invalid_codes": codes,
+    }
+    assert current.observation.raw_reference["capabilities"]["membership"][
+        "membership_data_date"
+    ] is None
+    assert "provenance" not in current.observation.raw_reference["capabilities"][
+        "membership"
+    ]
 
 
 def test_quote_rows_must_be_same_shanghai_date_and_not_future() -> None:
@@ -673,12 +725,12 @@ def test_incomplete_base_groups_keep_safe_current_standalone_fields() -> None:
 
 
 def test_current_flow_clears_incomplete_base_return_and_divergence() -> None:
-    terminal = _dates(21)[-1]
+    aligned_dates = _dates(21)[-5:]
     base = _base(return_5d_pct=9.0, price_flow_divergence=False)
     observation = _build(
         base=base,
-        board_history=_history([100.0], dates=[terminal]),
-        board_flow=_flows([1.0] * 20),
+        board_history=_history([100.0] * 5, dates=aligned_dates),
+        board_flow=_flows([1.0] * 5, dates=aligned_dates),
     ).observation
 
     assert observation.return_5d_pct is None

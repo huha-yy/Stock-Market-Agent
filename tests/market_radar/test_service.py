@@ -325,9 +325,7 @@ def test_run_builds_stable_snapshot_and_persists_in_dependency_order() -> None:
     assert snapshot.sectors[0].model_dump(mode="json")[
         "observation"
     ] == _observation().model_dump(mode="json")
-    assert snapshot.provider_trace == (
-        {"source": "fixture", "result": {"status": "ok"}},
-    )
+    assert snapshot.provider_trace == ({"source": "fixture"},)
     assert universe.loaded_as_of == NOW.date()
     assert provider.arguments == ("cn", NOW, universe.sectors)
     assert repository.snapshot == snapshot
@@ -682,10 +680,56 @@ def test_enrichment_trace_is_bounded_tagged_and_drops_unknown_secret_fields() ->
     ).run(persist=False)
 
     enrichment_trace = snapshot.provider_trace[1:]
-    assert len(enrichment_trace) == 1200
+    assert len(snapshot.provider_trace) == 1200
+    assert len(enrichment_trace) == 1199
     assert all(item["stage"] == "enrichment" for item in enrichment_trace)
     assert all(item["dataset"] == "board_history" for item in enrichment_trace)
     assert "secret" not in str(enrichment_trace)
+
+
+def test_total_trace_cap_preserves_a_late_deadline_in_original_order() -> None:
+    provider = FakeProvider(
+        ProviderBatch(
+            observations=[_observation()],
+            trace=[
+                {
+                    "dataset": "industry",
+                    "provider": f"discovery-{index}",
+                    "result": "failed",
+                }
+                for index in range(1200)
+            ],
+        )
+    )
+    enricher = RecordingEnricher(
+        EnrichmentBatch(
+            (),
+            (),
+            (
+                {
+                    "capability": "candidate_enrichment",
+                    "result": "deadline_exceeded",
+                    "error": "deadline_exceeded",
+                },
+            ),
+        )
+    )
+
+    snapshot = _service(
+        provider=provider,
+        candidate_selector=RecordingSelector(),
+        enricher=enricher,
+    ).run(persist=False)
+
+    assert len(snapshot.provider_trace) == 1200
+    assert snapshot.provider_trace[0]["provider"] == "discovery-0"
+    assert snapshot.provider_trace[-1] == {
+        "stage": "enrichment",
+        "dataset": "candidate_enrichment",
+        "capability": "candidate_enrichment",
+        "result": "deadline_exceeded",
+        "error": "deadline_exceeded",
+    }
 
 
 @pytest.mark.parametrize(
@@ -765,13 +809,13 @@ def test_duplicate_final_observations_abort_before_rank_or_persist(
     assert repository.snapshot is None
 
 
-def test_explicit_same_market_date_as_of_reads_clock_once_and_determines_key() -> None:
+def test_explicit_equivalent_instant_reads_clock_once_and_determines_key() -> None:
     as_of = datetime(
         2026,
         7,
         21,
         14,
-        30,
+        0,
         tzinfo=timezone(timedelta(hours=8)),
     )
     calls = 0
@@ -787,7 +831,7 @@ def test_explicit_same_market_date_as_of_reads_clock_once_and_determines_key() -
     )
 
     assert calls == 1
-    assert snapshot.run_key == "cn:20260721T063000Z:manual"
+    assert snapshot.run_key == "cn:20260721T060000Z:manual"
     assert snapshot.as_of == as_of.astimezone(timezone.utc)
 
 
@@ -820,7 +864,29 @@ def test_manual_run_rejects_different_market_date_before_dependencies(
     events: list[str] = []
     repository = FakeRepository(events=events)
 
-    with pytest.raises(ValueError, match="same Asia/Shanghai calendar date"):
+    with pytest.raises(ValueError, match="exact same instant as the clock"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=repository,
+        ).run(as_of=as_of)
+
+    assert events == []
+    assert repository.latest_calls == []
+
+
+@pytest.mark.parametrize(
+    "as_of",
+    [NOW - timedelta(seconds=1), NOW + timedelta(seconds=1)],
+    ids=["same_day_retro", "same_day_future"],
+)
+def test_manual_run_rejects_caller_selected_same_day_instant_before_dependencies(
+    as_of: datetime,
+) -> None:
+    events: list[str] = []
+    repository = FakeRepository(events=events)
+
+    with pytest.raises(ValueError, match="exact same instant as the clock"):
         _service(
             universe=FakeUniverse(events=events),
             provider=FakeProvider(events=events),
@@ -863,10 +929,12 @@ def test_run_canonicalizes_equivalent_instants_and_uses_cn_market_date() -> None
     first = _service(
         universe=first_universe,
         provider=first_provider,
+        clock=lambda: utc_as_of,
     ).run(as_of=utc_as_of, persist=False)
     second = _service(
         universe=second_universe,
         provider=second_provider,
+        clock=lambda: cn_as_of,
     ).run(as_of=cn_as_of, persist=False)
 
     assert first.run_key == second.run_key == "cn:20260720T163000Z:manual"
@@ -1285,6 +1353,84 @@ def test_persisted_run_returns_first_write_winner(isolated_db) -> None:
     assert retry.provider_trace[0]["source"] == "original"
 
 
+def test_persisted_discovery_and_enrichment_trace_is_allowlisted_bounded_and_redacted(
+    isolated_db,
+) -> None:
+    secret = "Authorization: Bearer token-secret Cookie=password-secret"
+    provider = FakeProvider(
+        ProviderBatch(
+            observations=[_observation()],
+            trace=[
+                {
+                    "dataset": "industry",
+                    "provider": "D" * 500,
+                    "result": "failed",
+                    "duration_ms": 10**30,
+                    "source": secret,
+                    "error": secret,
+                    "headers": {"Authorization": secret},
+                    "token": "token-secret",
+                    "nested": {"password": "password-secret"},
+                }
+            ],
+        )
+    )
+    enricher = RecordingEnricher(
+        EnrichmentBatch(
+            (),
+            (),
+            (
+                {
+                    "sector_id": "industry:semiconductor",
+                    "capability": "board_history",
+                    "result": "failed",
+                    "duration_ms": 10**30,
+                    "source": secret,
+                    "error": secret,
+                    "cookies": {"session": "token-secret"},
+                },
+            ),
+        )
+    )
+    repository = MarketRadarRepository(isolated_db)
+
+    stored = _service(
+        provider=provider,
+        repository=repository,
+        candidate_selector=RecordingSelector(),
+        enricher=enricher,
+    ).run()
+    readback = repository.get_run_by_key(stored.run_key)
+
+    assert readback is not None
+    assert readback.provider_trace == stored.provider_trace
+    assert len(readback.provider_trace) == 2
+    assert readback.provider_trace[0] == {
+        "dataset": "industry",
+        "provider": "D" * 128,
+        "result": "failed",
+        "duration_ms": 86_400_000,
+        "source": "[REDACTED]",
+        "error": "[REDACTED]",
+    }
+    assert readback.provider_trace[1] == {
+        "stage": "enrichment",
+        "dataset": "board_history",
+        "sector_id": "industry:semiconductor",
+        "capability": "board_history",
+        "result": "failed",
+        "duration_ms": 86_400_000,
+        "source": "[REDACTED]",
+        "error": "[REDACTED]",
+    }
+    persisted = str(readback.provider_trace).casefold()
+    assert "token-secret" not in persisted
+    assert "password-secret" not in persisted
+    assert "authorization" not in persisted
+    assert "headers" not in persisted
+    assert "cookies" not in persisted
+
+
 def test_failed_service_persistence_rolls_back_universe_and_snapshot(
     isolated_db,
 ) -> None:
@@ -1321,6 +1467,7 @@ def test_failed_service_persistence_rolls_back_universe_and_snapshot(
         _service(
             provider=provider,
             repository=repository,
+            clock=lambda: later,
         ).run(as_of=later)
 
     assert repository.get_latest_run("cn") == original

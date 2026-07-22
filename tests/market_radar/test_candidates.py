@@ -153,10 +153,7 @@ def test_selector_synthesizes_discovery_definition_without_rewriting_observation
         effective_from=NOW.date(),
     )
     assert selected[0].observation is discovered
-    assert selected[0].reasons == (
-        "current_concept_leader",
-        "current_concept_laggard",
-    )
+    assert selected[0].reasons == ("current_concept_leader",)
 
 
 def test_selector_collects_current_reasons_for_configured_and_prior_candidates() -> None:
@@ -177,11 +174,9 @@ def test_selector_collects_current_reasons_for_configured_and_prior_candidates()
         "configured_seed",
         "previous_leading",
         "current_industry_leader",
-        "current_industry_laggard",
     )
     assert selected[1].reasons == (
         "previous_improving",
-        "current_industry_leader",
         "current_industry_laggard",
     )
 
@@ -200,7 +195,6 @@ def test_selector_collects_current_reasons_before_priority_cutoff() -> None:
     assert selected[0].reasons == (
         "configured_seed",
         "current_industry_leader",
-        "current_industry_laggard",
     )
     assert len(selected[0].reasons) == len(set(selected[0].reasons))
 
@@ -222,6 +216,60 @@ def test_selector_sorts_missing_daily_returns_after_finite_values_with_sector_id
         "industry:z-tie",
         "industry:missing",
     ]
+
+
+@pytest.mark.parametrize(
+    ("daily_return", "expected_reason"),
+    (
+        (0.0, "current_industry_leader"),
+        (1.0, "current_industry_leader"),
+        (-1.0, "current_industry_laggard"),
+        (None, "current_industry_laggard"),
+    ),
+)
+def test_single_current_row_uses_sign_to_choose_one_extreme_reason(
+    daily_return: float | None,
+    expected_reason: str,
+) -> None:
+    selected = CandidateSelector().select(
+        (),
+        (observation("industry:only", daily_return=daily_return),),
+        None,
+        limit=1,
+    )
+
+    assert selected[0].reasons == (expected_reason,)
+
+
+def test_current_extreme_reasons_are_disjoint_and_cover_every_observation() -> None:
+    observations = (
+        observation("industry:best", daily_return=4.0),
+        observation("industry:upper", daily_return=2.0),
+        observation("industry:lower", daily_return=-1.0),
+        observation("industry:missing", daily_return=None),
+        observation("concept:best", daily_return=3.0),
+        observation("concept:worst", daily_return=-3.0),
+    )
+    selected = CandidateSelector().select(
+        universe=(definition("industry:best"),),
+        observations=observations,
+        previous_snapshot=snapshot(score("concept:worst", "leading")),
+        limit=len(observations),
+    )
+
+    current_reasons = {
+        item.sector.sector_id: tuple(
+            reason for reason in item.reasons if reason.startswith("current_")
+        )
+        for item in selected
+    }
+
+    assert set(current_reasons) == {item.sector_id for item in observations}
+    assert all(len(reasons) == 1 for reasons in current_reasons.values())
+    assert current_reasons["industry:best"] == ("current_industry_leader",)
+    assert current_reasons["industry:missing"] == ("current_industry_laggard",)
+    assert current_reasons["concept:best"] == ("current_concept_leader",)
+    assert current_reasons["concept:worst"] == ("current_concept_laggard",)
 
 
 @pytest.mark.parametrize("limit", [0, -1])
