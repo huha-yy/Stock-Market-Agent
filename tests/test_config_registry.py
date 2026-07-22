@@ -559,6 +559,24 @@ class TestEnvExampleWebSettingsCoverage(unittest.TestCase):
             }.issubset(WEB_SETTINGS_HIDDEN_FROM_UI)
         )
 
+    def test_market_radar_enrichment_defaults_are_documented_in_env_example(self) -> None:
+        expected = {
+            "MARKET_RADAR_ENRICHMENT_LIMIT": "60",
+            "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS": "180",
+            "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY": "6",
+        }
+        assignments = {
+            key: value
+            for line in self._ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+            if self._ACTIVE_ENV_ASSIGNMENT_RE.match(line.strip())
+            for key, value in [line.strip().split("=", 1)]
+        }
+
+        self.assertEqual(
+            {key: assignments.get(key) for key in expected},
+            expected,
+        )
+
     def test_active_env_example_keys_are_registered_or_hidden_from_web_ui(self) -> None:
         active_keys = {
             match.group(1)
