@@ -29,7 +29,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -2006,6 +2006,132 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Akshare] 获取概念排行失败: {e}")
             return None
+
+    def _get_sector_history_frame(
+        self,
+        ak: Any,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame]:
+        if kind == "industry":
+            endpoint = ak.stock_board_industry_hist_em
+            period = "日k"
+            call_name = "ak.stock_board_industry_hist_em"
+        elif kind == "concept":
+            endpoint = ak.stock_board_concept_hist_em
+            period = "daily"
+            call_name = "ak.stock_board_concept_hist_em"
+        else:
+            return None
+
+        end = datetime.now().date()
+        start = end - timedelta(days=180)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        return _akshare_call_with_timeout(
+            endpoint,
+            symbol=name,
+            period=period,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            adjust="",
+            timeout=self._history_call_timeout,
+            call_name=call_name,
+        )
+
+    def get_sector_history(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch industry or concept daily history from its explicit endpoint."""
+        import akshare as ak
+
+        return self._get_sector_history_frame(ak, kind, name)
+
+    def get_index_history(self, code: str) -> Optional[pd.DataFrame]:
+        """Fetch A-share index history without treating its code as an equity."""
+        import akshare as ak
+
+        end = datetime.now().date()
+        start = end - timedelta(days=180)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        return _akshare_call_with_timeout(
+            ak.index_zh_a_hist,
+            symbol=code,
+            period="daily",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            timeout=self._history_call_timeout,
+            call_name="ak.index_zh_a_hist",
+        )
+
+    def get_sector_flow(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch industry flow and join same-source traded amount by date."""
+        if kind != "industry":
+            return None
+
+        import akshare as ak
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        flow = _akshare_call_with_timeout(
+            ak.stock_sector_fund_flow_hist,
+            symbol=name,
+            timeout=self._history_call_timeout,
+            call_name="ak.stock_sector_fund_flow_hist",
+        )
+        if flow is None or flow.empty:
+            return flow
+
+        history = self._get_sector_history_frame(ak, kind, name)
+        if history is None or history.empty:
+            return flow
+        if "日期" not in flow.columns or not {"日期", "成交额"}.issubset(
+            history.columns
+        ):
+            return flow
+
+        flow = flow.copy()
+        amount = history[["日期", "成交额"]].copy()
+        flow["日期"] = pd.to_datetime(flow["日期"], errors="coerce").dt.date
+        amount["日期"] = pd.to_datetime(amount["日期"], errors="coerce").dt.date
+        return flow.merge(amount, on="日期", how="left", validate="many_to_one")
+
+    def get_sector_constituents(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch current membership and attach the same-source terminal date."""
+        import akshare as ak
+
+        if kind == "industry":
+            endpoint = ak.stock_board_industry_cons_em
+            call_name = "ak.stock_board_industry_cons_em"
+        elif kind == "concept":
+            endpoint = ak.stock_board_concept_cons_em
+            call_name = "ak.stock_board_concept_cons_em"
+        else:
+            return None
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        constituents = _akshare_call_with_timeout(
+            endpoint,
+            symbol=name,
+            timeout=self._history_call_timeout,
+            call_name=call_name,
+        )
+        if constituents is None or constituents.empty:
+            return constituents
+
+        return constituents
 
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """获取人气股榜，按免配置热榜数据源降级。"""

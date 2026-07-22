@@ -16,6 +16,7 @@
 
 import logging
 import random
+import re
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
@@ -422,6 +423,37 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_sector_history(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native sector history when supported."""
+        return None
+
+    def get_sector_flow(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native sector capital flow when supported."""
+        return None
+
+    def get_sector_constituents(
+        self,
+        kind: str,
+        name: str,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native current sector membership when supported."""
+        return None
+
+    def get_index_history(
+        self,
+        code: str,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native index history when identity is explicit."""
+        return None
+
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """
         获取市场人气股榜。
@@ -630,6 +662,13 @@ class DataFetcherManager:
     _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 30.0
     _concept_rankings_cache_lock = RLock()
     _concept_rankings_cache: Dict[int, Tuple[float, List[Dict], List[Dict]]] = {}
+    _MARKET_RADAR_CAPABILITY_METHODS = {
+        "sector_history": "get_sector_history",
+        "sector_flow": "get_sector_flow",
+        "sector_constituents": "get_sector_constituents",
+        "benchmark_history": "get_index_history",
+    }
+    _MARKET_RADAR_ERROR_LIMIT = 256
 
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
@@ -3643,6 +3682,101 @@ class DataFetcherManager:
     ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
         """Return sector rankings with the complete ordered provider trace."""
         return self._get_sector_rankings_with_meta(n)
+
+    @classmethod
+    def _safe_market_radar_text(cls, value: Any) -> str:
+        text = " ".join(str(value or "").split())
+        patterns = (
+            r"(?i)((?:headers?|cookies?)\s*[:=]\s*)\{[^}]*\}",
+            r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+            r"(?i)((?:token|api[_-]?key|secret|cookie|password|sendkey)\s*[:=]\s*)[^\s,;]+",
+        )
+        for pattern in patterns:
+            text = re.sub(pattern, r"\1[REDACTED]", text)
+        return text[: cls._MARKET_RADAR_ERROR_LIMIT]
+
+    def get_market_radar_capability_with_meta(
+        self,
+        capability: str,
+        *,
+        kind: str,
+        name: str,
+        as_of: Optional[datetime] = None,
+    ) -> Tuple[Any | None, List[Dict[str, Any]], str]:
+        """Fetch one enrichment capability with an ordered, bounded trace."""
+        method_name = self._MARKET_RADAR_CAPABILITY_METHODS.get(capability)
+        if method_name is None:
+            raise ValueError(f"unsupported Market Radar capability: {capability}")
+        allowed_kinds = {"index"} if capability == "benchmark_history" else {
+            "industry",
+            "concept",
+        }
+        if kind not in allowed_kinds:
+            raise ValueError(f"unsupported sector kind: {kind}")
+
+        # Keep provider alias and unit knowledge at the normalization boundary.
+        from src.market_radar.capability_provider import (
+            validate_provider_capability_payload,
+        )
+
+        source_chain: List[Dict[str, Any]] = []
+        last_error = ""
+        for fetcher in self._get_fetchers_snapshot():
+            method = getattr(fetcher, method_name, None)
+            if not callable(method):
+                continue
+            started = time.monotonic()
+            provider = self._safe_market_radar_text(
+                getattr(fetcher, "name", type(fetcher).__name__)
+            )[:80]
+            try:
+                args = (name,) if capability == "benchmark_history" else (kind, name)
+                payload = self._call_fetcher_method(fetcher, method_name, *args)
+                duration_ms = int((time.monotonic() - started) * 1000)
+                is_valid, reason = validate_provider_capability_payload(
+                    capability,
+                    payload,
+                    as_of=as_of,
+                )
+                if is_valid:
+                    source_chain.append(
+                        {
+                            "provider": provider,
+                            "result": "ok",
+                            "duration_ms": duration_ms,
+                        }
+                    )
+                    return payload, source_chain, ""
+
+                result = "empty" if reason == "empty result" else "invalid"
+                last_error = self._safe_market_radar_text(
+                    f"{provider} returned {reason}"
+                )
+                source_chain.append(
+                    {
+                        "provider": provider,
+                        "result": result,
+                        "duration_ms": duration_ms,
+                        "error": last_error,
+                    }
+                )
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                safe_reason = self._safe_market_radar_text(error_reason)
+                last_error = self._safe_market_radar_text(
+                    f"{provider} ({error_type}) {safe_reason}"
+                )
+                source_chain.append(
+                    {
+                        "provider": provider,
+                        "result": "failed",
+                        "duration_ms": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                        "error": safe_reason,
+                    }
+                )
+        return None, source_chain, last_error
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
