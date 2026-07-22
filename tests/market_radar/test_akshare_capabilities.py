@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import sys
 from types import SimpleNamespace
 
@@ -49,14 +51,21 @@ def test_sector_history_dispatches_explicit_industry_and_concept_endpoints(
         ),
     )
 
-    industry_result = fetcher.get_sector_history("industry", "半导体")
-    concept_result = fetcher.get_sector_history("concept", "先进封装")
+    as_of = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
+    industry_result = fetcher.get_sector_history(
+        "industry", "半导体", as_of=as_of
+    )
+    concept_result = fetcher.get_sector_history(
+        "concept", "先进封装", as_of=as_of
+    )
 
     assert industry_result.iloc[-1]["收盘"] == 1.0
     assert concept_result.iloc[-1]["收盘"] == 3.0
     assert [item[0] for item in calls] == ["industry", "concept"]
     assert calls[0][1]["symbol"] == "半导体"
     assert calls[0][1]["period"] == "日k"
+    assert calls[0][1]["start_date"] == "20260123"
+    assert calls[0][1]["end_date"] == "20260722"
     assert calls[1][1]["symbol"] == "先进封装"
     assert calls[1][1]["period"] == "daily"
 
@@ -69,7 +78,10 @@ def test_sector_flow_merges_same_source_history_amount_and_rejects_concepts(
     def flow(**kwargs):
         calls.append(("flow", kwargs))
         return pd.DataFrame(
-            {"日期": ["2026-07-22"], "主力净流入-净额": [100.0]}
+            {
+                "日期": ["2025-01-02", "2026-07-22"],
+                "主力净流入-净额": [50.0, 100.0],
+            }
         )
 
     def history(**kwargs):
@@ -88,6 +100,7 @@ def test_sector_flow_merges_same_source_history_amount_and_rejects_concepts(
     concept = fetcher.get_sector_flow("concept", "先进封装")
 
     assert result.iloc[-1]["成交额"] == 500.0
+    assert result["日期"].tolist() == [pd.Timestamp("2026-07-22").date()]
     assert [item[0] for item in calls] == ["flow", "history"]
     assert concept is None
 
@@ -113,8 +126,13 @@ def test_sector_constituents_dispatch_by_kind_without_inventing_data_date(
         ),
     )
 
-    industry = fetcher.get_sector_constituents("industry", "半导体")
-    concept = fetcher.get_sector_constituents("concept", "先进封装")
+    as_of = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
+    industry = fetcher.get_sector_constituents(
+        "industry", "半导体", as_of=as_of
+    )
+    concept = fetcher.get_sector_constituents(
+        "concept", "先进封装", as_of=as_of
+    )
 
     assert "数据日期" not in industry.columns
     assert "数据日期" not in concept.columns

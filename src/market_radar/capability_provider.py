@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from data_provider.base import normalize_stock_code
+from data_provider.base import normalize_stock_code, sanitize_persisted_text
 from src.market_radar.capabilities import (
     BoardBar,
     BoardBarSeries,
@@ -85,15 +85,7 @@ class MarketRadarEnrichmentProvider(Protocol):
 
 
 def _bounded_text(value: Any) -> str:
-    text = " ".join(str(value or "").split())
-    patterns = (
-        r"(?i)((?:headers?|cookies?)\s*[:=]\s*)\{[^}]*\}",
-        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
-        r"(?i)((?:token|api[_-]?key|secret|cookie|password|sendkey)\s*[:=]\s*)[^\s,;]+",
-    )
-    for pattern in patterns:
-        text = re.sub(pattern, r"\1[REDACTED]", text)
-    return text[:_ERROR_LIMIT]
+    return sanitize_persisted_text(value, _ERROR_LIMIT)
 
 
 def _rows(payload: Any) -> list[dict[str, Any]]:
@@ -172,7 +164,10 @@ def _aware_datetime(value: Any) -> datetime:
     return parsed
 
 
-def _payload_membership_date(payload: Any, rows: list[dict[str, Any]]) -> date:
+def _payload_membership_date(
+    payload: Any,
+    rows: list[dict[str, Any]],
+) -> date | None:
     row_dates: list[date] = []
     for row in rows:
         for alias in _DATE_ALIASES:
@@ -184,7 +179,9 @@ def _payload_membership_date(payload: Any, rows: list[dict[str, Any]]) -> date:
             if alias in payload.attrs:
                 row_dates.append(_data_date(payload.attrs[alias]))
                 break
-    if not row_dates or len(set(row_dates)) != 1:
+    if not row_dates:
+        return None
+    if len(set(row_dates)) != 1:
         raise ValueError("membership requires one provider-reported data date")
     return row_dates[0]
 
@@ -257,24 +254,31 @@ def validate_provider_capability_payload(
     if isinstance(payload, list) and not payload:
         return False, "empty result"
     try:
-        if capability == "sector_history":
-            terminal = _normalize_bars(payload, "validation").bars[-1].data_date
-        elif capability == "sector_flow":
-            terminal = _normalize_flows(payload, "validation").flows[-1].data_date
-        elif capability == "sector_constituents":
-            terminal = _normalize_membership(payload).data_date
-        elif capability == "benchmark_history":
-            terminal = _normalize_bars(payload, "validation").bars[-1].data_date
-        else:
-            return False, "unsupported capability"
+        terminal = provider_capability_data_date(capability, payload)
         if as_of is not None:
             if as_of.tzinfo is None or as_of.utcoffset() is None:
                 raise ValueError("as_of must be timezone-aware")
-            if terminal > as_of.astimezone(_CN_TIMEZONE).date():
+            if (
+                terminal is not None
+                and terminal > as_of.astimezone(_CN_TIMEZONE).date()
+            ):
                 raise ValueError("provider terminal date is later than requested as_of")
     except Exception as exc:
         return False, _bounded_text(exc) or "invalid result"
     return True, ""
+
+
+def provider_capability_data_date(
+    capability: str,
+    payload: Any,
+) -> date | None:
+    if capability in {"sector_history", "benchmark_history"}:
+        return _normalize_bars(payload, "validation").bars[-1].data_date
+    if capability == "sector_flow":
+        return _normalize_flows(payload, "validation").flows[-1].data_date
+    if capability == "sector_constituents":
+        return _normalize_membership(payload).data_date
+    raise ValueError("unsupported capability")
 
 
 def _safe_trace(trace: Any) -> tuple[Mapping[str, Any], ...]:
@@ -283,7 +287,14 @@ def _safe_trace(trace: Any) -> tuple[Mapping[str, Any], ...]:
         if not isinstance(item, Mapping):
             continue
         entry: dict[str, Any] = {}
-        for key in ("provider", "result", "duration_ms", "code", "error"):
+        for key in (
+            "provider",
+            "result",
+            "duration_ms",
+            "code",
+            "selected",
+            "error",
+        ):
             if key not in item:
                 continue
             value = item[key]
@@ -299,6 +310,15 @@ def _safe_trace(trace: Any) -> tuple[Mapping[str, Any], ...]:
 def _source_from_trace(trace: Any, fallback: str) -> str:
     for item in reversed(tuple(trace or ())):
         if isinstance(item, Mapping) and item.get("result") == "ok":
+            source = _bounded_text(item.get("provider"))[:80]
+            if source:
+                return source
+    for item in reversed(tuple(trace or ())):
+        if (
+            isinstance(item, Mapping)
+            and item.get("result") in {"stale", "partial"}
+            and item.get("selected") is True
+        ):
             source = _bounded_text(item.get("provider"))[:80]
             if source:
                 return source
@@ -378,15 +398,20 @@ class ProviderCapabilityAdapter:
                 error="provider terminal date is later than requested as_of",
                 source=source,
             )
+        stale = terminal < self._market_date(as_of)
         return CapabilityResult[BoardBarSeries](
             capability=capability,
-            status="ok",
+            status="stale" if stale else "ok",
             data=series,
             source=source,
             observed_at=as_of,
             data_date=terminal,
             bar_status=self._bar_status(terminal, as_of),
-            freshness_seconds=0,
+            freshness_seconds=(
+                (self._market_date(as_of) - terminal).days * 86400
+                if stale
+                else 0
+            ),
             trace=_safe_trace(trace),
             error=None,
         )
@@ -491,15 +516,20 @@ class ProviderCapabilityAdapter:
                     error="provider terminal date is later than requested as_of",
                     source=source,
                 )
+            stale = terminal < self._market_date(as_of)
             return CapabilityResult[BoardFlowSeries](
                 capability="board_flow",
-                status="ok",
+                status="stale" if stale else "ok",
                 data=series,
                 source=source,
                 observed_at=as_of,
                 data_date=terminal,
                 bar_status=self._bar_status(terminal, as_of),
-                freshness_seconds=0,
+                freshness_seconds=(
+                    (self._market_date(as_of) - terminal).days * 86400
+                    if stale
+                    else 0
+                ),
                 trace=_safe_trace(trace),
                 error=None,
             )
@@ -533,6 +563,19 @@ class ProviderCapabilityAdapter:
                 )
             membership = _normalize_membership(payload)
             source = _source_from_trace(trace, source)
+            if membership.data_date is None:
+                return CapabilityResult[ConstituentMembership](
+                    capability="constituents",
+                    status="partial",
+                    data=membership,
+                    source=source,
+                    observed_at=as_of,
+                    data_date=None,
+                    bar_status=None,
+                    freshness_seconds=0,
+                    trace=_safe_trace(trace),
+                    error="unversioned_current_membership",
+                )
             if membership.data_date > self._market_date(as_of):
                 return self._unavailable(
                     "constituents",
@@ -541,15 +584,21 @@ class ProviderCapabilityAdapter:
                     error="provider data date is later than requested as_of",
                     source=source,
                 )
+            stale = membership.data_date < self._market_date(as_of)
             return CapabilityResult[ConstituentMembership](
                 capability="constituents",
-                status="ok",
+                status="stale" if stale else "ok",
                 data=membership,
                 source=source,
                 observed_at=as_of,
                 data_date=membership.data_date,
                 bar_status=self._bar_status(membership.data_date, as_of),
-                freshness_seconds=0,
+                freshness_seconds=(
+                    (self._market_date(as_of) - membership.data_date).days
+                    * 86400
+                    if stale
+                    else 0
+                ),
                 trace=_safe_trace(trace),
                 error=None,
             )

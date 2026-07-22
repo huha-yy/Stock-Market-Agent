@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -64,6 +65,7 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
+_CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 # User-Agent 池，用于随机轮换
@@ -2012,6 +2014,7 @@ class AkshareFetcher(BaseFetcher):
         ak: Any,
         kind: str,
         name: str,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame]:
         if kind == "industry":
             endpoint = ak.stock_board_industry_hist_em
@@ -2024,7 +2027,7 @@ class AkshareFetcher(BaseFetcher):
         else:
             return None
 
-        end = datetime.now().date()
+        end = self._market_radar_request_date(as_of)
         start = end - timedelta(days=180)
         self._set_random_user_agent()
         self._enforce_rate_limit()
@@ -2043,17 +2046,32 @@ class AkshareFetcher(BaseFetcher):
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame]:
         """Fetch industry or concept daily history from its explicit endpoint."""
         import akshare as ak
 
-        return self._get_sector_history_frame(ak, kind, name)
+        return self._get_sector_history_frame(ak, kind, name, as_of)
 
-    def get_index_history(self, code: str) -> Optional[pd.DataFrame]:
+    @staticmethod
+    def _market_radar_request_date(as_of: Optional[datetime]):
+        if as_of is None:
+            return datetime.now(_CN_MARKET_TIMEZONE).date()
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        return as_of.astimezone(_CN_MARKET_TIMEZONE).date()
+
+    def get_index_history(
+        self,
+        code: str,
+        *,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[pd.DataFrame]:
         """Fetch A-share index history without treating its code as an equity."""
         import akshare as ak
 
-        end = datetime.now().date()
+        end = self._market_radar_request_date(as_of)
         start = end - timedelta(days=180)
         self._set_random_user_agent()
         self._enforce_rate_limit()
@@ -2071,6 +2089,8 @@ class AkshareFetcher(BaseFetcher):
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame]:
         """Fetch industry flow and join same-source traded amount by date."""
         if kind != "industry":
@@ -2089,7 +2109,7 @@ class AkshareFetcher(BaseFetcher):
         if flow is None or flow.empty:
             return flow
 
-        history = self._get_sector_history_frame(ak, kind, name)
+        history = self._get_sector_history_frame(ak, kind, name, as_of)
         if history is None or history.empty:
             return flow
         if "日期" not in flow.columns or not {"日期", "成交额"}.issubset(
@@ -2101,14 +2121,16 @@ class AkshareFetcher(BaseFetcher):
         amount = history[["日期", "成交额"]].copy()
         flow["日期"] = pd.to_datetime(flow["日期"], errors="coerce").dt.date
         amount["日期"] = pd.to_datetime(amount["日期"], errors="coerce").dt.date
-        return flow.merge(amount, on="日期", how="left", validate="many_to_one")
+        return flow.merge(amount, on="日期", how="inner", validate="many_to_one")
 
     def get_sector_constituents(
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame]:
-        """Fetch current membership and attach the same-source terminal date."""
+        """Fetch current membership without synthesizing an observation date."""
         import akshare as ak
 
         if kind == "industry":

@@ -16,12 +16,13 @@
 
 import logging
 import random
-import re
+import inspect
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Optional, List, Tuple, Dict, Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
@@ -35,6 +36,25 @@ from .realtime_types import CircuitBreaker
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+_PERSISTED_TEXT_REDACTED = "[REDACTED]"
+_PERSISTED_SENSITIVE_MARKERS = (
+    "authorization",
+    "proxy-authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+    "token",
+    "secret",
+    "password",
+    "sendkey",
+    "credential",
+    "headers",
+    "cookies",
+)
 
 
 # === 标准化列名定义 ===
@@ -66,6 +86,15 @@ def summarize_exception(exc: Exception) -> Tuple[str, str]:
     error_type = type(root).__name__
     message = str(exc).strip() or str(root).strip() or error_type
     return error_type, " ".join(message.split())
+
+
+def sanitize_persisted_text(value: Any, limit: int = 256) -> str:
+    """Return bounded text that cannot persist credential-bearing details."""
+    text = " ".join(str(value or "").split())
+    lowered = text.casefold()
+    if any(marker in lowered for marker in _PERSISTED_SENSITIVE_MARKERS):
+        return _PERSISTED_TEXT_REDACTED
+    return text[: max(0, int(limit))]
 
 
 def normalize_stock_code(stock_code: str) -> str:
@@ -427,6 +456,8 @@ class BaseFetcher(ABC):
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native sector history when supported."""
         return None
@@ -435,6 +466,8 @@ class BaseFetcher(ABC):
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native sector capital flow when supported."""
         return None
@@ -443,6 +476,8 @@ class BaseFetcher(ABC):
         self,
         kind: str,
         name: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native current sector membership when supported."""
         return None
@@ -450,6 +485,8 @@ class BaseFetcher(ABC):
     def get_index_history(
         self,
         code: str,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
         """Return provider-native index history when identity is explicit."""
         return None
@@ -3685,15 +3722,40 @@ class DataFetcherManager:
 
     @classmethod
     def _safe_market_radar_text(cls, value: Any) -> str:
-        text = " ".join(str(value or "").split())
-        patterns = (
-            r"(?i)((?:headers?|cookies?)\s*[:=]\s*)\{[^}]*\}",
-            r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
-            r"(?i)((?:token|api[_-]?key|secret|cookie|password|sendkey)\s*[:=]\s*)[^\s,;]+",
+        return sanitize_persisted_text(value, cls._MARKET_RADAR_ERROR_LIMIT)
+
+    @staticmethod
+    def _implements_market_radar_capability(
+        fetcher: BaseFetcher,
+        method_name: str,
+    ) -> bool:
+        declared_method = getattr(type(fetcher), method_name, None)
+        base_method = getattr(BaseFetcher, method_name, None)
+        if declared_method is not None and declared_method is not base_method:
+            return True
+        return callable(getattr(fetcher, "__dict__", {}).get(method_name))
+
+    def _call_market_radar_capability(
+        self,
+        fetcher: BaseFetcher,
+        method_name: str,
+        args: tuple[Any, ...],
+        as_of: Optional[datetime],
+    ) -> Any:
+        method = getattr(fetcher, method_name)
+        parameters = inspect.signature(method).parameters.values()
+        accepts_as_of = any(
+            parameter.name == "as_of"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
         )
-        for pattern in patterns:
-            text = re.sub(pattern, r"\1[REDACTED]", text)
-        return text[: cls._MARKET_RADAR_ERROR_LIMIT]
+        kwargs = {"as_of": as_of} if accepts_as_of else {}
+        return self._call_fetcher_method(
+            fetcher,
+            method_name,
+            *args,
+            **kwargs,
+        )
 
     def get_market_radar_capability_with_meta(
         self,
@@ -3716,14 +3778,25 @@ class DataFetcherManager:
 
         # Keep provider alias and unit knowledge at the normalization boundary.
         from src.market_radar.capability_provider import (
+            provider_capability_data_date,
             validate_provider_capability_payload,
         )
 
         source_chain: List[Dict[str, Any]] = []
         last_error = ""
+        stale_candidate: Optional[Tuple[date, Any, int]] = None
+        partial_candidate: Optional[Tuple[Any, int]] = None
+        target_date = None
+        if as_of is not None:
+            if as_of.tzinfo is None or as_of.utcoffset() is None:
+                raise ValueError("as_of must be timezone-aware")
+            target_date = as_of.astimezone(ZoneInfo("Asia/Shanghai")).date()
         for fetcher in self._get_fetchers_snapshot():
             method = getattr(fetcher, method_name, None)
-            if not callable(method):
+            if not callable(method) or not self._implements_market_radar_capability(
+                fetcher,
+                method_name,
+            ):
                 continue
             started = time.monotonic()
             provider = self._safe_market_radar_text(
@@ -3731,7 +3804,12 @@ class DataFetcherManager:
             )[:80]
             try:
                 args = (name,) if capability == "benchmark_history" else (kind, name)
-                payload = self._call_fetcher_method(fetcher, method_name, *args)
+                payload = self._call_market_radar_capability(
+                    fetcher,
+                    method_name,
+                    args,
+                    as_of,
+                )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 is_valid, reason = validate_provider_capability_payload(
                     capability,
@@ -3739,6 +3817,39 @@ class DataFetcherManager:
                     as_of=as_of,
                 )
                 if is_valid:
+                    terminal = provider_capability_data_date(capability, payload)
+                    if target_date is not None and terminal is None:
+                        source_chain.append(
+                            {
+                                "provider": provider,
+                                "result": "partial",
+                                "duration_ms": duration_ms,
+                                "error": "unversioned_current_membership",
+                            }
+                        )
+                        if partial_candidate is None:
+                            partial_candidate = (payload, len(source_chain) - 1)
+                        continue
+                    if (
+                        target_date is not None
+                        and terminal is not None
+                        and terminal < target_date
+                    ):
+                        source_chain.append(
+                            {
+                                "provider": provider,
+                                "result": "stale",
+                                "duration_ms": duration_ms,
+                                "error": "provider terminal date precedes requested as_of",
+                            }
+                        )
+                        if stale_candidate is None or terminal > stale_candidate[0]:
+                            stale_candidate = (
+                                terminal,
+                                payload,
+                                len(source_chain) - 1,
+                            )
+                        continue
                     source_chain.append(
                         {
                             "provider": provider,
@@ -3776,6 +3887,14 @@ class DataFetcherManager:
                         "error": safe_reason,
                     }
                 )
+        if stale_candidate is not None:
+            _, payload, trace_index = stale_candidate
+            source_chain[trace_index]["selected"] = True
+            return payload, source_chain, ""
+        if partial_candidate is not None:
+            payload, trace_index = partial_candidate
+            source_chain[trace_index]["selected"] = True
+            return payload, source_chain, ""
         return None, source_chain, last_error
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:

@@ -56,7 +56,7 @@ class BoardFlowSeries(FrozenModel):
 
 class ConstituentMembership(FrozenModel):
     codes: tuple[str, ...] = Field(min_length=1)
-    data_date: date
+    data_date: date | None
 
     @field_validator("codes")
     @classmethod

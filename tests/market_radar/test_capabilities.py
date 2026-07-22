@@ -65,6 +65,9 @@ def test_normalized_payloads_are_ordered_immutable_and_timezone_aware() -> None:
     membership = ConstituentMembership(
         codes=["000001", "600519"], data_date=date(2026, 7, 22)
     )
+    unversioned_membership = ConstituentMembership(
+        codes=["000001", "600519"], data_date=None
+    )
     quotes = ConstituentQuoteBatch(
         quotes=[
             ConstituentQuote(
@@ -80,6 +83,7 @@ def test_normalized_payloads_are_ordered_immutable_and_timezone_aware() -> None:
     assert isinstance(bar_series.bars, tuple)
     assert isinstance(flow_series.flows, tuple)
     assert isinstance(membership.codes, tuple)
+    assert unversioned_membership.data_date is None
     assert isinstance(quotes.quotes, tuple)
     with pytest.raises(ValidationError, match="timezone-aware"):
         ConstituentQuote(

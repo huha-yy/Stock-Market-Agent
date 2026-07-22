@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import sys
 from types import SimpleNamespace
 
 import pandas as pd
 
+from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetcherManager
 from src.market_radar.capability_provider import ProviderCapabilityAdapter
 from src.market_radar.models import SectorDefinition
@@ -86,6 +88,8 @@ def test_manager_bounds_and_redacts_persisted_failure_text() -> None:
                 "token=top-secret cookie=session-secret Authorization=Bearer bearer-secret "
                 "headers={'Authorization': 'Basic basic-secret', "
                 "'X-Api-Key': 'quoted-key', 'Cookie': 'sid=quoted-cookie'} "
+                "wrapper=Headers({'Proxy-Authorization': 'proxy-secret', "
+                "'Set-Cookie': 'wrapped-cookie'}) "
                 + "x" * 1000
             )
 
@@ -106,6 +110,52 @@ def test_manager_bounds_and_redacts_persisted_failure_text() -> None:
     assert "basic-secret" not in combined
     assert "quoted-key" not in combined
     assert "quoted-cookie" not in combined
+    assert "proxy-secret" not in combined
+    assert "wrapped-cookie" not in combined
+
+    adapter_result = ProviderCapabilityAdapter(manager).fetch_board_history(
+        SECTOR, AS_OF
+    )
+    persisted = f"{adapter_result.error} {adapter_result.trace}"
+    assert "top-secret" not in persisted
+    assert "proxy-secret" not in persisted
+
+    class ExplodingManager:
+        def get_market_radar_capability_with_meta(self, capability, *, kind, name):
+            raise RuntimeError(
+                "outer(headers=Headers({'X-Api-Key': 'adapter-secret'}))"
+            )
+
+    result = ProviderCapabilityAdapter(ExplodingManager()).fetch_board_history(
+        SECTOR, AS_OF
+    )
+    assert "adapter-secret" not in (result.error or "")
+    assert len(result.error or "") <= 256
+
+
+def test_manager_skips_inherited_noop_capabilities_and_preserves_failure() -> None:
+    class FailingFetcher(_MinimalFetcher):
+        name = "FailingFetcher"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str, *, as_of=None):
+            raise RuntimeError("actionable upstream failure")
+
+    class UnsupportedFetcher(_MinimalFetcher):
+        name = "UnsupportedFetcher"
+        priority = 1
+
+    manager = DataFetcherManager(
+        fetchers=[FailingFetcher(), UnsupportedFetcher()]
+    )
+
+    data, trace, error = manager.get_market_radar_capability_with_meta(
+        "sector_history", kind="industry", name="半导体", as_of=AS_OF
+    )
+
+    assert data is None
+    assert [item["provider"] for item in trace] == ["FailingFetcher"]
+    assert "actionable upstream failure" in error
 
 
 def test_manager_falls_through_malformed_constituent_codes() -> None:
@@ -162,6 +212,73 @@ def test_manager_falls_through_future_terminal_date_for_requested_as_of() -> Non
     assert data.iloc[-1]["日期"] == "2026-07-22"
     assert [item["result"] for item in trace] == ["invalid", "ok"]
     assert error == ""
+
+
+def test_manager_prefers_exact_date_after_stale_candidate() -> None:
+    captured_as_of = []
+
+    class StaleFetcher:
+        name = "StaleFetcher"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str, *, as_of=None):
+            captured_as_of.append(as_of)
+            return pd.DataFrame(
+                {"日期": ["2026-07-21"], "收盘": [1.0], "成交额": [2.0]}
+            )
+
+    class ExactFetcher:
+        name = "ExactFetcher"
+        priority = 1
+
+        def get_sector_history(self, kind: str, name: str, *, as_of=None):
+            captured_as_of.append(as_of)
+            return pd.DataFrame(
+                {"日期": ["2026-07-22"], "收盘": [3.0], "成交额": [4.0]}
+            )
+
+    manager = DataFetcherManager(fetchers=[StaleFetcher(), ExactFetcher()])
+
+    data, trace, error = manager.get_market_radar_capability_with_meta(
+        "sector_history", kind="industry", name="半导体", as_of=AS_OF
+    )
+
+    assert data.iloc[-1]["收盘"] == 3.0
+    assert [item["result"] for item in trace] == ["stale", "ok"]
+    assert captured_as_of == [AS_OF, AS_OF]
+    assert error == ""
+
+
+def test_adapter_returns_newest_past_payload_as_stale_with_freshness() -> None:
+    class OlderFetcher:
+        name = "OlderFetcher"
+        priority = 0
+
+        def get_sector_history(self, kind: str, name: str, *, as_of=None):
+            return pd.DataFrame(
+                {"日期": ["2026-07-20"], "收盘": [1.0], "成交额": [2.0]}
+            )
+
+    class NewerFetcher:
+        name = "NewerFetcher"
+        priority = 1
+
+        def get_sector_history(self, kind: str, name: str, *, as_of=None):
+            return pd.DataFrame(
+                {"日期": ["2026-07-21"], "收盘": [3.0], "成交额": [4.0]}
+            )
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[OlderFetcher(), NewerFetcher()])
+    ).fetch_board_history(SECTOR, AS_OF)
+
+    assert result.status == "stale"
+    assert result.data is not None
+    assert result.data.bars[-1].close == 3.0
+    assert result.data_date == date(2026, 7, 21)
+    assert result.freshness_seconds > 0
+    assert [item["result"] for item in result.trace] == ["stale", "stale"]
+    assert result.trace[1]["selected"] is True
 
 
 class _CapabilityManager:
@@ -286,6 +403,46 @@ def test_flow_membership_and_quotes_normalize_without_native_aliases_leaking() -
     assert tuple(item.code for item in quotes.data.quotes) == ("000001",)
     assert quotes.data_date == date(2026, 7, 22)
     assert quotes.trace[0]["code"] == "000001"
+
+
+def test_akshare_unversioned_membership_remains_usable_as_partial(
+    monkeypatch,
+) -> None:
+    constituents = pd.DataFrame({"代码": ["000001", "600519"]})
+    fake_akshare = SimpleNamespace(
+        stock_board_industry_cons_em=lambda **kwargs: constituents
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher._akshare_call_with_timeout",
+        lambda func, *args, **kwargs: func(
+            *args,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"timeout", "call_name"}
+            },
+        ),
+    )
+    fetcher = AkshareFetcher.__new__(AkshareFetcher)
+    fetcher._history_call_timeout = 7
+    monkeypatch.setattr(fetcher, "_set_random_user_agent", lambda: None)
+    monkeypatch.setattr(fetcher, "_enforce_rate_limit", lambda: None)
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[fetcher])
+    ).fetch_constituents(SECTOR, AS_OF)
+
+    assert result.status == "partial"
+    assert result.data is not None
+    assert result.data.codes == ("000001", "600519")
+    assert result.data.data_date is None
+    assert result.data_date is None
+    assert result.error == "unversioned_current_membership"
+    assert any(
+        item.get("error") == "unversioned_current_membership"
+        for item in result.trace
+    )
 
 
 def test_benchmark_history_reuses_manager_daily_api_without_changing_identity() -> None:
