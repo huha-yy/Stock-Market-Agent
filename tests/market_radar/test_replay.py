@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import select
 
 from src.config import Config
 from src.market_radar.models import (
@@ -19,7 +20,11 @@ from src.market_radar.observation_builder import (
 from src.market_radar.ranking import RankingConfig, score_sectors
 from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.replay import MarketRadarReplayEngine, ReplayFrame
-from src.storage import DatabaseManager, RadarConstituentSetRecord
+from src.storage import (
+    DatabaseManager,
+    RadarConstituentObservationRecord,
+    RadarConstituentSetRecord,
+)
 
 
 START = datetime(2026, 7, 20, 7, 0, tzinfo=timezone.utc)
@@ -406,6 +411,37 @@ def test_repository_backed_replay_resolves_evidence_before_scoring(
     monkeypatch.setattr("src.market_radar.replay.score_sectors", score_spy)
 
     with pytest.raises(ValueError, match="missing referenced constituent set"):
+        MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
+            repository,
+            stored.run_key,
+        )
+
+    assert scoring_calls == 0
+
+
+def test_repository_backed_replay_rejects_corrupted_future_evidence(
+    repository,
+    monkeypatch,
+) -> None:
+    evidence, sector, stored = _persisted_replay_fixture()
+    repository.save_enriched_run([sector], [evidence], stored)
+    with repository.db.session_scope() as session:
+        row = session.execute(
+            select(RadarConstituentObservationRecord).where(
+                RadarConstituentObservationRecord.set_key == evidence.set_key
+            )
+        ).scalar_one()
+        row.observed_at = (stored.as_of + timedelta(minutes=1)).replace(tzinfo=None)
+    scoring_calls = 0
+
+    def score_spy(*_args, **_kwargs):
+        nonlocal scoring_calls
+        scoring_calls += 1
+        return []
+
+    monkeypatch.setattr("src.market_radar.replay.score_sectors", score_spy)
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
         MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
             repository,
             stored.run_key,

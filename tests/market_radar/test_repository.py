@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import delete, event, func, inspect, select
@@ -24,7 +26,7 @@ from src.market_radar.observation_builder import (
     ConstituentEvidence,
     canonical_constituent_set_key,
 )
-from src.market_radar.repository import MarketRadarRepository
+from src.market_radar.repository import ConstituentSetContent, MarketRadarRepository
 from src.storage import (
     DatabaseManager,
     RadarConstituentObservationRecord,
@@ -708,9 +710,11 @@ def test_enriched_run_reuses_content_and_reads_immutable_evidence(isolated_db) -
     first_id = repo.save_enriched_run(
         [_sector_definition()], [first], first_snapshot
     )
+    first_content = repo.get_constituent_set(first.set_key)
     later_id = repo.save_enriched_run(
         [_sector_definition()], [later], later_snapshot
     )
+    later_content = repo.get_constituent_set(first.set_key)
 
     with isolated_db.get_session() as session:
         assert session.scalar(
@@ -728,7 +732,19 @@ def test_enriched_run_reuses_content_and_reads_immutable_evidence(isolated_db) -
         assert stored_observed_at.tzinfo is None
     assert repo.get_run_by_key(first_snapshot.run_key) == first_snapshot
     assert repo.get_run_by_key("missing") is None
-    assert repo.get_constituent_set(first.set_key) == later
+    assert first_content == later_content
+    assert isinstance(first_content, ConstituentSetContent)
+    assert first_content.set_key == first.set_key
+    assert first_content.market == first.market
+    assert first_content.sector_id == first.sector_id
+    assert first_content.source == first.source
+    assert first_content.codes == first.codes
+    assert first_content.constituent_count == len(first.codes)
+    assert first_content.created_at.tzinfo is not None
+    assert not hasattr(first_content, "data_date")
+    assert not hasattr(first_content, "observed_at")
+    with pytest.raises(FrozenInstanceError):
+        first_content.codes = ()
     assert repo.get_constituent_set("sha256:missing") is None
     assert repo.get_constituent_evidence(
         first.market,
@@ -736,9 +752,39 @@ def test_enriched_run_reuses_content_and_reads_immutable_evidence(isolated_db) -
         first.data_date,
         first.source,
     ) == first
+    assert repo.get_constituent_evidence(
+        later.market,
+        later.sector_id,
+        later.data_date,
+        later.source,
+    ) == later
+    assert repo.list_constituent_evidence_for_set(first.set_key) == (first, later)
     assert repo.resolve_run_constituent_evidence(first_id) == (first,)
     assert repo.resolve_snapshot_constituent_evidence(later_snapshot) == (later,)
     assert later_id != first_id
+
+
+def test_constituent_set_lookup_does_not_require_an_observation(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    with isolated_db.session_scope() as session:
+        session.add(
+            RadarConstituentSetRecord(
+                set_key=evidence.set_key,
+                market=evidence.market,
+                sector_id=evidence.sector_id,
+                source=evidence.source,
+                codes_json=json.dumps(list(evidence.codes), sort_keys=True),
+                constituent_count=len(evidence.codes),
+            )
+        )
+
+    content = repo.get_constituent_set(evidence.set_key)
+
+    assert content is not None
+    assert content.codes == evidence.codes
+    assert content.constituent_count == len(evidence.codes)
+    assert repo.list_constituent_evidence_for_set(evidence.set_key) == ()
 
 
 def test_same_identity_and_set_is_idempotent_and_preserves_first_observed_at(
@@ -943,6 +989,84 @@ def test_enriched_run_revalidates_evidence_before_any_write(
         assert session.scalar(select(func.count(RadarRunRecord.id))) == 0
 
 
+def test_enriched_run_rejects_evidence_observed_after_snapshot(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence(observed_at=NOW + timedelta(minutes=1))
+    snapshot = _snapshot(
+        as_of=NOW,
+        sectors=(
+            _score(
+                observed_at=evidence.observed_at,
+                constituent_set_key=evidence.set_key,
+                evidence_date=evidence.data_date,
+                membership_source=evidence.source,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            snapshot,
+        )
+
+    with isolated_db.get_session() as session:
+        assert session.scalar(select(func.count(RadarRunRecord.id))) == 0
+
+
+def test_enriched_run_rejects_evidence_observed_after_sector_observation(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence(observed_at=NOW + timedelta(minutes=1))
+    snapshot = _snapshot(
+        as_of=NOW + timedelta(minutes=2),
+        sectors=(
+            _score(
+                observed_at=NOW,
+                constituent_set_key=evidence.set_key,
+                evidence_date=evidence.data_date,
+                membership_source=evidence.source,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="observed_at.*after sector observation"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            snapshot,
+        )
+
+
+def test_enriched_run_rejects_evidence_date_after_shanghai_snapshot_date(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    future_date = NOW.astimezone(ZoneInfo("Asia/Shanghai")).date() + timedelta(
+        days=1
+    )
+    evidence = _constituent_evidence(data_date=future_date)
+    snapshot = _snapshot(
+        as_of=NOW,
+        sectors=(
+            _score(
+                constituent_set_key=evidence.set_key,
+                evidence_date=evidence.data_date,
+                membership_source=evidence.source,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="data_date.*after snapshot"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            snapshot,
+        )
+
+
 def test_enriched_run_rejects_missing_and_orphan_evidence(isolated_db) -> None:
     repo = MarketRadarRepository(isolated_db)
     evidence = _constituent_evidence()
@@ -1141,4 +1265,26 @@ def test_resolving_a_run_rejects_a_missing_referenced_set(isolated_db) -> None:
         )
 
     with pytest.raises(ValueError, match="missing referenced constituent set"):
+        repo.resolve_run_constituent_evidence(run_id)
+
+
+def test_resolving_a_run_rejects_corrupted_future_evidence(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    run_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        _enriched_snapshot(evidence),
+    )
+    with isolated_db.session_scope() as session:
+        row = session.execute(
+            select(RadarConstituentObservationRecord).where(
+                RadarConstituentObservationRecord.set_key == evidence.set_key
+            )
+        ).scalar_one()
+        row.observed_at = (evidence.observed_at + timedelta(minutes=1)).replace(
+            tzinfo=None
+        )
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
         repo.resolve_run_constituent_evidence(run_id)

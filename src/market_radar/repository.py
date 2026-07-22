@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +41,20 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is not None and value.utcoffset() is not None:
         return value.astimezone(timezone.utc)
     return value.replace(tzinfo=timezone.utc)
+
+
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+@dataclass(frozen=True)
+class ConstituentSetContent:
+    set_key: str
+    market: str
+    sector_id: str
+    source: str
+    codes: tuple[str, ...]
+    constituent_count: int
+    created_at: datetime
 
 
 class MarketRadarRepository:
@@ -262,6 +278,7 @@ class MarketRadarRepository:
                 raise ValueError(
                     f"constituent evidence source mismatch for {sector.sector_id}"
                 )
+            cls._validate_point_in_time_evidence(item, snapshot, observation)
             referenced.add(set_key)
 
         orphaned = set(by_key) - referenced
@@ -276,12 +293,6 @@ class MarketRadarRepository:
     def _validate_constituent_evidence(item: ConstituentEvidence) -> None:
         if not isinstance(item, ConstituentEvidence):
             raise ValueError("constituent evidence must be ConstituentEvidence")
-        if item.market != "cn":
-            raise ValueError("constituent evidence market must be cn")
-        if not isinstance(item.sector_id, str) or not item.sector_id.strip():
-            raise ValueError("constituent evidence sector_id is required")
-        if not isinstance(item.source, str) or not item.source.strip():
-            raise ValueError("constituent evidence source is required")
         if type(item.data_date) is not date:
             raise ValueError("constituent evidence data_date must be a date")
         if (
@@ -290,27 +301,50 @@ class MarketRadarRepository:
             or item.observed_at.utcoffset() is None
         ):
             raise ValueError("constituent evidence observed_at must be timezone-aware")
-        if not isinstance(item.codes, tuple) or not item.codes:
+        MarketRadarRepository._validate_constituent_set_identity(
+            market=item.market,
+            sector_id=item.sector_id,
+            source=item.source,
+            codes=item.codes,
+            set_key=item.set_key,
+        )
+
+    @staticmethod
+    def _validate_constituent_set_identity(
+        *,
+        market: str,
+        sector_id: str,
+        source: str,
+        codes: tuple[str, ...],
+        set_key: str,
+    ) -> None:
+        if market != "cn":
+            raise ValueError("constituent evidence market must be cn")
+        if not isinstance(sector_id, str) or not sector_id.strip():
+            raise ValueError("constituent evidence sector_id is required")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("constituent evidence source is required")
+        if not isinstance(codes, tuple) or not codes:
             raise ValueError("constituent evidence codes must be a non-empty tuple")
-        if any(not isinstance(code, str) for code in item.codes):
+        if any(not isinstance(code, str) for code in codes):
             raise ValueError("constituent evidence codes must be strings")
         try:
             expected_key = canonical_constituent_set_key(
-                item.market,
-                item.sector_id,
-                item.source,
-                item.codes,
+                market,
+                sector_id,
+                source,
+                codes,
             )
             canonical_codes = tuple(
-                sorted(normalize_stock_code(code) for code in item.codes)
+                sorted(normalize_stock_code(code) for code in codes)
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"constituent evidence codes are not canonical: {exc}") from exc
-        if item.codes != canonical_codes:
+        if codes != canonical_codes:
             raise ValueError(
                 "constituent evidence codes must be sorted canonical codes"
             )
-        if item.set_key != expected_key:
+        if set_key != expected_key:
             raise ValueError("constituent evidence set_key does not match content")
 
     @staticmethod
@@ -347,6 +381,32 @@ class MarketRadarRepository:
                 f"constituent evidence source is required for {sector_id}"
             )
         return source
+
+    @staticmethod
+    def _validate_point_in_time_evidence(
+        evidence: ConstituentEvidence,
+        snapshot: RadarRunSnapshot,
+        observation: SectorObservation,
+    ) -> None:
+        evidence_observed_at = _aware(evidence.observed_at)
+        if evidence_observed_at > _aware(snapshot.as_of):
+            raise ValueError(
+                f"constituent evidence observed_at is after snapshot as_of for "
+                f"{observation.sector_id}"
+            )
+        if evidence_observed_at > _aware(observation.observed_at):
+            raise ValueError(
+                "constituent evidence observed_at is after sector observation "
+                f"for {observation.sector_id}"
+            )
+        snapshot_data_date = _aware(snapshot.as_of).astimezone(
+            _SHANGHAI_TIMEZONE
+        ).date()
+        if evidence.data_date > snapshot_data_date:
+            raise ValueError(
+                f"constituent evidence data_date is after snapshot date for "
+                f"{observation.sector_id}"
+            )
 
     @classmethod
     def _save_constituent_evidence_in_session(
@@ -580,26 +640,34 @@ class MarketRadarRepository:
     def get_constituent_set(
         self,
         set_key: str,
-    ) -> ConstituentEvidence | None:
+    ) -> ConstituentSetContent | None:
         with self.db.get_session() as session:
             set_row = session.get(RadarConstituentSetRecord, set_key)
             if set_row is None:
                 return None
-            observation_row = session.execute(
+            return self._constituent_set_content_from_row(set_row)
+
+    def list_constituent_evidence_for_set(
+        self,
+        set_key: str,
+    ) -> tuple[ConstituentEvidence, ...]:
+        with self.db.get_session() as session:
+            set_row = session.get(RadarConstituentSetRecord, set_key)
+            if set_row is None:
+                return ()
+            observation_rows = session.execute(
                 select(RadarConstituentObservationRecord)
                 .where(RadarConstituentObservationRecord.set_key == set_key)
                 .order_by(
-                    desc(RadarConstituentObservationRecord.data_date),
-                    desc(RadarConstituentObservationRecord.observed_at),
-                    desc(RadarConstituentObservationRecord.id),
+                    RadarConstituentObservationRecord.data_date,
+                    RadarConstituentObservationRecord.observed_at,
+                    RadarConstituentObservationRecord.id,
                 )
-                .limit(1)
-            ).scalar_one_or_none()
-            if observation_row is None:
-                raise ValueError(
-                    f"constituent set has no observation: {set_key}"
-                )
-            return self._evidence_from_rows(set_row, observation_row)
+            ).scalars().all()
+            return tuple(
+                self._evidence_from_rows(set_row, observation_row)
+                for observation_row in observation_rows
+            )
 
     def get_constituent_evidence(
         self,
@@ -712,7 +780,9 @@ class MarketRadarRepository:
                     f"missing referenced constituent observation for "
                     f"{sector.sector_id}: {set_key}"
                 )
-            resolved.append(cls._evidence_from_rows(set_row, observation_row))
+            evidence = cls._evidence_from_rows(set_row, observation_row)
+            cls._validate_point_in_time_evidence(evidence, snapshot, observation)
+            resolved.append(evidence)
         return tuple(resolved)
 
     @classmethod
@@ -721,6 +791,36 @@ class MarketRadarRepository:
         set_row: RadarConstituentSetRecord,
         observation_row: RadarConstituentObservationRecord,
     ) -> ConstituentEvidence:
+        content = cls._constituent_set_content_from_row(set_row)
+        if observation_row.set_key != content.set_key:
+            raise ValueError(
+                f"constituent observation set mismatch for {content.set_key}"
+            )
+        if (
+            observation_row.market != content.market
+            or observation_row.sector_id != content.sector_id
+            or observation_row.source != content.source
+        ):
+            raise ValueError(
+                f"constituent observation identity mismatch for {content.set_key}"
+            )
+        evidence = ConstituentEvidence(
+            market=content.market,
+            sector_id=content.sector_id,
+            source=content.source,
+            data_date=observation_row.data_date,
+            observed_at=_aware(observation_row.observed_at),
+            codes=content.codes,
+            set_key=content.set_key,
+        )
+        cls._validate_constituent_evidence(evidence)
+        return evidence
+
+    @classmethod
+    def _constituent_set_content_from_row(
+        cls,
+        set_row: RadarConstituentSetRecord,
+    ) -> ConstituentSetContent:
         try:
             decoded_codes = json.loads(set_row.codes_json)
         except (TypeError, ValueError) as exc:
@@ -731,33 +831,31 @@ class MarketRadarRepository:
             raise ValueError(
                 f"invalid constituent set JSON for {set_row.set_key}"
             )
-        if observation_row.set_key != set_row.set_key:
-            raise ValueError(
-                f"constituent observation set mismatch for {set_row.set_key}"
-            )
-        if (
-            observation_row.market != set_row.market
-            or observation_row.sector_id != set_row.sector_id
-            or observation_row.source != set_row.source
-        ):
-            raise ValueError(
-                f"constituent observation identity mismatch for {set_row.set_key}"
-            )
         if set_row.constituent_count != len(decoded_codes):
             raise ValueError(
                 f"constituent count mismatch for {set_row.set_key}"
             )
-        evidence = ConstituentEvidence(
+        codes = tuple(decoded_codes)
+        cls._validate_constituent_set_identity(
             market=set_row.market,
             sector_id=set_row.sector_id,
             source=set_row.source,
-            data_date=observation_row.data_date,
-            observed_at=_aware(observation_row.observed_at),
-            codes=tuple(decoded_codes),
+            codes=codes,
             set_key=set_row.set_key,
         )
-        cls._validate_constituent_evidence(evidence)
-        return evidence
+        if not isinstance(set_row.created_at, datetime):
+            raise ValueError(
+                f"constituent set created_at is invalid for {set_row.set_key}"
+            )
+        return ConstituentSetContent(
+            set_key=set_row.set_key,
+            market=set_row.market,
+            sector_id=set_row.sector_id,
+            source=set_row.source,
+            codes=codes,
+            constituent_count=set_row.constituent_count,
+            created_at=_aware(set_row.created_at),
+        )
 
     @classmethod
     def _snapshot_from_run_in_session(
