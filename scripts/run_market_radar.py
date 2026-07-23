@@ -18,6 +18,15 @@ from src.market_radar.candidates import CandidateSelector
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.capability_provider import ProviderCapabilityAdapter
 from src.market_radar.enrichment import MarketRadarEnricher
+from src.market_radar.etf_collection import (
+    EtfCollectionConfig,
+    MarketRadarEtfCollector,
+)
+from src.market_radar.policy_config import (
+    EtfPolicyConfig,
+    PositionPolicyConfig,
+    RegimeConfig,
+)
 from src.market_radar.providers import LegacyRankingProvider
 from src.market_radar.ranking import RankingConfig
 from src.market_radar.repository import MarketRadarRepository
@@ -42,12 +51,18 @@ def build_service(
     )
     manager = DataFetcherManager()
     enricher = None
+    etf_collector = None
     candidate_selector = None
     if not discovery_only:
+        adapter = ProviderCapabilityAdapter(manager)
         candidate_selector = CandidateSelector()
         enricher = MarketRadarEnricher(
-            provider=ProviderCapabilityAdapter(manager),
+            provider=adapter,
             config=enrichment_config,
+        )
+        etf_collector = MarketRadarEtfCollector(
+            provider=adapter,
+            config=EtfCollectionConfig(),
         )
     return MarketRadarService(
         universe_loader=UniverseLoader(
@@ -62,6 +77,10 @@ def build_service(
         enricher=enricher,
         candidate_selector=candidate_selector,
         enrichment_config=enrichment_config,
+        etf_collector=etf_collector,
+        etf_policy_config=EtfPolicyConfig(),
+        regime_config=RegimeConfig(),
+        position_policy_config=PositionPolicyConfig(),
     )
 
 

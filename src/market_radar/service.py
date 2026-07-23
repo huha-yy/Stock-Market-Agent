@@ -10,6 +10,7 @@ from data_provider.base import sanitize_persisted_text
 from src.market_radar.candidates import CandidateSelector, EnrichmentCandidate
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.enrichment import EnrichmentBatch
+from src.market_radar.etf_selection import select_etfs
 from src.market_radar.models import (
     RadarRunSnapshot,
     SectorDefinition,
@@ -17,7 +18,14 @@ from src.market_radar.models import (
     aggregate_run_quality,
 )
 from src.market_radar.providers import MarketRadarProvider
+from src.market_radar.policy_config import (
+    EtfPolicyConfig,
+    PositionPolicyConfig,
+    RegimeConfig,
+)
+from src.market_radar.position_policy import build_position_plan
 from src.market_radar.ranking import RankingConfig, score_sectors
+from src.market_radar.regime import assess_market_regime
 from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.universe import UniverseLoader
 
@@ -321,6 +329,10 @@ class MarketRadarService:
         enricher: Any | None = None,
         candidate_selector: CandidateSelector | None = None,
         enrichment_config: MarketRadarEnrichmentConfig | None = None,
+        etf_collector: Any | None = None,
+        etf_policy_config: EtfPolicyConfig | None = None,
+        regime_config: RegimeConfig | None = None,
+        position_policy_config: PositionPolicyConfig | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.universe_loader = universe_loader
@@ -342,6 +354,12 @@ class MarketRadarService:
                 else None
             )
             or MarketRadarEnrichmentConfig()
+        )
+        self.etf_collector = etf_collector
+        self.etf_policy_config = etf_policy_config or EtfPolicyConfig()
+        self.regime_config = regime_config or RegimeConfig()
+        self.position_policy_config = (
+            position_policy_config or PositionPolicyConfig()
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -420,9 +438,52 @@ class MarketRadarService:
 
         _validate_unique_observations(observations, "final")
         sectors = score_sectors(observations, self.ranking_config)
+        etf_observations = ()
+        etfs = ()
+        regime = None
+        position_plan = None
+        etf_trace: Sequence[Mapping[str, Any]] = ()
+        phase2b_enabled = not discovery_only and self.etf_collector is not None
+        if phase2b_enabled:
+            etf_batch = self.etf_collector.collect(
+                universe,
+                sectors,
+                snapshot_as_of,
+            )
+            if (
+                etf_batch.as_of.tzinfo is None
+                or etf_batch.as_of.utcoffset() is None
+            ):
+                raise ValueError("ETF collection as_of must be timezone-aware")
+            snapshot_as_of = max(
+                snapshot_as_of.astimezone(timezone.utc),
+                etf_batch.as_of.astimezone(timezone.utc),
+            )
+            etf_observations = tuple(etf_batch.observations)
+            if any(
+                item.observed_at.astimezone(timezone.utc) > snapshot_as_of
+                for item in etf_observations
+            ):
+                raise ValueError("ETF observation is after collection as_of")
+            etfs = select_etfs(etf_observations, self.etf_policy_config)
+            regime = assess_market_regime(
+                sectors,
+                self.regime_config,
+                snapshot_as_of,
+            )
+            position_plan = build_position_plan(
+                sectors,
+                etfs,
+                regime,
+                self.position_policy_config,
+            )
+            etf_trace = etf_batch.trace
         provider_trace = _sanitize_provider_trace(
             batch.trace,
-            enrichment.trace if enrichment is not None else (),
+            (
+                *(enrichment.trace if enrichment is not None else ()),
+                *etf_trace,
+            ),
         )
         snapshot = RadarRunSnapshot(
             run_key=(
@@ -439,6 +500,9 @@ class MarketRadarService:
             scoring_version=self.ranking_config.scoring_version,
             sectors=sectors,
             provider_trace=provider_trace,
+            etfs=etfs,
+            regime=regime,
+            position_plan=position_plan,
         )
         if persist:
             combined_universe = [
@@ -456,7 +520,7 @@ class MarketRadarService:
                     item.effective_from,
                 ),
             )
-            if enrichment is None:
+            if enrichment is None and not phase2b_enabled:
                 run_id = repository.save_run_with_universe(
                     sorted_universe,
                     snapshot,
@@ -464,8 +528,13 @@ class MarketRadarService:
             else:
                 run_id = repository.save_enriched_run(
                     sorted_universe,
-                    enrichment.constituent_evidence,
-                    snapshot,
+                    (
+                        enrichment.constituent_evidence
+                        if enrichment is not None
+                        else ()
+                    ),
+                    etf_observations=etf_observations,
+                    snapshot=snapshot,
                 )
             stored_snapshot = repository.get_run(run_id)
             if stored_snapshot is None:

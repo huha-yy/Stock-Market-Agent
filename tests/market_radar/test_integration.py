@@ -34,6 +34,8 @@ PUBLIC_API = {
     "EnrichmentBatch",
     "EnrichmentCandidate",
     "EtfComponentScores",
+    "EtfCollectionBatch",
+    "EtfCollectionConfig",
     "EtfDefinition",
     "EtfObservation",
     "EtfPolicyConfig",
@@ -44,6 +46,7 @@ PUBLIC_API = {
     "MarketRadarProvider",
     "MarketRadarEnricher",
     "MarketRadarEnrichmentConfig",
+    "MarketRadarEtfCollector",
     "MarketRadarReplayEngine",
     "MarketRadarRepository",
     "MarketRadarService",
@@ -64,7 +67,10 @@ PUBLIC_API = {
     "SectorScore",
     "SectorState",
     "UniverseLoader",
+    "assess_market_regime",
+    "build_position_plan",
     "score_sectors",
+    "select_etfs",
 }
 
 
