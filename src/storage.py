@@ -1211,7 +1211,7 @@ class RadarConstituentObservationRecord(Base):
     source = Column(String(128), nullable=False)
     set_key = Column(
         String(80),
-        ForeignKey("radar_constituent_sets.set_key"),
+        ForeignKey("radar_constituent_sets.set_key", ondelete="CASCADE"),
         nullable=False,
     )
 
@@ -1262,6 +1262,92 @@ class RadarSectorSnapshotRecord(Base):
     risk_reasons_json = Column(Text, nullable=False, default="[]")
     missing_fields_json = Column(Text, nullable=False, default="[]")
     observation_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarEtfObservationRecord(Base):
+    __tablename__ = "radar_etf_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "sector_id",
+            "code",
+            name="uix_radar_etf_observation_identity",
+        ),
+        Index("idx_radar_etf_observation_position", "run_id", "position"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sector_id = Column(String(160), nullable=False)
+    code = Column(String(64), nullable=False)
+    position = Column(Integer, nullable=False)
+    observation_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarEtfSelectionRecord(Base):
+    __tablename__ = "radar_etf_selections"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "sector_id",
+            "code",
+            name="uix_radar_etf_selection_identity",
+        ),
+        Index("idx_radar_etf_selection_position", "run_id", "position"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sector_id = Column(String(160), nullable=False)
+    code = Column(String(64), nullable=False)
+    position = Column(Integer, nullable=False)
+    selection_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarRegimeAssessmentRecord(Base):
+    __tablename__ = "radar_regime_assessments"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uix_radar_regime_assessment_run"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    assessment_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarPositionPlanRecord(Base):
+    __tablename__ = "radar_position_plans"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uix_radar_position_plan_run"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_json = Column(Text, nullable=False)
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
 
@@ -1825,6 +1911,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
             cursor = dbapi_connection.cursor()
             try:
+                cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.execute(f"PRAGMA busy_timeout={int(self._sqlite_busy_timeout_ms)}")
                 if self._sqlite_file_db and self._sqlite_wal_enabled:
                     cursor.execute("PRAGMA journal_mode=WAL")

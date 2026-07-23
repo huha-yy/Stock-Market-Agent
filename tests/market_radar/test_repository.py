@@ -17,7 +17,14 @@ from sqlalchemy.exc import IntegrityError
 from src.config import Config
 from src.market_radar.models import (
     EtfDefinition,
+    EtfComponentScores,
+    EtfObservation,
+    EtfSelection,
+    MarketRegimeAssessment,
+    PositionPlan,
+    PositionSuggestion,
     RadarRunSnapshot,
+    RegimeComponents,
     SectorDefinition,
     SectorObservation,
     SectorScore,
@@ -31,6 +38,10 @@ from src.storage import (
     DatabaseManager,
     RadarConstituentObservationRecord,
     RadarConstituentSetRecord,
+    RadarEtfObservationRecord,
+    RadarEtfSelectionRecord,
+    RadarPositionPlanRecord,
+    RadarRegimeAssessmentRecord,
     RadarRunRecord,
     RadarSectorSnapshotRecord,
     RadarUniverseRecord,
@@ -127,6 +138,113 @@ def _snapshot(
         sectors=sectors or (_score(observed_at=as_of),),
         provider_trace=[{"source": "fixture", "result": {"status": "ok"}}],
     )
+
+
+def _phase2b_evidence(
+    *,
+    current_price: float = 1.2,
+    selection_score: float = 80.0,
+    regime_score: float = 70.0,
+    total_position_max_pct: float = 60.0,
+) -> tuple[
+    tuple[EtfObservation, ...],
+    tuple[EtfSelection, ...],
+    MarketRegimeAssessment,
+    PositionPlan,
+]:
+    observation = EtfObservation(
+        sector_id="industry:semiconductor",
+        code="512480",
+        name="Semiconductor ETF",
+        observed_at=NOW,
+        data_date=None,
+        bar_status=None,
+        source="provider-fixture",
+        quality="partial",
+        freshness_seconds=30,
+        mapping_effective_from=date(2026, 1, 1),
+        current_price=current_price,
+        missing_fields=tuple(
+            field
+            for field in EtfObservation.tracked_metric_fields
+            if field != "current_price"
+        ),
+        raw_reference={"provider": "fixture"},
+    )
+    selection = EtfSelection(
+        sector_id=observation.sector_id,
+        code=observation.code,
+        name=observation.name,
+        status="best_supported",
+        eligible=True,
+        rank=1,
+        score=selection_score,
+        confidence=0.9,
+        components=EtfComponentScores(
+            liquidity=90.0,
+            trend=80.0,
+            tracking_quality=70.0,
+            cost=60.0,
+            size=50.0,
+        ),
+        effective_weights={"liquidity": 100.0},
+        reason_codes=("supported",),
+        observation=observation,
+    )
+    regime = MarketRegimeAssessment(
+        as_of=NOW,
+        score=regime_score,
+        regime="selective",
+        confidence=0.8,
+        coverage=0.9,
+        components=RegimeComponents(
+            benchmark_trend=75.0,
+            positive_sector_diffusion=70.0,
+            flow_diffusion=65.0,
+            liquidity_diffusion=60.0,
+            non_risk_sector_share=80.0,
+        ),
+        cohort_sector_ids=("industry:semiconductor",),
+    )
+    plan = PositionPlan(
+        as_of=NOW,
+        regime="selective",
+        total_position_min_pct=35.0,
+        total_position_max_pct=total_position_max_pct,
+        suggestions=(
+            PositionSuggestion(
+                sector_id=selection.sector_id,
+                sector_name="Semiconductor",
+                sector_rank=1,
+                etf_code=selection.code,
+                etf_status="best_supported",
+                sector_cap_pct=12.0,
+                etf_cap_pct=12.0,
+                joint_confidence=0.8,
+            ),
+        ),
+        correlation_coverage=1.0,
+        confidence=0.8,
+        reason_codes=("selective",),
+    )
+    return (observation,), (selection,), regime, plan
+
+
+def _phase2b_snapshot(
+    evidence: ConstituentEvidence,
+    *,
+    selection_score: float = 80.0,
+    regime_score: float = 70.0,
+    total_position_max_pct: float = 60.0,
+) -> tuple[RadarRunSnapshot, tuple[EtfObservation, ...]]:
+    observations, selections, regime, plan = _phase2b_evidence(
+        selection_score=selection_score,
+        regime_score=regime_score,
+        total_position_max_pct=total_position_max_pct,
+    )
+    data = _enriched_snapshot(evidence).model_dump(mode="json")
+    data.update(etfs=selections, regime=regime, position_plan=plan)
+    return RadarRunSnapshot.model_validate(data), observations
 
 
 def _constituent_evidence(
@@ -327,6 +445,243 @@ def test_tables_are_created(isolated_db) -> None:
         and tuple(item["referred_columns"]) == ("set_key",)
         for item in constituent_foreign_keys
     )
+
+
+def test_phase2b_tables_are_additive_and_cascade_with_run(isolated_db) -> None:
+    inspector = inspect(isolated_db._engine)
+    table_shapes = {
+        "radar_etf_observations": {
+            "run_id",
+            "sector_id",
+            "code",
+            "position",
+            "observation_json",
+        },
+        "radar_etf_selections": {
+            "run_id",
+            "sector_id",
+            "code",
+            "position",
+            "selection_json",
+        },
+        "radar_regime_assessments": {"run_id", "assessment_json"},
+        "radar_position_plans": {"run_id", "plan_json"},
+    }
+    assert set(table_shapes) <= set(inspector.get_table_names())
+
+    for table_name, expected_columns in table_shapes.items():
+        columns = {
+            item["name"]: item for item in inspector.get_columns(table_name)
+        }
+        assert expected_columns <= set(columns)
+        foreign_keys = inspector.get_foreign_keys(table_name)
+        assert any(
+            tuple(item["constrained_columns"]) == ("run_id",)
+            and item["referred_table"] == "radar_runs"
+            and tuple(item["referred_columns"]) == ("id",)
+            and item["options"].get("ondelete") == "CASCADE"
+            for item in foreign_keys
+        )
+
+    for table_name in ("radar_etf_observations", "radar_etf_selections"):
+        uniques = {
+            tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(table_name)
+        }
+        assert ("run_id", "sector_id", "code") in uniques
+        columns = {
+            item["name"]: item for item in inspector.get_columns(table_name)
+        }
+        assert columns["position"]["nullable"] is False
+
+    for table_name in ("radar_regime_assessments", "radar_position_plans"):
+        uniques = {
+            tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(table_name)
+        }
+        assert ("run_id",) in uniques
+
+
+def test_phase2b_evidence_round_trips_through_models_and_snapshot(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot, observations = _phase2b_snapshot(evidence)
+
+    run_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        etf_observations=observations,
+        snapshot=snapshot,
+    )
+
+    loaded = repo.load_phase2b_evidence(run_id)
+    assert loaded == (
+        observations,
+        snapshot.etfs,
+        snapshot.regime,
+        snapshot.position_plan,
+    )
+    assert all(isinstance(item, EtfObservation) for item in loaded[0])
+    assert all(isinstance(item, EtfSelection) for item in loaded[1])
+    assert isinstance(loaded[2], MarketRegimeAssessment)
+    assert isinstance(loaded[3], PositionPlan)
+    assert repo.get_run(run_id) == snapshot
+
+    with isolated_db.session_scope() as session:
+        selection_row = session.scalar(
+            select(RadarEtfSelectionRecord).where(
+                RadarEtfSelectionRecord.run_id == run_id
+            )
+        )
+        assert selection_row is not None
+        assert selection_row.position == 0
+
+
+def test_phase2b_rows_cascade_when_run_is_deleted(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot, observations = _phase2b_snapshot(evidence)
+    run_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        etf_observations=observations,
+        snapshot=snapshot,
+    )
+
+    with isolated_db.session_scope() as session:
+        session.execute(delete(RadarRunRecord).where(RadarRunRecord.id == run_id))
+
+    with isolated_db.get_session() as session:
+        for record_type in (
+            RadarSectorSnapshotRecord,
+            RadarEtfObservationRecord,
+            RadarEtfSelectionRecord,
+            RadarRegimeAssessmentRecord,
+            RadarPositionPlanRecord,
+        ):
+            assert session.scalar(select(func.count()).select_from(record_type)) == 0
+
+
+def test_phase2b_reads_legacy_run_without_policy_rows(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    legacy = _snapshot()
+
+    run_id = repo.save_run(legacy)
+
+    assert repo.load_phase2b_evidence(run_id) == ((), (), None, None)
+    assert repo.get_run(run_id) == legacy
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    [
+        "radar_etf_observations",
+        "radar_etf_selections",
+        "radar_regime_assessments",
+        "radar_position_plans",
+    ],
+)
+def test_phase2b_insert_failure_rolls_back_the_complete_enriched_run(
+    isolated_db,
+    table_name,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot, observations = _phase2b_snapshot(evidence)
+    with isolated_db._engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"""
+            CREATE TRIGGER reject_phase2b_insert
+            BEFORE INSERT ON {table_name}
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected phase2b insert');
+            END
+            """
+        )
+
+    with pytest.raises(IntegrityError, match="rejected phase2b insert"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            etf_observations=observations,
+            snapshot=snapshot,
+        )
+
+    record_types = (
+        RadarUniverseRecord,
+        RadarConstituentSetRecord,
+        RadarConstituentObservationRecord,
+        RadarRunRecord,
+        RadarSectorSnapshotRecord,
+        RadarEtfObservationRecord,
+        RadarEtfSelectionRecord,
+        RadarRegimeAssessmentRecord,
+        RadarPositionPlanRecord,
+    )
+    with isolated_db.get_session() as session:
+        for record_type in record_types:
+            assert session.scalar(select(func.count()).select_from(record_type)) == 0
+
+
+def test_phase2b_identical_retry_reuses_run_id(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot, observations = _phase2b_snapshot(evidence)
+
+    first_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        etf_observations=observations,
+        snapshot=snapshot,
+    )
+    second_id = repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        etf_observations=observations,
+        snapshot=snapshot,
+    )
+
+    assert first_id == second_id
+
+
+@pytest.mark.parametrize("changed_entity", ["observation", "selection", "regime", "plan"])
+def test_phase2b_retry_rejects_changed_semantics(
+    isolated_db,
+    changed_entity,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    evidence = _constituent_evidence()
+    snapshot, observations = _phase2b_snapshot(evidence)
+    repo.save_enriched_run(
+        [_sector_definition()],
+        [evidence],
+        etf_observations=observations,
+        snapshot=snapshot,
+    )
+
+    changed_snapshot = snapshot
+    changed_observations = observations
+    if changed_entity == "observation":
+        observation_data = observations[0].model_dump(mode="json")
+        observation_data["current_price"] = 1.3
+        changed_observations = (EtfObservation.model_validate(observation_data),)
+    elif changed_entity == "selection":
+        changed_snapshot, _ = _phase2b_snapshot(evidence, selection_score=81.0)
+    elif changed_entity == "regime":
+        changed_snapshot, _ = _phase2b_snapshot(evidence, regime_score=71.0)
+    else:
+        changed_snapshot, _ = _phase2b_snapshot(
+            evidence,
+            total_position_max_pct=61.0,
+        )
+
+    with pytest.raises(ValueError, match="semantic conflict"):
+        repo.save_enriched_run(
+            [_sector_definition()],
+            [evidence],
+            etf_observations=changed_observations,
+            snapshot=changed_snapshot,
+        )
 
 
 def test_existing_snapshot_table_gains_nullable_position_and_index(
@@ -1419,12 +1774,17 @@ def test_resolving_a_run_rejects_a_missing_referenced_set(isolated_db) -> None:
         [evidence],
         _enriched_snapshot(evidence),
     )
-    with isolated_db.session_scope() as session:
-        session.execute(
-            delete(RadarConstituentSetRecord).where(
-                RadarConstituentSetRecord.set_key == evidence.set_key
-            )
+    connection = isolated_db._engine.raw_connection()
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "DELETE FROM radar_constituent_sets WHERE set_key = ?",
+            (evidence.set_key,),
         )
+        connection.commit()
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.close()
 
     with pytest.raises(ValueError, match="missing referenced constituent set"):
         repo.resolve_run_constituent_evidence(run_id)
