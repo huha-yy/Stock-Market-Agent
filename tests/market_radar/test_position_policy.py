@@ -102,6 +102,7 @@ def selection(
     confidence: float = 0.9,
     returns: tuple[float, ...] = VECTOR_A,
     dates: tuple[date, ...] = DATES,
+    bar_status: str = "finalized",
 ) -> EtfSelection:
     observation = EtfObservation(
         sector_id=sector_id,
@@ -109,7 +110,7 @@ def selection(
         name=f"ETF {code}",
         observed_at=NOW,
         data_date=date(2026, 7, 23),
-        bar_status="finalized",
+        bar_status=bar_status,  # type: ignore[arg-type]
         source="fixture",
         quality="complete",
         freshness_seconds=30,
@@ -183,10 +184,30 @@ def test_candidates_are_filtered_ordered_and_prefer_best_supported() -> None:
     low_confidence = sector("industry:low", score=97.0, confidence=0.5999)
     selections = (
         selection(alpha.sector_id, "100002", status="candidate", rank=1, score=99.0),
-        selection(alpha.sector_id, "100001", status="best_supported", rank=2, score=1.0),
-        selection(delta.sector_id, "100003", status="candidate", rank=1),
+        selection(
+            alpha.sector_id,
+            "100001",
+            status="best_supported",
+            rank=2,
+            score=1.0,
+            returns=VECTOR_A,
+        ),
+        selection(
+            delta.sector_id,
+            "100003",
+            status="candidate",
+            rank=1,
+            returns=VECTOR_B,
+        ),
         selection(beta.sector_id, "100005", status="candidate", rank=2, score=99.0),
-        selection(beta.sector_id, "100004", status="candidate", rank=1, score=1.0),
+        selection(
+            beta.sector_id,
+            "100004",
+            status="candidate",
+            rank=1,
+            score=1.0,
+            returns=VECTOR_C,
+        ),
         selection(rejected.sector_id, "100006", status="rejected", rank=None, score=None),
         selection(neutral.sector_id, "100007"),
         selection(low_confidence.sector_id, "100008"),
@@ -275,6 +296,31 @@ def test_invalid_correlation_evidence_is_unknown(other: tuple[float, ...], reque
     assert plan.reason_codes == ("correlation_coverage_incomplete",)
 
 
+def test_provisional_correlation_evidence_is_unknown() -> None:
+    first = sector("industry:first")
+    second = sector("industry:second", score=79.0)
+
+    plan = build_position_plan(
+        (first, second),
+        (
+            selection(first.sector_id, "200011", returns=VECTOR_A),
+            selection(
+                second.sector_id,
+                "200012",
+                returns=_mix(VECTOR_A, VECTOR_B, 0.9),
+                bar_status="provisional",
+            ),
+        ),
+        regime(),
+        PositionPolicyConfig(),
+    )
+
+    assert plan.correlation_groups == ()
+    assert plan.correlation_coverage == 0.0
+    assert plan.confidence == 0.0
+    assert plan.reason_codes == ("correlation_coverage_incomplete",)
+
+
 def test_correlation_threshold_is_inclusive_and_below_threshold_is_not_grouped() -> None:
     assert correlation(VECTOR_A, _mix(VECTOR_A, VECTOR_B, 0.8)) >= 0.8
     assert correlation(VECTOR_A, _mix(VECTOR_A, VECTOR_B, 0.799)) < 0.8
@@ -323,11 +369,52 @@ def test_transitive_group_reduces_lowest_ranked_caps_first() -> None:
         PositionPolicyConfig(),
     )
 
-    assert plan.correlation_groups[0].etf_codes == ("300001", "300002", "300003")
-    assert [item.etf_cap_pct for item in plan.suggestions] == [15.0, 10.0, 0.0]
+    assert plan.correlation_groups[0].etf_codes == ("300002", "300003")
+    assert [item.etf_code for item in plan.suggestions] == ["300003", "300002"]
+    assert [item.etf_cap_pct for item in plan.suggestions] == [15.0, 10.0]
     assert plan.suggestions[1].invalidation_codes == ("correlation_cap_reached",)
-    assert plan.suggestions[2].invalidation_codes == ("correlation_cap_reached",)
     assert sum(item.etf_cap_pct for item in plan.suggestions) == 25.0
+    assert plan.correlation_coverage == 1.0
+    assert plan.confidence == 1.0
+
+
+def test_final_single_suggestion_rebinds_correlation_coverage_and_confidence() -> None:
+    first = sector("industry:first", score=90.0, confidence=1.0)
+    second = sector("industry:second", score=80.0, confidence=1.0)
+    third = sector("industry:third", score=70.0, confidence=1.0)
+    second_returns = _mix(VECTOR_A, VECTOR_B, 0.9)
+    third_returns = _mix(second_returns, VECTOR_C, 0.85)
+
+    plan = build_position_plan(
+        (first, second, third),
+        (
+            selection(first.sector_id, "300013", status="candidate", rank=1, confidence=1.0),
+            selection(
+                second.sector_id,
+                "300012",
+                status="candidate",
+                rank=2,
+                confidence=1.0,
+                returns=second_returns,
+            ),
+            selection(
+                third.sector_id,
+                "300011",
+                status="candidate",
+                rank=3,
+                confidence=0.4,
+                returns=third_returns,
+            ),
+        ),
+        regime(confidence=1.0),
+        PositionPolicyConfig(maximum_correlated_pct=15.0),
+    )
+
+    assert [item.etf_code for item in plan.suggestions] == ["300013"]
+    assert plan.correlation_groups == ()
+    assert plan.correlation_coverage == 1.0
+    assert plan.confidence == 1.0
+    assert plan.reason_codes == ()
 
 
 def test_correlation_reduction_uses_code_as_rank_tie_breaker() -> None:

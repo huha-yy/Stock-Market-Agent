@@ -87,6 +87,8 @@ def _validated_returns(
     observation = selection.observation
     dates = observation.daily_return_dates_60
     returns = observation.daily_returns_60
+    if observation.bar_status != "finalized":
+        return None
     if not isinstance(dates, tuple) or not isinstance(returns, tuple):
         return None
     if observation.finalized_session_count is None:
@@ -295,8 +297,22 @@ def build_position_plan(
         )
         for index, item in enumerate(candidates, start=1)
     )
-    components, correlation_coverage = _correlation_components(candidates, config)
-    suggestions = _reduce_correlation_caps(suggestions, candidates, components, config)
+    reduction_components, _ = _correlation_components(candidates, config)
+    suggestions = _reduce_correlation_caps(
+        suggestions, candidates, reduction_components, config
+    )
+    suggestions = tuple(
+        item
+        for item in suggestions
+        if item.sector_cap_pct > 0 and item.etf_cap_pct > 0
+    )
+    visible_codes = {item.etf_code for item in suggestions}
+    final_candidates = tuple(
+        item for item in candidates if item.selection.code in visible_codes
+    )
+    components, correlation_coverage = _correlation_components(
+        final_candidates, config
+    )
     groups = tuple(
         CorrelationGroup(
             etf_codes=component,
@@ -306,12 +322,17 @@ def build_position_plan(
     )
 
     base_confidence = (
-        min([regime.confidence, *(item.joint_confidence for item in candidates)])
-        if candidates
+        min(
+            [
+                regime.confidence,
+                *(item.joint_confidence for item in final_candidates),
+            ]
+        )
+        if final_candidates
         else regime.confidence
     )
     reason_codes: list[str] = []
-    if not candidates:
+    if not final_candidates:
         reason_codes.append("no_supported_sector_suggestions")
     if correlation_coverage < 1:
         reason_codes.append("correlation_coverage_incomplete")
