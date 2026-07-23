@@ -176,7 +176,17 @@ The sector snapshot references its constituent-set key. One atomic transaction w
 
 The curated ETF seed remains at `src/data/market_radar/a_share_etfs.yaml`. Persistence retains its effective-dated sector and ETF history, while an online run sends providers only mappings active on the current China market date.
 
-## Out Of Scope
+## Read-only API (Phase 2C)
+
+Phase 2C exposes the latest persisted A-share snapshot under the authenticated FastAPI v1 surface:
+
+- `GET /api/v1/market-radar/latest` returns the complete latest snapshot. A new installation with no persisted run returns HTTP 200 with `available=false` and `run=null`.
+- `GET /api/v1/market-radar/sectors` returns every sector in persisted rank order. With no run it returns HTTP 200 with an empty list and `available=false`.
+- `GET /api/v1/market-radar/sectors/{sector_id}` returns one canonical sector, its ETF alternatives, matching position suggestion, regime, and position plan from the same snapshot. It returns `market_radar_run_not_found` when no run exists and `market_radar_sector_not_found` when the identifier is absent.
+
+These routes always read market `cn` through `MarketRadarRepository`; they do not accept a market override, call a provider, start a scan, recompute policy, or write data. When `ADMIN_AUTH_ENABLED=true`, the existing administrator session cookie is required. Legacy persisted snapshots remain readable with an empty ETF list and null regime, position suggestion, and position plan.
+
+## Phase 2B Out Of Scope
 
 The exact Phase 2B exclusions are:
 
@@ -184,7 +194,7 @@ The exact Phase 2B exclusions are:
 - reconstructing old observations from current constituents;
 - catalyst/news/policy scoring;
 - lifecycle hysteresis, signals, state-transition alerts, scheduling, or notifications;
-- API, Web, Desktop, or report rendering;
+- write APIs, Web, Desktop, or report rendering;
 - outcomes and calibration;
 - Hong Kong data and A/H links;
 - LLM calls or narrative generation;
