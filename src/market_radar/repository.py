@@ -13,6 +13,10 @@ from sqlalchemy.exc import IntegrityError
 from data_provider.base import normalize_stock_code
 from src.market_radar.models import (
     EtfDefinition,
+    EtfObservation,
+    EtfSelection,
+    MarketRegimeAssessment,
+    PositionPlan,
     RadarRunSnapshot,
     SectorDefinition,
     SectorObservation,
@@ -26,6 +30,10 @@ from src.storage import (
     DatabaseManager,
     RadarConstituentObservationRecord,
     RadarConstituentSetRecord,
+    RadarEtfObservationRecord,
+    RadarEtfSelectionRecord,
+    RadarPositionPlanRecord,
+    RadarRegimeAssessmentRecord,
     RadarRunRecord,
     RadarSectorSnapshotRecord,
     RadarUniverseRecord,
@@ -189,10 +197,21 @@ class MarketRadarRepository:
         self,
         sectors: list[SectorDefinition],
         evidence: Sequence[ConstituentEvidence],
-        snapshot: RadarRunSnapshot,
+        etf_observations: Sequence[EtfObservation] | RadarRunSnapshot = (),
+        snapshot: RadarRunSnapshot | None = None,
     ) -> int:
+        if isinstance(etf_observations, RadarRunSnapshot):
+            if snapshot is not None:
+                raise TypeError("snapshot was provided twice")
+            snapshot = etf_observations
+            validated_etf_observations: tuple[EtfObservation, ...] = ()
+        else:
+            validated_etf_observations = tuple(etf_observations)
+        if snapshot is None:
+            raise TypeError("snapshot is required")
         self._validate_universe(sectors)
         self._validate_snapshot_traceability(snapshot)
+        self._validate_etf_observations(snapshot, validated_etf_observations)
         validated_evidence = self._validate_enriched_traceability(
             snapshot,
             evidence,
@@ -214,6 +233,12 @@ class MarketRadarRepository:
                     validated_evidence,
                     snapshot,
                 )
+                self._assert_run_semantically_equal_in_session(
+                    session,
+                    int(existing_id),
+                    snapshot,
+                    validated_etf_observations,
+                )
                 return int(existing_id)
             self._sync_universe_in_session(session, sectors)
             self._save_constituent_evidence_in_session(
@@ -225,7 +250,11 @@ class MarketRadarRepository:
                 validated_evidence,
                 snapshot,
             )
-            return self._save_run_in_session(session, snapshot)
+            return self._save_run_in_session(
+                session,
+                snapshot,
+                validated_etf_observations,
+            )
 
         return self._run_idempotent_write(
             f"save_market_radar_enriched_run[{snapshot.run_key}]",
@@ -579,10 +608,12 @@ class MarketRadarRepository:
                 f"{item.market}/{item.sector_id}/{item.data_date}/{item.source}"
             )
 
-    @staticmethod
+    @classmethod
     def _save_run_in_session(
+        cls,
         session: Any,
         snapshot: RadarRunSnapshot,
+        etf_observations: Sequence[EtfObservation] = (),
     ) -> int:
         existing_id = session.execute(
             select(RadarRunRecord.id).where(
@@ -628,7 +659,68 @@ class MarketRadarRepository:
                     observation_json=_dump(sector_data["observation"]),
                 )
             )
+        for position, observation in enumerate(etf_observations):
+            session.add(
+                RadarEtfObservationRecord(
+                    run_id=run.id,
+                    sector_id=observation.sector_id,
+                    code=observation.code,
+                    position=position,
+                    observation_json=_dump(
+                        observation.model_dump(mode="json")
+                    ),
+                )
+            )
+        for position, selection in enumerate(snapshot.etfs):
+            session.add(
+                RadarEtfSelectionRecord(
+                    run_id=run.id,
+                    sector_id=selection.sector_id,
+                    code=selection.code,
+                    position=position,
+                    selection_json=_dump(selection.model_dump(mode="json")),
+                )
+            )
+        if snapshot.regime is not None:
+            session.add(
+                RadarRegimeAssessmentRecord(
+                    run_id=run.id,
+                    assessment_json=_dump(
+                        snapshot.regime.model_dump(mode="json")
+                    ),
+                )
+            )
+        if snapshot.position_plan is not None:
+            session.add(
+                RadarPositionPlanRecord(
+                    run_id=run.id,
+                    plan_json=_dump(
+                        snapshot.position_plan.model_dump(mode="json")
+                    ),
+                )
+            )
         return int(run.id)
+
+    @classmethod
+    def _assert_run_semantically_equal_in_session(
+        cls,
+        session: Any,
+        run_id: int,
+        snapshot: RadarRunSnapshot,
+        etf_observations: tuple[EtfObservation, ...],
+    ) -> None:
+        run = session.get(RadarRunRecord, run_id)
+        if run is None:
+            raise ValueError(f"stored Market Radar run not found: {run_id}")
+        stored_snapshot = cls._snapshot_from_run_in_session(session, run)
+        stored_observations, _, _, _ = cls._phase2b_evidence_from_run_in_session(
+            session,
+            run_id,
+        )
+        if stored_snapshot != snapshot or stored_observations != etf_observations:
+            raise ValueError(
+                f"Market Radar run semantic conflict for run_key={snapshot.run_key}"
+            )
 
     @staticmethod
     def _validate_snapshot_traceability(snapshot: RadarRunSnapshot) -> None:
@@ -663,6 +755,24 @@ class MarketRadarRepository:
                         f"SectorScore observation {field_name} mismatch for "
                         f"{sector.sector_id}"
                     )
+
+    @staticmethod
+    def _validate_etf_observations(
+        snapshot: RadarRunSnapshot,
+        observations: tuple[EtfObservation, ...],
+    ) -> None:
+        identities: set[tuple[str, str]] = set()
+        for observation in observations:
+            if not isinstance(observation, EtfObservation):
+                raise ValueError("ETF observations must be EtfObservation models")
+            identity = (observation.sector_id, observation.code)
+            if identity in identities:
+                raise ValueError("duplicate ETF observation identity")
+            identities.add(identity)
+            if observation.market != snapshot.market:
+                raise ValueError("ETF observation market must match run market")
+            if _aware(observation.observed_at) != _aware(snapshot.as_of):
+                raise ValueError("ETF observation timestamp must match run as_of")
 
     def get_latest_run(
         self,
@@ -709,6 +819,20 @@ class MarketRadarRepository:
             if run is None:
                 return None
             return self._snapshot_from_run_in_session(session, run)
+
+    def load_phase2b_evidence(
+        self,
+        run_id: int,
+    ) -> tuple[
+        tuple[EtfObservation, ...],
+        tuple[EtfSelection, ...],
+        MarketRegimeAssessment | None,
+        PositionPlan | None,
+    ]:
+        with self.db.get_session() as session:
+            if session.get(RadarRunRecord, run_id) is None:
+                raise ValueError(f"stored Market Radar run not found: {run_id}")
+            return self._phase2b_evidence_from_run_in_session(session, run_id)
 
     def get_constituent_set(
         self,
@@ -937,6 +1061,9 @@ class MarketRadarRepository:
         run: RadarRunRecord,
     ) -> RadarRunSnapshot:
         sectors = cls._list_sector_snapshots_in_session(session, int(run.id))
+        _, selections, regime, position_plan = (
+            cls._phase2b_evidence_from_run_in_session(session, int(run.id))
+        )
         return RadarRunSnapshot(
             run_key=run.run_key,
             market=run.market,
@@ -946,7 +1073,69 @@ class MarketRadarRepository:
             scoring_version=run.scoring_version,
             sectors=sectors,
             provider_trace=json.loads(run.provider_trace_json or "[]"),
+            etfs=selections,
+            regime=regime,
+            position_plan=position_plan,
         )
+
+    @staticmethod
+    def _phase2b_evidence_from_run_in_session(
+        session: Any,
+        run_id: int,
+    ) -> tuple[
+        tuple[EtfObservation, ...],
+        tuple[EtfSelection, ...],
+        MarketRegimeAssessment | None,
+        PositionPlan | None,
+    ]:
+        observation_rows = session.execute(
+            select(RadarEtfObservationRecord)
+            .where(RadarEtfObservationRecord.run_id == run_id)
+            .order_by(
+                RadarEtfObservationRecord.position,
+                RadarEtfObservationRecord.id,
+            )
+        ).scalars().all()
+        selection_rows = session.execute(
+            select(RadarEtfSelectionRecord)
+            .where(RadarEtfSelectionRecord.run_id == run_id)
+            .order_by(
+                RadarEtfSelectionRecord.position,
+                RadarEtfSelectionRecord.id,
+            )
+        ).scalars().all()
+        regime_row = session.execute(
+            select(RadarRegimeAssessmentRecord).where(
+                RadarRegimeAssessmentRecord.run_id == run_id
+            )
+        ).scalar_one_or_none()
+        plan_row = session.execute(
+            select(RadarPositionPlanRecord).where(
+                RadarPositionPlanRecord.run_id == run_id
+            )
+        ).scalar_one_or_none()
+
+        observations = tuple(
+            EtfObservation.model_validate(json.loads(row.observation_json))
+            for row in observation_rows
+        )
+        selections = tuple(
+            EtfSelection.model_validate(json.loads(row.selection_json))
+            for row in selection_rows
+        )
+        regime = (
+            MarketRegimeAssessment.model_validate(
+                json.loads(regime_row.assessment_json)
+            )
+            if regime_row is not None
+            else None
+        )
+        position_plan = (
+            PositionPlan.model_validate(json.loads(plan_row.plan_json))
+            if plan_row is not None
+            else None
+        )
+        return observations, selections, regime, position_plan
 
     def list_sector_snapshots(self, run_id: int) -> list[SectorScore]:
         with self.db.get_session() as session:

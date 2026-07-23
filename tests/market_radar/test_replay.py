@@ -18,6 +18,9 @@ from src.market_radar.observation_builder import (
     canonical_constituent_set_key,
 )
 from src.market_radar.ranking import RankingConfig, score_sectors
+from src.market_radar.policy_config import PositionPolicyConfig, RegimeConfig
+from src.market_radar.position_policy import build_position_plan
+from src.market_radar.regime import assess_market_regime
 from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.replay import MarketRadarReplayEngine, ReplayFrame
 from src.storage import (
@@ -398,6 +401,37 @@ def test_repository_backed_replay_resolves_evidence_without_a_provider(
     assert replayed.sectors == stored.sectors
     assert repository.resolve_snapshot_constituent_evidence(stored) == (evidence,)
     assert provider_calls == []
+
+
+def test_phase2b_persisted_replay_recomputes_policy_without_provider(
+    repository,
+) -> None:
+    evidence, sector, stored = _persisted_replay_fixture()
+    regime = assess_market_regime(stored.sectors, RegimeConfig(), stored.as_of)
+    plan = build_position_plan(
+        stored.sectors,
+        (),
+        regime,
+        PositionPolicyConfig(),
+    )
+    payload = stored.model_dump(mode="json")
+    payload.update(regime=regime, position_plan=plan)
+    phase2b = RadarRunSnapshot.model_validate(payload)
+    repository.save_enriched_run(
+        [sector],
+        [evidence],
+        etf_observations=(),
+        snapshot=phase2b,
+    )
+
+    replayed = MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
+        repository,
+        phase2b.run_key,
+    )
+
+    assert replayed.etfs == phase2b.etfs
+    assert replayed.regime == phase2b.regime
+    assert replayed.position_plan == phase2b.position_plan
 
 
 def test_repository_backed_replay_resolves_evidence_before_scoring(

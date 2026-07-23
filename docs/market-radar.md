@@ -1,10 +1,10 @@
 # Market Radar
 
-Market Radar Phase 2A produces a deterministic, current A-share industry and concept snapshot. It first discovers the broad market, then enriches a bounded candidate set with multi-period price, capital-flow, benchmark, constituent breadth, and concentration evidence. It records provider provenance and does not call an LLM.
+Market Radar Phase 2B produces a deterministic, current A-share industry and concept snapshot. It preserves Phase 2A sector discovery, evidence, and `cn-v1` ranking, then adds bounded ETF collection, deterministic ETF selection, a market-regime assessment, and a generic cap-only position policy. It records provider provenance and does not call an LLM.
 
 ## Run
 
-Normal execution enables Phase 2A enrichment and prints JSON to standard output:
+Normal execution enables the Phase 2A enrichment and Phase 2B policy pipeline and prints JSON to standard output:
 
 ```bash
 python scripts/run_market_radar.py --market cn
@@ -30,7 +30,7 @@ Phase 2A works without new configuration. The following optional integer setting
 | `MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS=180` | 180 seconds | 10-900 | Monotonic deadline for the whole enrichment stage |
 | `MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY=6` | 6 | 1-16 | Maximum concurrent enrichment work |
 
-The formula thresholds remain code-owned and versioned; these settings are not exposed in Web settings because Phase 2A has no Web administration surface.
+The formula thresholds remain code-owned and versioned; these settings are not exposed in Web settings because Market Radar has no Web administration surface. Phase 2B adds no environment variables. ETF collection is fixed at 30 unique ETFs, a 90-second monotonic budget, and maximum concurrency of 6.
 
 AkShare currently implements board history, benchmark history, industry flow, and current industry/concept membership. Its current membership endpoints do not supply an authoritative observation date. Those codes may remain visible as partial provenance, but undated membership is excluded from dated breadth, concentration, constituent-set keys, and persisted constituent evidence; its date is never inferred from board history or constituent quotes. Concept flow has no equivalent capability and is explicitly `unavailable`.
 
@@ -45,11 +45,58 @@ The second stage uses bounded concurrency and a monotonic total deadline. It sto
 
 Concept sectors follow the same selection and normalized evidence contract as industry sectors. When a provider cannot map a concept to history, flow, membership, or quotes, the missing capability remains explicitly `unavailable` or the observation remains `partial`; it is never converted to a neutral zero.
 
+## Phase 2B JSON Contract
+
+Phase 2B appends three fields without changing existing sector JSON bytes: `etfs` is the ordered tuple of ETF alternatives, `regime` is the versioned market assessment, and `position_plan` is the generic cap-only policy. Discovery-only and legacy Phase 1/2A snapshots retain `etfs=[]`, `regime=null`, and `position_plan=null`.
+
+ETF evidence is collected only for mappings effective on the authoritative China market date. Sector score order, curated mapping order, and ETF code provide deterministic priority. Provider failure is isolated to that ETF; deadline expiry remains visible in trace output and never changes `snapshot.sectors`.
+
+### ETF Eligibility, Ranking, And Confidence
+
+`cn-etf-v1` evaluates no more than 30 ETFs. Each alternative has one of four statuses: `best_supported`, `candidate`, `rejected`, or `insufficient_data`. Hard-filter reason codes are ordered as follows:
+
+`inactive_mapping`, `not_active`, `insufficient_history`, `invalid_price`, `invalid_amount`, `low_liquidity`, `stale_quote`, `suspended`, `data_integrity_failure`, `spread_too_wide`, and `premium_discount_too_large`.
+
+Required-evidence gaps use `missing_data_date`, `missing_active`, `missing_finalized_session_count`, `missing_current_price`, `missing_current_traded_amount`, and `missing_average_traded_amount_20d`. Liquidity and trend gaps that prevent ranking add `missing_required_ranking_evidence`. A rejected ETF keeps every applicable hard reason; missing required evidence produces `insufficient_data`, never negative market evidence.
+
+The fixed gates are 60 finalized sessions, prior-20-session average traded amount of at least CNY 10,000,000, quote freshness no more than 2,700 seconds, spread no more than 50 bps when available, and absolute premium/discount no more than 2.0% when available. Zero current amount is valid only for an explicitly identified fresh auction/session state.
+
+Eligible alternatives are ranked within their sector using liquidity 35%, trend 25%, tracking quality 20%, cost 10%, and size 10%. Missing optional components stay absent and available weights are renormalized only for score comparability. Confidence is:
+
+```text
+ranking coverage * (0.8 + 0.2 * available safety checks / 3) * quality multiplier
+quality multiplier = complete: 1.0, partial: 0.85, stale/unavailable: 0.0
+```
+
+Only a first-ranked ETF with all five components plus spread, premium/discount, and suspension evidence can be `best_supported`; other scoreable alternatives remain `candidate`.
+
+### Market Regime
+
+`cn-regime-v1` uses the existing sector scores and canonical benchmark `000985`. A sector enters the cohort only when 20-session return, 5-session capital flow, 20-session turnover ratio, usable state, and non-stale critical price evidence are present. Fewer than 5 cohort sectors, coverage below 60%, or missing benchmark evidence produces `insufficient_data` with no numeric score.
+
+The five components are benchmark trend 30%, positive-sector diffusion 25%, flow diffusion 20%, liquidity diffusion 10%, and non-risk sector share 15%. Benchmark trend maps returns `>=5%`, `>=2%`, `>=0%`, `>-2%`, and `<=-2%` to 100, 75, 55, 35, and 0. Inclusive regime thresholds are `risk_on >=75`, `selective >=55`, `defensive >=35`, and `risk_off <35`. Confidence equals cohort coverage times mean cohort sector confidence. Excluded sectors, missing fields, and reasons such as `cohort_below_minimum`, `coverage_below_minimum`, and `benchmark_missing` remain explicit.
+
+### Generic Position Policy
+
+`cn-position-v1` emits model ranges, not personalized advice or executable allocation instructions:
+
+| Regime | Total-position range |
+| --- | ---: |
+| `risk_on` | 60%-80% |
+| `selective` | 35%-60% |
+| `defensive` | 10%-35% |
+| `risk_off` | 0%-15% |
+| `insufficient_data` | 0%-10% |
+
+At most three `leading` or `improving` sectors with confidence at least 0.60 and a supported ETF are suggested. For each suggestion, joint confidence is the minimum of sector, ETF, and regime confidence; the sector cap is `floor_to_0.1(15 * joint_confidence)` and the ETF cap cannot exceed 15% or its sector cap. There is no minimum allocation target.
+
+Correlation uses exactly 60 aligned finalized daily ETF returns. Correlation `>=0.80` creates deterministic transitive groups whose combined ETF cap is at most 25%. Unknown pairs do not imply independence: coverage is `known_pair_count / total_pair_count`, multiplies plan confidence, and adds `correlation_coverage_incomplete`. No retained suggestion adds `no_supported_sector_suggestions`. Suggestion invalidation codes are `sector_state_deteriorated`, `sector_confidence_below_threshold`, `etf_became_ineligible`, `critical_evidence_stale`, `market_regime_deteriorated`, and `correlation_cap_reached`.
+
 ## Current Snapshot And Replay
 
 All instants are timezone-aware and market dates use `Asia/Shanghai`. A live run first captures a start anchor for request validation, universe selection, discovery, and previous-snapshot lookup. Omitting `as_of` uses this captured start; when a caller supplies `as_of`, it must represent the exact same UTC instant as that start anchor. Caller-selected historical or future instants are rejected, including another instant on the same Asia/Shanghai date. Realtime quote acquisition may advance the final observation anchor to the latest accepted evidence acquisition time. The persisted snapshot and enriched observations use that final anchor, which is never earlier than any accepted evidence timestamp. The live service also rejects `trigger="replay"`.
 
-Replay is a separate persisted snapshot replay path. It reads the stored sector observations, reuses the deterministic scoring path, and makes zero live provider calls. Referenced constituent evidence remains resolvable for audit. There is no historical provider backfill, and current membership is never used to reconstruct an old observation.
+Replay is a separate persisted snapshot replay path. It reads stored sector and ETF observations, reuses the same deterministic sector, ETF, regime, and position functions, and makes zero live provider calls and zero current-universe reads. Referenced constituent evidence remains resolvable for audit. Recomputed Phase 2B outputs must semantically equal stored outputs; a mismatch or future observation is a corruption error. Legacy runs follow the unchanged sector-only path. There is no historical provider backfill, and current membership is never used to reconstruct an old observation.
 
 The provider-returned `data_date` is authoritative. Price, benchmark, flow, membership, and constituent quote evidence combined into a field must be point-in-time compatible. Intraday evidence is marked `provisional`; completed same-date evidence is `finalized`.
 
@@ -125,22 +172,20 @@ A stale critical board price makes the enriched observation `stale`; no usable b
 
 With `--persist`, only provider-dated constituent membership that exactly matches the terminal board session is stored as immutable, content-addressed evidence. Its key is SHA-256 over market, sector ID, source, and the sorted canonical constituent codes. Identical content reuses the same row; conflicting content for the same sector, source, and observation date is rejected rather than overwritten or backdated. Undated current membership remains observation-only and cannot produce a constituent-set reference.
 
-The sector snapshot references its constituent-set key. One atomic transaction writes the effective-dated universe, constituent sets and observations, radar run, and sector snapshots; any validation or storage conflict rolls back the whole run. Existing Phase 1 records remain readable.
+The sector snapshot references its constituent-set key. One atomic transaction writes the effective-dated universe, constituent sets and observations, radar run, sector snapshots, ETF observations and selections, the regime assessment, and the position plan; any validation or storage conflict rolls back the whole run. Same-key retries must be semantically identical, while changed ETF or policy evidence is rejected rather than overwritten. Repository reads reconstruct all JSON through immutable Pydantic models. Existing Phase 1/2A records remain readable with empty Phase 2B fields.
 
 The curated ETF seed remains at `src/data/market_radar/a_share_etfs.yaml`. Persistence retains its effective-dated sector and ETF history, while an online run sends providers only mappings active on the current China market date.
 
 ## Out Of Scope
 
-The exact Phase 2A exclusions are:
+The exact Phase 2B exclusions are:
 
 - historical provider backfill;
 - reconstructing old observations from current constituents;
 - catalyst/news/policy scoring;
-- ETF candidate filters or ranking;
-- market regime and position ranges;
-- lifecycle hysteresis or state-transition alerts;
-- scheduler integration;
-- API, Web, Desktop, notifications, or reports;
+- lifecycle hysteresis, signals, state-transition alerts, scheduling, or notifications;
+- API, Web, Desktop, or report rendering;
 - outcomes and calibration;
 - Hong Kong data and A/H links;
-- LLM calls or narrative generation.
+- LLM calls or narrative generation;
+- order execution, broker integration, account holdings, suitability, leverage, or margin.

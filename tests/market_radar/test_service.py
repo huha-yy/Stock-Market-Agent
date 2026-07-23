@@ -10,6 +10,7 @@ from src.config import Config
 from src.market_radar.candidates import EnrichmentCandidate
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.enrichment import EnrichmentBatch
+from src.market_radar.etf_collection import EtfCollectionBatch
 from src.market_radar.models import (
     EtfDefinition,
     RadarRunSnapshot,
@@ -174,8 +175,11 @@ class FakeRepository:
         self,
         sectors: list[SectorDefinition],
         evidence: tuple[object, ...],
-        snapshot: RadarRunSnapshot,
+        etf_observations=(),
+        snapshot: RadarRunSnapshot | None = None,
     ) -> int:
+        if isinstance(etf_observations, RadarRunSnapshot):
+            snapshot = etf_observations
         if self.events is not None:
             self.events.append("persist")
         if self.error is not None:
@@ -232,6 +236,7 @@ def _service(
     enricher: RecordingEnricher | None = None,
     candidate_selector: RecordingSelector | None = None,
     enrichment_config: MarketRadarEnrichmentConfig | None = None,
+    etf_collector=None,
     clock=lambda: NOW,
 ) -> MarketRadarService:
     return MarketRadarService(
@@ -242,8 +247,52 @@ def _service(
         enricher=enricher,
         candidate_selector=candidate_selector,
         enrichment_config=enrichment_config,
+        etf_collector=etf_collector,
         clock=clock,
     )
+
+
+def test_phase2b_policy_runs_after_sector_scoring_and_persists_once(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    class Collector:
+        def collect(self, universe, sectors, as_of):
+            events.append("collect_etfs")
+            return EtfCollectionBatch((), (), as_of)
+
+    actual_score = service_module.score_sectors
+    actual_select = service_module.select_etfs
+    actual_regime = service_module.assess_market_regime
+    actual_position = service_module.build_position_plan
+
+    def record(name, function):
+        def wrapped(*args, **kwargs):
+            events.append(name)
+            return function(*args, **kwargs)
+        return wrapped
+
+    monkeypatch.setattr(service_module, "score_sectors", record("score_sectors", actual_score))
+    monkeypatch.setattr(service_module, "select_etfs", record("select_etfs", actual_select))
+    monkeypatch.setattr(service_module, "assess_market_regime", record("assess_regime", actual_regime))
+    monkeypatch.setattr(service_module, "build_position_plan", record("build_position_plan", actual_position))
+    repository = FakeRepository(events=events)
+
+    snapshot = _service(
+        universe=FakeUniverse(events=events),
+        provider=FakeProvider(events=events),
+        repository=repository,
+        etf_collector=Collector(),
+    ).run()
+
+    assert events == [
+        "load", "fetch", "score_sectors", "collect_etfs", "select_etfs",
+        "assess_regime", "build_position_plan", "persist", "get",
+    ]
+    assert snapshot.etfs == ()
+    assert snapshot.regime is not None
+    assert snapshot.position_plan is not None
 
 
 def _previous_snapshot(as_of: datetime) -> RadarRunSnapshot:

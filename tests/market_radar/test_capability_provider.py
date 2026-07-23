@@ -7,13 +7,17 @@ from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetcherManager
 from data_provider.realtime_types import RealtimeSource, UnifiedRealtimeQuote
-from src.market_radar.capability_provider import ProviderCapabilityAdapter
+from src.market_radar.capability_provider import (
+    ProviderCapabilityAdapter,
+    provider_capability_data_date,
+)
 from src.market_radar.enrichment import RunScopedCapabilityCircuit
-from src.market_radar.models import SectorDefinition
+from src.market_radar.models import EtfDefinition, SectorDefinition
 
 
 AS_OF = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
@@ -21,6 +25,12 @@ SECTOR = SectorDefinition(
     sector_id="industry:semiconductor",
     kind="industry",
     name="半导体",
+    effective_from=date(2026, 1, 1),
+)
+ETF = EtfDefinition(
+    code="510300",
+    name="沪深300ETF",
+    sector_id=SECTOR.sector_id,
     effective_from=date(2026, 1, 1),
 )
 
@@ -39,6 +49,226 @@ def test_base_fetcher_market_radar_capabilities_are_optional() -> None:
     assert fetcher.get_sector_history("industry", "半导体") is None
     assert fetcher.get_sector_flow("industry", "半导体") is None
     assert fetcher.get_sector_constituents("industry", "半导体") is None
+    assert fetcher.get_market_radar_etf("510300") is None
+
+
+def test_etf_manager_routes_single_code_and_adapter_normalizes_snapshot() -> None:
+    calls = []
+
+    class EtfFetcher:
+        name = "EtfFixture"
+        priority = 0
+
+        def get_market_radar_etf(self, code: str, **kwargs):
+            calls.append((code, kwargs))
+            return {
+                "code": code,
+                "bars": [
+                    {"日期": "2026-07-21", "收盘": 4.0, "成交额": 100.0},
+                    {"日期": "2026-07-22", "收盘": 4.1, "成交额": 120.0},
+                ],
+                "报价时间": "2026-07-22T15:00:00+08:00",
+                "最新价": 4.12,
+                "当前成交额": 150.0,
+                "active": True,
+                "suspended": False,
+            }
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[EtfFetcher()]), clock=lambda: AS_OF
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "ok"
+    assert result.data is not None
+    assert result.data.code == ETF.code
+    assert result.data.current_price == 4.12
+    assert result.data.current_traded_amount == 150.0
+    assert result.data.quoted_at == datetime.fromisoformat("2026-07-22T15:00:00+08:00")
+    assert result.data_date == date(2026, 7, 22)
+    assert provider_capability_data_date(
+        "etf_snapshot",
+        {
+            "code": "510300",
+            "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+        },
+    ) == date(2026, 7, 22)
+    assert calls[0][0] == "510300"
+
+
+def test_etf_adapter_rejects_identity_mismatch_missing_quote_time_and_future_rows() -> None:
+    def result(payload):
+        return ProviderCapabilityAdapter(
+            _CapabilityManager(payload), clock=lambda: AS_OF
+        ).fetch_etf(ETF, AS_OF)
+
+    wrong_code = result(
+        {
+            "code": "510500",
+            "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+        }
+    )
+    missing_time = result(
+        {
+            "code": "510300",
+            "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+            "current_price": 4.1,
+        }
+    )
+    future = result(
+        {
+            "code": "510300",
+            "bars": [{"date": "2026-07-23", "close": 4.1, "amount": 1.0}],
+        }
+    )
+
+    assert wrong_code.status == "unavailable"
+    assert missing_time.status == "unavailable"
+    assert future.status == "unavailable"
+
+
+def test_etf_adapter_rejects_non_finite_optional_facts() -> None:
+    result = ProviderCapabilityAdapter(
+        _CapabilityManager(
+            {
+                "code": "510300",
+                "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+                "tracking_error_pct": float("nan"),
+            }
+        ),
+        clock=lambda: AS_OF,
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "unavailable"
+    assert result.data is None
+
+
+@pytest.mark.parametrize("bad_date", [20260722, 20260722.0, "07/22/2026", "bad-date"])
+def test_etf_manager_rejects_numeric_or_ambiguous_dates_before_fallback(
+    bad_date,
+) -> None:
+    valid = {
+        "code": "510300",
+        "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+    }
+
+    class BadDateFetcher:
+        name = "BadDate"
+        priority = 0
+
+        def get_market_radar_etf(self, code: str):
+            return {
+                "code": code,
+                "bars": [{"date": bad_date, "close": 4.0, "amount": 1.0}],
+            }
+
+    class WorkingFetcher:
+        name = "Working"
+        priority = 1
+
+        def get_market_radar_etf(self, code: str):
+            return valid
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[BadDateFetcher(), WorkingFetcher()]),
+        clock=lambda: AS_OF,
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "ok"
+    assert result.data_date == date(2026, 7, 22)
+    assert [item["result"] for item in result.trace] == ["invalid", "ok"]
+
+
+@pytest.mark.parametrize(
+    "valid_date",
+    [
+        date(2026, 7, 22),
+        datetime(2026, 7, 22, 15, 0),
+        pd.Timestamp("2026-07-22"),
+        "2026-07-22",
+        "20260722",
+    ],
+)
+def test_etf_provider_date_accepts_only_explicit_valid_shapes(valid_date) -> None:
+    assert provider_capability_data_date(
+        "etf_snapshot",
+        {
+            "code": "510300",
+            "bars": [{"date": valid_date, "close": 4.1, "amount": 1.0}],
+        },
+    ) == date(2026, 7, 22)
+
+
+@pytest.mark.parametrize("unit_field", ["当前成交额(万元)", "成交额(万元)"])
+def test_etf_manager_rejects_unsupported_current_amount_unit_and_falls_back(
+    unit_field,
+) -> None:
+    class WrongUnitFetcher:
+        name = "WrongUnit"
+        priority = 0
+
+        def get_market_radar_etf(self, code: str):
+            return {
+                "code": code,
+                "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+                "quoted_at": "2026-07-22T15:00:00+08:00",
+                "current_traded_amount": None,
+                unit_field: 2.0,
+            }
+
+    class CnyFetcher:
+        name = "Cny"
+        priority = 1
+
+        def get_market_radar_etf(self, code: str):
+            return {
+                "code": code,
+                "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+                "quoted_at": "2026-07-22T15:00:00+08:00",
+                "成交额(元)": 20_000.0,
+            }
+
+    result = ProviderCapabilityAdapter(
+        DataFetcherManager(fetchers=[WrongUnitFetcher(), CnyFetcher()]),
+        clock=lambda: AS_OF,
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "ok"
+    assert result.data is not None
+    assert result.data.current_traded_amount == 20_000.0
+    assert [item["result"] for item in result.trace] == ["invalid", "ok"]
+
+
+def test_etf_payload_allows_genuinely_absent_optional_current_amount() -> None:
+    result = ProviderCapabilityAdapter(
+        _CapabilityManager(
+            {
+                "code": "510300",
+                "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+            }
+        ),
+        clock=lambda: AS_OF,
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "ok"
+    assert result.data is not None
+    assert result.data.current_traded_amount is None
+
+
+@pytest.mark.parametrize("fact", [{"active": True}, {"suspended": False}])
+def test_etf_provider_rejects_untimestamped_lifecycle_facts(fact) -> None:
+    result = ProviderCapabilityAdapter(
+        _CapabilityManager(
+            {
+                "code": "510300",
+                "bars": [{"date": "2026-07-22", "close": 4.1, "amount": 1.0}],
+                **fact,
+            }
+        ),
+        clock=lambda: AS_OF,
+    ).fetch_etf(ETF, AS_OF)
+
+    assert result.status == "unavailable"
+    assert result.data is None
 
 
 def test_manager_continues_after_empty_wrong_date_and_non_finite_payloads() -> None:

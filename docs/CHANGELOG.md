@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] Market Radar Phase 2B 新增可追溯的 ETF 筛选、市场状态评估、通用模型仓位区间及原子持久化回放。
 - [修复] 修复 Market Radar 在运行开始后取得的有效实时报价被误判为未来数据的问题，并确保最终快照时间不早于已接受证据的获取时间。
 - [新功能] 新增 A 股 Market Radar 第一阶段基础能力，包括板块/ETF 契约、可追溯数据质量、确定性评分、快照持久化、离线回放基础与手动 CLI；暂不包含 Web、API、调度、告警、仓位策略和港股。
 - [修复] 修复 Market Radar 生效日期历史被后续同步覆盖、发现板块使用 UTC 日期、价量背离缺失被误判为否，以及回放 stale 质量降级为 partial 的契约问题。
