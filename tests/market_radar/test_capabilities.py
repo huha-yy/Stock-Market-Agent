@@ -178,6 +178,20 @@ def test_etf_capability_data_is_ordered_immutable_and_preserves_optional_facts()
             ],
             "current_price": float("nan"),
         },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": 1.0}
+            ],
+            "active": True,
+        },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": 1.0}
+            ],
+            "suspended": False,
+        },
     ],
 )
 def test_etf_capability_data_rejects_malformed_or_non_finite_evidence(payload) -> None:

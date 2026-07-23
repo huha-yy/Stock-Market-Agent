@@ -1404,6 +1404,7 @@ class AkshareFetcher(BaseFetcher):
         *,
         deadline_monotonic: Optional[float] = None,
         monotonic: Callable[[], float] = time.monotonic,
+        record_realtime_health: bool = False,
     ) -> pd.DataFrame:
         """Return the shared ETF spot snapshot through the existing cache."""
         import akshare as ak
@@ -1419,6 +1420,7 @@ class AkshareFetcher(BaseFetcher):
 
         last_error: Optional[Exception] = None
         df = None
+        exhausted = False
         for attempt in range(1, 3):
             try:
                 self._market_radar_call_timeout(deadline_monotonic, monotonic)
@@ -1439,7 +1441,11 @@ class AkshareFetcher(BaseFetcher):
             except Exception as exc:
                 last_error = exc
                 if attempt == 2:
-                    raise
+                    if deadline_monotonic is not None:
+                        raise
+                    exhausted = True
+                    df = pd.DataFrame()
+                    break
                 delay = min(2**attempt, 5)
                 if deadline_monotonic is not None:
                     remaining = deadline_monotonic - monotonic()
@@ -1448,6 +1454,12 @@ class AkshareFetcher(BaseFetcher):
                 time.sleep(delay)
         if df is None:
             raise RuntimeError("ETF spot API returned no result") from last_error
+        if record_realtime_health:
+            circuit_breaker = get_realtime_circuit_breaker()
+            if exhausted:
+                circuit_breaker.record_failure("akshare_etf", str(last_error))
+            else:
+                circuit_breaker.record_success("akshare_etf")
         _etf_realtime_cache["data"] = df
         _etf_realtime_cache["timestamp"] = current_time
         return df
@@ -1469,8 +1481,7 @@ class AkshareFetcher(BaseFetcher):
         source_key = "akshare_etf"
         
         try:
-            df = self._get_etf_spot_frame()
-            circuit_breaker.record_success(source_key)
+            df = self._get_etf_spot_frame(record_realtime_health=True)
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")

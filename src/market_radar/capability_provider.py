@@ -37,14 +37,19 @@ _CURRENT_PRICE_ALIASES = ("current_price", "price", "最新价", "现价")
 _PREVIOUS_CLOSE_ALIASES = ("previous_close", "pre_close", "昨收", "昨收价")
 _QUOTE_TIME_ALIASES = ("quoted_at", "provider_timestamp", "quote_time", "报价时间")
 _ETF_BARS_ALIASES = ("bars", "history")
-_ETF_CURRENT_AMOUNT_ALIASES = (
-    "current_traded_amount",
-    "current_amount",
-    "当前成交额",
-    "成交额",
-    "成交额(元)",
-    "成交额（元）",
-)
+_ETF_CURRENT_AMOUNT_FACTORS = {
+    "current_traded_amount": 1.0,
+    "current_amount": 1.0,
+    "current_traded_amount_cny": 1.0,
+    "current_amount_cny": 1.0,
+    "amount": 1.0,
+    "当前成交额": 1.0,
+    "当前成交额(元)": 1.0,
+    "当前成交额（元）": 1.0,
+    "成交额": 1.0,
+    "成交额(元)": 1.0,
+    "成交额（元）": 1.0,
+}
 _AMOUNT_FACTORS = {
     "traded_amount": 1.0,
     "amount": 1.0,
@@ -208,6 +213,31 @@ def _data_date(value: Any) -> date:
     return parsed.date()
 
 
+def _etf_data_date(value: Any) -> date:
+    """Parse ETF provider dates without pandas' numeric/ambiguous coercions."""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        raise ValueError("ETF data date is invalid")
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            raise ValueError("ETF data date is invalid")
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("ETF data date is invalid")
+    text = value.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return date.fromisoformat(text)
+        if re.fullmatch(r"\d{8}", text):
+            return datetime.strptime(text, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError("ETF data date is invalid") from exc
+    raise ValueError("ETF data date is invalid")
+
+
 def _aware_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         parsed = value
@@ -326,6 +356,26 @@ def _optional_bool(
     return value
 
 
+def _optional_etf_current_amount(payload: Mapping[str, Any]) -> float | None:
+    unsupported = tuple(
+        column
+        for column in payload
+        if (
+            "成交额" in str(column) or "amount" in str(column).lower()
+        )
+        and column not in _ETF_CURRENT_AMOUNT_FACTORS
+    )
+    if unsupported:
+        raise ValueError("unknown unit for current traded amount")
+    for column, factor in _ETF_CURRENT_AMOUNT_FACTORS.items():
+        if column in payload:
+            value = payload[column]
+            if value is None:
+                return None
+            return _finite_number(value, "current traded amount") * factor
+    return None
+
+
 def _normalize_etf(
     payload: Any, expected_code: str | None = None
 ) -> EtfCapabilityData:
@@ -337,7 +387,7 @@ def _normalize_etf(
     raw_bars = _mapping_value(payload, _ETF_BARS_ALIASES)
     bars = tuple(
         EtfBar(
-            data_date=_data_date(_value(row, _DATE_ALIASES)),
+            data_date=_etf_data_date(_value(row, _DATE_ALIASES)),
             close=_finite_number(_value(row, _CLOSE_ALIASES), "close"),
             traded_amount=_scaled_value(row, _AMOUNT_FACTORS, "traded amount"),
         )
@@ -356,9 +406,7 @@ def _normalize_etf(
         current_price=_optional_number(
             payload, _CURRENT_PRICE_ALIASES, "current price"
         ),
-        current_traded_amount=_optional_number(
-            payload, _ETF_CURRENT_AMOUNT_ALIASES, "current traded amount"
-        ),
+        current_traded_amount=_optional_etf_current_amount(payload),
         active=_optional_bool(payload, ("active",), "active"),
         suspended=_optional_bool(payload, ("suspended",), "suspended"),
         bid_price=_optional_number(payload, ("bid_price", "bid"), "bid price"),

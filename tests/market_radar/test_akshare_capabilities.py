@@ -318,6 +318,46 @@ def test_etf_snapshot_omits_unverifiable_current_quote(monkeypatch, spot) -> Non
     assert result["current_traded_amount"] is None
 
 
+def test_etf_realtime_outage_uses_negative_cache_until_ttl_expires(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def failing_spot():
+        calls.append(True)
+        raise RuntimeError("spot unavailable")
+
+    cache = {"data": None, "timestamp": 0, "ttl": 1200}
+    times = iter((100.0, 101.0, 1301.0))
+    monkeypatch.setattr(akshare_module, "_etf_realtime_cache", cache)
+    monkeypatch.setattr(akshare_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(akshare_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        akshare_module,
+        "get_realtime_circuit_breaker",
+        lambda: SimpleNamespace(
+            record_success=lambda key: None,
+            record_failure=lambda key, error: None,
+        ),
+    )
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(fund_etf_spot_em=failing_spot),
+    )
+
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert len(calls) == 2
+    assert isinstance(cache["data"], pd.DataFrame)
+    assert cache["data"].empty
+    assert cache["timestamp"] == 100.0
+    assert cache["ttl"] == 1200
+
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert len(calls) == 4
+    assert cache["timestamp"] == 1301.0
+
+
 @pytest.mark.parametrize(
     "invoke",
     [

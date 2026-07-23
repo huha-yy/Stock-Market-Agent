@@ -134,6 +134,8 @@ class EtfCapabilityData(FrozenModel):
         quote_fields = (
             self.current_price,
             self.current_traded_amount,
+            self.active,
+            self.suspended,
             self.bid_price,
             self.ask_price,
             self.nav,
