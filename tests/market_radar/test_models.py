@@ -68,13 +68,16 @@ ETF_TRACKED_METRICS = (
 
 
 def complete_etf_observation(
-    *, code: str = "512480", **overrides: object
+    *,
+    code: str = "512480",
+    sector_id: str = "industry:semiconductor",
+    **overrides: object,
 ) -> EtfObservation:
     dates = tuple(date(2026, 4, day) for day in range(1, 31)) + tuple(
         date(2026, 5, day) for day in range(1, 31)
     )
     values: dict[str, object] = {
-        "sector_id": "industry:semiconductor",
+        "sector_id": sector_id,
         "code": code,
         "name": "Semiconductor ETF",
         "observed_at": NOW,
@@ -107,9 +110,11 @@ def complete_etf_observation(
     return EtfObservation(**values)
 
 
-def complete_etf_selection(*, code: str = "512480") -> EtfSelection:
+def complete_etf_selection(
+    *, code: str = "512480", sector_id: str = "industry:semiconductor"
+) -> EtfSelection:
     return EtfSelection(
-        sector_id="industry:semiconductor",
+        sector_id=sector_id,
         code=code,
         name="Semiconductor ETF",
         status="best_supported",
@@ -131,7 +136,7 @@ def complete_etf_selection(*, code: str = "512480") -> EtfSelection:
             "cost": 10.0,
             "size": 10.0,
         },
-        observation=complete_etf_observation(code=code),
+        observation=complete_etf_observation(code=code, sector_id=sector_id),
     )
 
 
@@ -559,6 +564,24 @@ def test_phase_2b_contracts_reject_invalid_evidence_and_plan_relationships() -> 
             total_position_max_pct=60.0,
             correlation_coverage=1.0,
             confidence=0.8,
+        )
+
+
+def test_run_snapshot_rejects_duplicate_etf_codes_across_sectors() -> None:
+    semiconductor = complete_etf_selection()
+    technology = complete_etf_selection(sector_id="concept:technology")
+
+    with pytest.raises(ValidationError, match="duplicate ETF code"):
+        RadarRunSnapshot(
+            run_key="cn:20260721T060000Z:manual",
+            market="cn",
+            trigger="manual",
+            as_of=NOW,
+            quality="partial",
+            scoring_version="cn-v1",
+            sectors=(),
+            provider_trace=(),
+            etfs=(semiconductor, technology),
         )
 
 

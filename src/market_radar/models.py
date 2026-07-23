@@ -484,6 +484,9 @@ class RadarRunSnapshot(FrozenModel):
         etf_ids = [(selection.sector_id, selection.code) for selection in self.etfs]
         if len(etf_ids) != len(set(etf_ids)):
             raise ValueError("duplicate ETF identity in run snapshot")
+        etf_codes = [selection.code for selection in self.etfs]
+        if len(etf_codes) != len(set(etf_codes)):
+            raise ValueError("duplicate ETF code in run snapshot")
         if any(selection.observation.observed_at != self.as_of for selection in self.etfs):
             raise ValueError("ETF observation timestamps must match run as_of")
         best_supported_sectors = [
