@@ -40,9 +40,9 @@ def _benchmark_score(benchmark_return: float) -> float:
     if benchmark_return >= 2.0:
         return 75.0
     if benchmark_return >= 0.0:
-        return 50.0
+        return 55.0
     if benchmark_return > -2.0:
-        return 25.0
+        return 35.0
     return 0.0
 
 
@@ -140,7 +140,7 @@ def _assessment(
         score=score,
         regime=regime,
         confidence=confidence,
-        coverage=coverage,
+        coverage=round(coverage, 4),
         components=components,
         cohort_sector_ids=tuple(item.score.sector_id for item in cohort),
         excluded_sector_reasons=dict(sorted(excluded.items())),
@@ -174,7 +174,7 @@ def assess_market_regime(
             continue
         cohort.append(_CohortSector(score=score, observation=observation))
 
-    coverage = round(len(cohort) / len(sectors), 4) if sectors else 0.0
+    coverage = len(cohort) / len(sectors) if sectors else 0.0
     reasons: list[str] = []
     if len(cohort) < config.minimum_sector_count:
         reasons.append("cohort_below_minimum")

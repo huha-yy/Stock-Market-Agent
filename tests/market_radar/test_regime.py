@@ -138,6 +138,19 @@ def test_exact_minimum_coverage_proceeds() -> None:
     assert len(assessment.cohort_sector_ids) == 6
 
 
+def test_raw_coverage_below_minimum_does_not_pass_after_rounding() -> None:
+    eligible = scores(10_000)
+    excluded = scores(6_667, prefix="excluded", state="insufficient_data")
+
+    assessment = assess_market_regime([*eligible, *excluded], RegimeConfig(), NOW)
+
+    assert 10_000 / 16_667 < 0.6
+    assert assessment.coverage == 0.6
+    assert assessment.regime == "insufficient_data"
+    assert assessment.score is None
+    assert "coverage_below_minimum" in assessment.reasons
+
+
 def test_exact_minimum_cohort_count_proceeds() -> None:
     assessment = assess_market_regime(scores(5), RegimeConfig(), NOW)
 
@@ -218,8 +231,8 @@ def test_conflicting_canonical_benchmark_evidence_is_rejected(
     [
         (5.0, 100.0),
         (2.0, 75.0),
-        (0.0, 50.0),
-        (-0.0001, 25.0),
+        (0.0, 55.0),
+        (-0.0001, 35.0),
         (-2.0, 0.0),
     ],
 )
