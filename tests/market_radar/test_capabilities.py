@@ -12,6 +12,8 @@ from src.market_radar.capabilities import (
     ConstituentMembership,
     ConstituentQuote,
     ConstituentQuoteBatch,
+    EtfBar,
+    EtfCapabilityData,
     MarketRadarEnrichmentConfig,
 )
 
@@ -110,6 +112,77 @@ def test_normalized_series_reject_non_monotonic_dates_and_non_finite_numbers() -
             net_main_inflow=float("inf"),
             traded_amount=1.0,
         )
+
+
+def test_etf_capability_data_is_ordered_immutable_and_preserves_optional_facts() -> None:
+    payload = EtfCapabilityData(
+        code="510300",
+        bars=[
+            EtfBar(data_date=date(2026, 7, 21), close=4.0, traded_amount=100.0),
+            EtfBar(data_date=date(2026, 7, 22), close=4.1, traded_amount=120.0),
+        ],
+        quoted_at=NOW,
+        current_price=4.12,
+        current_traded_amount=150.0,
+        active=True,
+        suspended=False,
+        bid_price=4.11,
+        ask_price=4.12,
+        nav=4.10,
+        tracking_error_pct=0.2,
+        tracking_difference_pct=-0.1,
+        annual_fee_pct=0.6,
+        net_assets_cny=10_000_000.0,
+        shares=2_000_000.0,
+    )
+
+    assert isinstance(payload.bars, tuple)
+    assert payload.bars[-1].data_date == date(2026, 7, 22)
+    assert payload.tracking_difference_pct == -0.1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": 1.0},
+                {"data_date": date(2026, 7, 22), "close": 4.2, "traded_amount": 2.0},
+            ],
+        },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 0.0, "traded_amount": 1.0}
+            ],
+        },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": -1.0}
+            ],
+        },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": 1.0}
+            ],
+            "quoted_at": datetime(2026, 7, 22),
+            "current_price": 4.1,
+        },
+        {
+            "code": "510300",
+            "bars": [
+                {"data_date": date(2026, 7, 22), "close": 4.1, "traded_amount": 1.0}
+            ],
+            "current_price": float("nan"),
+        },
+    ],
+)
+def test_etf_capability_data_rejects_malformed_or_non_finite_evidence(payload) -> None:
+    with pytest.raises(ValidationError):
+        EtfCapabilityData(**payload)
 
 
 def test_enrichment_config_uses_approved_defaults_and_runtime_values() -> None:

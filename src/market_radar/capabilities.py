@@ -92,6 +92,63 @@ class ConstituentQuoteBatch(FrozenModel):
         return self
 
 
+class EtfBar(FrozenModel):
+    data_date: date
+    close: float = Field(gt=0, allow_inf_nan=False)
+    traded_amount: float = Field(ge=0, allow_inf_nan=False)
+
+
+class EtfCapabilityData(FrozenModel):
+    code: str = Field(pattern=r"^\d{6}$")
+    bars: tuple[EtfBar, ...] = Field(min_length=1)
+    quoted_at: datetime | None = None
+    current_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    current_traded_amount: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    active: bool | None = None
+    suspended: bool | None = None
+    bid_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    ask_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    nav: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    tracking_error_pct: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    tracking_difference_pct: float | None = Field(default=None, allow_inf_nan=False)
+    annual_fee_pct: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    net_assets_cny: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    shares: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @field_validator("quoted_at")
+    @classmethod
+    def require_quote_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return _require_timezone(value, "quoted_at")
+
+    @model_validator(mode="after")
+    def validate_etf_evidence(self) -> "EtfCapabilityData":
+        dates = tuple(bar.data_date for bar in self.bars)
+        if any(previous >= current for previous, current in zip(dates, dates[1:])):
+            raise ValueError("bars must have strictly increasing data_date values")
+        quote_fields = (
+            self.current_price,
+            self.current_traded_amount,
+            self.bid_price,
+            self.ask_price,
+            self.nav,
+        )
+        if any(value is not None for value in quote_fields) and self.quoted_at is None:
+            raise ValueError("current quote facts require authoritative quoted_at")
+        if (
+            self.bid_price is not None
+            and self.ask_price is not None
+            and self.bid_price > self.ask_price
+        ):
+            raise ValueError("bid_price must not exceed ask_price")
+        return self
+
+
 T = TypeVar("T", bound=FrozenModel)
 
 

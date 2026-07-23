@@ -21,7 +21,7 @@ import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -499,6 +499,17 @@ class BaseFetcher(ABC):
         """Return provider-native index history when identity is explicit."""
         return None
 
+    def get_market_radar_etf(
+        self,
+        code: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[Mapping[str, Any]]:
+        """Return provider-native point-in-time ETF evidence when supported."""
+        return None
+
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """
         获取市场人气股榜。
@@ -712,6 +723,7 @@ class DataFetcherManager:
         "sector_flow": "get_sector_flow",
         "sector_constituents": "get_sector_constituents",
         "benchmark_history": "get_index_history",
+        "etf_snapshot": "get_market_radar_etf",
     }
     _MARKET_RADAR_ERROR_LIMIT = 256
     _MARKET_RADAR_TRACE_LIMIT = 1000
@@ -3941,7 +3953,11 @@ class DataFetcherManager:
                     "duration_ms": 0,
                 }, "", None
             try:
-                args = (name,) if capability == "benchmark_history" else (kind, name)
+                args = (
+                    (name,)
+                    if capability in {"benchmark_history", "etf_snapshot"}
+                    else (kind, name)
+                )
                 payload = self._call_market_radar_capability(
                     fetcher,
                     method_name,
@@ -4042,10 +4058,12 @@ class DataFetcherManager:
         method_name = self._MARKET_RADAR_CAPABILITY_METHODS.get(capability)
         if method_name is None:
             raise ValueError(f"unsupported Market Radar capability: {capability}")
-        allowed_kinds = {"index"} if capability == "benchmark_history" else {
-            "industry",
-            "concept",
-        }
+        if capability == "benchmark_history":
+            allowed_kinds = {"index"}
+        elif capability == "etf_snapshot":
+            allowed_kinds = {"etf"}
+        else:
+            allowed_kinds = {"industry", "concept"}
         if kind not in allowed_kinds:
             raise ValueError(f"unsupported sector kind: {kind}")
 

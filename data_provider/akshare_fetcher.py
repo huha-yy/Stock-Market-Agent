@@ -24,6 +24,7 @@ AkshareFetcher - 主数据源 (Priority 1)
 """
 
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -659,7 +660,15 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             raise e
     
-    def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_etf_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> pd.DataFrame:
         """
         获取 ETF 基金历史数据
         
@@ -674,12 +683,17 @@ class AkshareFetcher(BaseFetcher):
             ETF 历史数据 DataFrame
         """
         import akshare as ak
+
+        self._market_radar_call_timeout(deadline_monotonic, monotonic)
         
         # 防封禁策略 1: 随机 User-Agent
         self._set_random_user_agent()
         
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
+        call_timeout = self._market_radar_call_timeout(
+            deadline_monotonic, monotonic
+        )
         
         logger.info(f"[API调用] ak.fund_etf_hist_em(symbol={stock_code}, period=daily, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
@@ -689,13 +703,22 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             # 调用 akshare 获取 ETF 日线数据
-            df = ak.fund_etf_hist_em(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.replace('-', ''),
-                end_date=end_date.replace('-', ''),
-                adjust="qfq"  # 前复权
-            )
+            kwargs = {
+                "symbol": stock_code,
+                "period": "daily",
+                "start_date": start_date.replace('-', ''),
+                "end_date": end_date.replace('-', ''),
+                "adjust": "qfq",
+            }
+            if deadline_monotonic is None:
+                df = ak.fund_etf_hist_em(**kwargs)
+            else:
+                df = _akshare_call_with_timeout(
+                    ak.fund_etf_hist_em,
+                    **kwargs,
+                    timeout=call_timeout,
+                    call_name="ak.fund_etf_hist_em",
+                )
             
             api_elapsed = _time.time() - api_start
             
@@ -1376,6 +1399,59 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, failure_message)
             return None
     
+    def _get_etf_spot_frame(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> pd.DataFrame:
+        """Return the shared ETF spot snapshot through the existing cache."""
+        import akshare as ak
+
+        current_time = time.time()
+        if (
+            _etf_realtime_cache["data"] is not None
+            and current_time - _etf_realtime_cache["timestamp"]
+            < _etf_realtime_cache["ttl"]
+        ):
+            logger.debug("[缓存命中] 使用缓存的ETF实时行情数据")
+            return _etf_realtime_cache["data"]
+
+        last_error: Optional[Exception] = None
+        df = None
+        for attempt in range(1, 3):
+            try:
+                self._market_radar_call_timeout(deadline_monotonic, monotonic)
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                call_timeout = self._market_radar_call_timeout(
+                    deadline_monotonic, monotonic
+                )
+                if deadline_monotonic is None:
+                    df = ak.fund_etf_spot_em()
+                else:
+                    df = _akshare_call_with_timeout(
+                        ak.fund_etf_spot_em,
+                        timeout=call_timeout,
+                        call_name="ak.fund_etf_spot_em",
+                    )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise
+                delay = min(2**attempt, 5)
+                if deadline_monotonic is not None:
+                    remaining = deadline_monotonic - monotonic()
+                    if remaining <= delay:
+                        raise TimeoutError("market radar deadline exceeded") from exc
+                time.sleep(delay)
+        if df is None:
+            raise RuntimeError("ETF spot API returned no result") from last_error
+        _etf_realtime_cache["data"] = df
+        _etf_realtime_cache["timestamp"] = current_time
+        return df
+
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取 ETF 基金实时行情数据
@@ -1389,47 +1465,12 @@ class AkshareFetcher(BaseFetcher):
         Returns:
             UnifiedRealtimeQuote 对象，获取失败返回 None
         """
-        import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_etf"
         
         try:
-            # 检查缓存
-            current_time = time.time()
-            if (_etf_realtime_cache['data'] is not None and 
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
-                df = _etf_realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
-            else:
-                last_error: Optional[Exception] = None
-                df = None
-                for attempt in range(1, 3):
-                    try:
-                        # 防封禁策略
-                        self._set_random_user_agent()
-                        self._enforce_rate_limit()
-
-                        logger.info(f"[API调用] ak.fund_etf_spot_em() 获取ETF实时行情... (attempt {attempt}/2)")
-                        import time as _time
-                        api_start = _time.time()
-
-                        df = ak.fund_etf_spot_em()
-
-                        api_elapsed = _time.time() - api_start
-                        logger.info(f"[API返回] ak.fund_etf_spot_em 成功: 返回 {len(df)} 只ETF, 耗时 {api_elapsed:.2f}s")
-                        circuit_breaker.record_success(source_key)
-                        break
-                    except Exception as e:
-                        last_error = e
-                        logger.info(f"[API错误] ak.fund_etf_spot_em 获取失败 (attempt {attempt}/2): {e}")
-                        time.sleep(min(2 ** attempt, 5))
-
-                if df is None:
-                    logger.info(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
-                    circuit_breaker.record_failure(source_key, str(last_error))
-                    df = pd.DataFrame()
-                _etf_realtime_cache['data'] = df
-                _etf_realtime_cache['timestamp'] = current_time
+            df = self._get_etf_spot_frame()
+            circuit_breaker.record_success(source_key)
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")
@@ -2137,6 +2178,123 @@ class AkshareFetcher(BaseFetcher):
             timeout=call_timeout,
             call_name="ak.index_zh_a_hist",
         )
+
+    @staticmethod
+    def _market_radar_etf_number(value: Any) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _market_radar_etf_timestamp(value: Any) -> Optional[str]:
+        if value is None or pd.isna(value):
+            return None
+        parsed = pd.Timestamp(value)
+        if pd.isna(parsed):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.tz_localize(_CN_MARKET_TIMEZONE)
+        return parsed.to_pydatetime().isoformat()
+
+    @staticmethod
+    def _market_radar_etf_active(value: Any) -> Optional[bool]:
+        if value is None or pd.isna(value):
+            return None
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {"active", "listed", "trading", "上市", "正常"}:
+            return True
+        if normalized in {"inactive", "delisted", "退市", "终止上市"}:
+            return False
+        return None
+
+    def get_market_radar_etf(
+        self,
+        code: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one ETF history plus only timestamped current quote facts."""
+        normalized_code = normalize_stock_code(str(code)).upper()
+        if not _is_etf_code(normalized_code):
+            return None
+        end = self._market_radar_request_date(as_of)
+        start = end - timedelta(days=365)
+        history = self._fetch_etf_data(
+            normalized_code,
+            start.isoformat(),
+            end.isoformat(),
+            deadline_monotonic=deadline_monotonic,
+            monotonic=monotonic,
+        )
+        payload: Dict[str, Any] = {
+            "code": normalized_code,
+            "bars": history,
+            "quoted_at": None,
+            "current_price": None,
+            "current_traded_amount": None,
+            "active": None,
+            "suspended": None,
+            "bid_price": None,
+            "ask_price": None,
+            "nav": None,
+            "tracking_error_pct": None,
+            "tracking_difference_pct": None,
+            "annual_fee_pct": None,
+            "net_assets_cny": None,
+            "shares": None,
+        }
+        try:
+            spot = self._get_etf_spot_frame(
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
+            )
+        except Exception as exc:
+            logger.info("[ETF快照] 当前行情不可用 %s: %s", normalized_code, exc)
+            return payload
+        if spot is None or spot.empty or "代码" not in spot.columns:
+            return payload
+
+        codes = spot["代码"].map(
+            lambda value: str(value).strip().split(".")[0].zfill(6)
+        )
+        matches = spot[codes == normalized_code]
+        if matches.empty:
+            return payload
+        row = matches.iloc[0]
+        quoted_at = None
+        for field in ("报价时间", "更新时间", "数据时间", "quoted_at"):
+            if field in row.index:
+                try:
+                    quoted_at = self._market_radar_etf_timestamp(row[field])
+                except (TypeError, ValueError):
+                    quoted_at = None
+                break
+        price = self._market_radar_etf_number(row.get("最新价"))
+        amount = self._market_radar_etf_number(row.get("成交额"))
+        if quoted_at is None or price is None or price <= 0 or amount is None or amount < 0:
+            return payload
+
+        payload.update(
+            {
+                "quoted_at": quoted_at,
+                "current_price": price,
+                "current_traded_amount": amount,
+                "active": self._market_radar_etf_active(
+                    row.get("active", row.get("上市状态"))
+                ),
+            }
+        )
+        return payload
 
     def get_sector_flow(
         self,

@@ -200,6 +200,124 @@ def test_benchmark_history_uses_index_endpoint_and_preserves_000985(monkeypatch)
     assert calls[0]["symbol"] == "000985"
 
 
+def test_etf_snapshot_reuses_native_history_and_spot_cache_with_provider_time(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def history(**kwargs):
+        calls.append(("history", kwargs))
+        return pd.DataFrame(
+            {
+                "日期": ["2026-07-21", "2026-07-22"],
+                "收盘": [4.0, 4.1],
+                "成交额": [10_000.0, 20_000.0],
+            }
+        )
+
+    def spot():
+        calls.append(("spot", {}))
+        return pd.DataFrame(
+            {
+                "代码": ["510300"],
+                "最新价": [4.12],
+                "成交额": [30_000.0],
+                "报价时间": ["2026-07-22T14:59:00+08:00"],
+                "active": [True],
+            }
+        )
+
+    monkeypatch.setattr(
+        akshare_module,
+        "_etf_realtime_cache",
+        {"data": None, "timestamp": 0, "ttl": 1200},
+    )
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(fund_etf_hist_em=history, fund_etf_spot_em=spot),
+    )
+    as_of = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
+
+    first = fetcher.get_market_radar_etf("510300", as_of=as_of)
+    second = fetcher.get_market_radar_etf("510300", as_of=as_of)
+
+    assert first["code"] == "510300"
+    assert first["bars"].iloc[-1]["日期"] == "2026-07-22"
+    assert first["quoted_at"] == "2026-07-22T14:59:00+08:00"
+    assert first["current_price"] == 4.12
+    assert first["current_traded_amount"] == 30_000.0
+    assert first["active"] is True
+    for unknown in (
+        "suspended",
+        "bid_price",
+        "ask_price",
+        "nav",
+        "tracking_error_pct",
+        "tracking_difference_pct",
+        "annual_fee_pct",
+        "net_assets_cny",
+        "shares",
+    ):
+        assert first[unknown] is None
+    assert second["current_price"] == 4.12
+    assert [name for name, _ in calls].count("spot") == 1
+    assert calls[0][1]["symbol"] == "510300"
+    assert calls[0][1]["end_date"] == "20260722"
+
+
+@pytest.mark.parametrize(
+    "spot",
+    [
+        pd.DataFrame(
+            {
+                "代码": ["510500"],
+                "最新价": [4.12],
+                "成交额": [30_000.0],
+                "报价时间": ["2026-07-22T14:59:00+08:00"],
+            }
+        ),
+        pd.DataFrame(
+            {"代码": ["510300"], "最新价": [4.12], "成交额": [30_000.0]}
+        ),
+        pd.DataFrame(
+            {
+                "代码": ["510300"],
+                "最新价": [4.12],
+                "成交额": ["not-an-amount"],
+                "报价时间": ["2026-07-22T14:59:00+08:00"],
+            }
+        ),
+    ],
+    ids=["wrong-code", "missing-time", "malformed-amount"],
+)
+def test_etf_snapshot_omits_unverifiable_current_quote(monkeypatch, spot) -> None:
+    history = pd.DataFrame(
+        {"日期": ["2026-07-22"], "收盘": [4.1], "成交额": [20_000.0]}
+    )
+    monkeypatch.setattr(
+        akshare_module,
+        "_etf_realtime_cache",
+        {"data": None, "timestamp": 0, "ttl": 1200},
+    )
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(
+            fund_etf_hist_em=lambda **kwargs: history,
+            fund_etf_spot_em=lambda: spot,
+        ),
+    )
+
+    result = fetcher.get_market_radar_etf(
+        "510300",
+        as_of=datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result["bars"] is history
+    assert result["quoted_at"] is None
+    assert result["current_price"] is None
+    assert result["current_traded_amount"] is None
+
+
 @pytest.mark.parametrize(
     "invoke",
     [

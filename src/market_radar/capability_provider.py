@@ -21,8 +21,10 @@ from src.market_radar.capabilities import (
     ConstituentMembership,
     ConstituentQuote,
     ConstituentQuoteBatch,
+    EtfBar,
+    EtfCapabilityData,
 )
-from src.market_radar.models import SectorDefinition
+from src.market_radar.models import EtfDefinition, SectorDefinition
 
 
 _CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -34,6 +36,15 @@ _CODE_ALIASES = ("code", "stock_code", "symbol", "代码", "股票代码", "证�
 _CURRENT_PRICE_ALIASES = ("current_price", "price", "最新价", "现价")
 _PREVIOUS_CLOSE_ALIASES = ("previous_close", "pre_close", "昨收", "昨收价")
 _QUOTE_TIME_ALIASES = ("quoted_at", "provider_timestamp", "quote_time", "报价时间")
+_ETF_BARS_ALIASES = ("bars", "history")
+_ETF_CURRENT_AMOUNT_ALIASES = (
+    "current_traded_amount",
+    "current_amount",
+    "当前成交额",
+    "成交额",
+    "成交额(元)",
+    "成交额（元）",
+)
 _AMOUNT_FACTORS = {
     "traded_amount": 1.0,
     "amount": 1.0,
@@ -70,6 +81,7 @@ class MarketRadarEnrichmentProvider(Protocol):
         monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[BoardBarSeries]:
         raise NotImplementedError
+
 
     def fetch_benchmark_history(
         self,
@@ -113,6 +125,19 @@ class MarketRadarEnrichmentProvider(Protocol):
         deadline_monotonic: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> CapabilityResult[ConstituentQuoteBatch]:
+        raise NotImplementedError
+
+
+class MarketRadarEtfProvider(Protocol):
+    def fetch_etf(
+        self,
+        etf: EtfDefinition,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> CapabilityResult[EtfCapabilityData]:
         raise NotImplementedError
 
 
@@ -272,6 +297,89 @@ def _normalize_membership(payload: Any) -> ConstituentMembership:
     return ConstituentMembership(codes=codes, data_date=data_date)
 
 
+def _mapping_value(
+    payload: Mapping[str, Any], aliases: tuple[str, ...], default: Any = None
+) -> Any:
+    for alias in aliases:
+        if alias in payload:
+            return payload[alias]
+    return default
+
+
+def _optional_number(
+    payload: Mapping[str, Any], aliases: tuple[str, ...], field_name: str
+) -> float | None:
+    value = _mapping_value(payload, aliases)
+    if value is None:
+        return None
+    return _finite_number(value, field_name)
+
+
+def _optional_bool(
+    payload: Mapping[str, Any], aliases: tuple[str, ...], field_name: str
+) -> bool | None:
+    value = _mapping_value(payload, aliases)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be boolean")
+    return value
+
+
+def _normalize_etf(
+    payload: Any, expected_code: str | None = None
+) -> EtfCapabilityData:
+    if not isinstance(payload, Mapping):
+        raise ValueError("ETF snapshot must be a mapping")
+    code = _canonical_cn_code(_value(payload, _CODE_ALIASES))
+    if expected_code is not None and code != expected_code:
+        raise ValueError("provider ETF code does not match requested code")
+    raw_bars = _mapping_value(payload, _ETF_BARS_ALIASES)
+    bars = tuple(
+        EtfBar(
+            data_date=_data_date(_value(row, _DATE_ALIASES)),
+            close=_finite_number(_value(row, _CLOSE_ALIASES), "close"),
+            traded_amount=_scaled_value(row, _AMOUNT_FACTORS, "traded amount"),
+        )
+        for row in _rows(raw_bars)
+    )
+    if not bars:
+        raise ValueError("empty result")
+    bars = tuple(sorted(bars, key=lambda item: item.data_date))
+    quoted_value = _mapping_value(payload, _QUOTE_TIME_ALIASES)
+    return EtfCapabilityData(
+        code=code,
+        bars=bars,
+        quoted_at=(
+            _aware_datetime(quoted_value) if quoted_value is not None else None
+        ),
+        current_price=_optional_number(
+            payload, _CURRENT_PRICE_ALIASES, "current price"
+        ),
+        current_traded_amount=_optional_number(
+            payload, _ETF_CURRENT_AMOUNT_ALIASES, "current traded amount"
+        ),
+        active=_optional_bool(payload, ("active",), "active"),
+        suspended=_optional_bool(payload, ("suspended",), "suspended"),
+        bid_price=_optional_number(payload, ("bid_price", "bid"), "bid price"),
+        ask_price=_optional_number(payload, ("ask_price", "ask"), "ask price"),
+        nav=_optional_number(payload, ("nav", "单位净值"), "nav"),
+        tracking_error_pct=_optional_number(
+            payload, ("tracking_error_pct",), "tracking error"
+        ),
+        tracking_difference_pct=_optional_number(
+            payload, ("tracking_difference_pct",), "tracking difference"
+        ),
+        annual_fee_pct=_optional_number(
+            payload, ("annual_fee_pct",), "annual fee"
+        ),
+        net_assets_cny=_optional_number(
+            payload, ("net_assets_cny",), "net assets"
+        ),
+        shares=_optional_number(payload, ("shares",), "shares"),
+    )
+
+
 def validate_provider_capability_payload(
     capability: str,
     payload: Any,
@@ -310,6 +418,8 @@ def provider_capability_data_date(
         return _normalize_flows(payload, "validation").flows[-1].data_date
     if capability == "sector_constituents":
         return _normalize_membership(payload).data_date
+    if capability == "etf_snapshot":
+        return _normalize_etf(payload).bars[-1].data_date
     raise ValueError("unsupported capability")
 
 
@@ -561,6 +671,83 @@ class ProviderCapabilityAdapter:
             )
         except Exception as exc:
             return self._unavailable("benchmark_history", as_of, error=exc)
+
+    def fetch_etf(
+        self,
+        etf: EtfDefinition,
+        as_of: datetime,
+        *,
+        attempt_policy: Any = None,
+        deadline_monotonic: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> CapabilityResult[EtfCapabilityData]:
+        self._require_as_of(as_of)
+        trace: Any = ()
+        source = "etf_snapshot"
+        try:
+            code = _canonical_cn_code(etf.code)
+            payload, trace, error = self._manager_capability(
+                "etf_snapshot",
+                kind="etf",
+                name=code,
+                as_of=as_of,
+                attempt_policy=attempt_policy,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
+            )
+            if payload is None:
+                return self._unavailable(
+                    "etf_snapshot", as_of, trace=trace, error=error
+                )
+            data = _normalize_etf(payload, code)
+            terminal = data.bars[-1].data_date
+            if terminal > self._market_date(as_of):
+                return self._unavailable(
+                    "etf_snapshot",
+                    as_of,
+                    trace=trace,
+                    error="provider terminal date is later than requested as_of",
+                )
+            observed_at = as_of.astimezone(timezone.utc)
+            freshness_seconds = max(
+                0, (self._market_date(as_of) - terminal).days * 86400
+            )
+            if data.quoted_at is not None:
+                acquired_at = self._acquisition_time(as_of)
+                if data.quoted_at.astimezone(timezone.utc) > acquired_at:
+                    raise ValueError("quote time is later than acquisition time")
+                observed_at = acquired_at
+                freshness_seconds = max(
+                    0,
+                    int(
+                        (
+                            acquired_at
+                            - data.quoted_at.astimezone(timezone.utc)
+                        ).total_seconds()
+                    ),
+                )
+            stale = terminal < self._market_date(as_of)
+            source = _source_from_trace(trace, source)
+            return CapabilityResult[EtfCapabilityData](
+                capability="etf_snapshot",
+                status="stale" if stale else "ok",
+                data=data,
+                source=source,
+                observed_at=observed_at,
+                data_date=terminal,
+                bar_status=self._bar_status(terminal, as_of),
+                freshness_seconds=freshness_seconds,
+                trace=_safe_trace(trace),
+                error=None,
+            )
+        except Exception as exc:
+            return self._unavailable(
+                "etf_snapshot",
+                as_of,
+                trace=trace,
+                error=exc,
+                source=source,
+            )
 
     def fetch_board_flow(
         self,
