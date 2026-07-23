@@ -418,13 +418,21 @@ def test_market_radar_docs_cover_phase_2a_operational_contract() -> None:
     assert "EFinance may provide industry membership" not in text
     assert "Tushare or TickFlow providers participate" not in text
 
+    for route in (
+        "/api/v1/market-radar/latest",
+        "/api/v1/market-radar/sectors",
+        "/api/v1/market-radar/sectors/{sector_id}",
+    ):
+        assert route in text
 
-def test_english_index_market_radar_entry_tracks_phase_2a() -> None:
-    text = (ROOT / "docs/INDEX_EN.md").read_text(encoding="utf-8")
+
+@pytest.mark.parametrize("index_name", ["INDEX.md", "INDEX_EN.md"])
+def test_documentation_indexes_track_market_radar_phase_2c(index_name: str) -> None:
+    text = (ROOT / "docs" / index_name).read_text(encoding="utf-8")
     entry = next(line for line in text.splitlines() if "[Market Radar]" in line)
 
-    assert "Phase 2A" in entry
-    assert "Phase 1" not in entry
+    assert "Phase 2C" in entry
+    assert "Phase 2A" not in entry
 
 
 def test_offline_manual_run_persists_and_replays_same_scoring_path(
