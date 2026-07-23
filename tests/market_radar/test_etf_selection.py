@@ -167,6 +167,25 @@ def test_missing_required_filter_evidence_is_insufficient_not_rejected(
     assert result.score is None
 
 
+def test_confirmed_rejection_takes_precedence_over_missing_required_evidence() -> None:
+    item = observation(
+        current_price=None,
+        suspended=True,
+        raw_reference={"normalized_code": "512999"},
+    )
+
+    result = select_etfs([item], EtfPolicyConfig())[0]
+
+    assert result.status == "rejected"
+    assert result.eligible is False
+    assert result.reason_codes == (
+        "suspended",
+        "data_integrity_failure",
+        "missing_current_price",
+    )
+    assert result.score is None
+
+
 @pytest.mark.parametrize("field", ["spread_bps", "premium_discount_pct", "suspended"])
 def test_optional_safety_gaps_remain_eligible_but_prevent_best_supported(
     field: str,
@@ -191,6 +210,16 @@ def test_one_eligible_etf_scores_one_hundred() -> None:
     assert result.score == 100.0
     assert result.rank == 1
     assert result.status == "best_supported"
+
+
+def test_fully_evidenced_partial_quality_etf_can_be_best_supported() -> None:
+    result = select_etfs(
+        [observation(quality="partial")], EtfPolicyConfig()
+    )[0]
+
+    assert result.status == "best_supported"
+    assert result.score == 100.0
+    assert result.confidence == 0.85
 
 
 def test_percentiles_use_mean_ordinals_and_reverse_tracking_and_cost_metrics() -> None:

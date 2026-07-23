@@ -256,7 +256,7 @@ def _unranked_selection(row: _Classified, *, ranking_reason: str | None = None) 
     reasons = row.hard_reasons + row.missing_reasons
     if ranking_reason is not None:
         reasons += (ranking_reason,)
-    status = "insufficient_data" if row.missing_reasons or ranking_reason else "rejected"
+    status = "rejected" if row.hard_reasons else "insufficient_data"
     return EtfSelection(
         sector_id=row.observation.sector_id,
         code=row.observation.code,
@@ -341,7 +341,7 @@ def _rank_sector(rows: Sequence[_Classified], config: EtfPolicyConfig) -> list[E
             index == 1
             and len(selection.effective_weights) == len(config.component_weights)
             and all(getattr(selection.observation, field) is not None for field in _SAFETY_FIELDS)
-            and selection.observation.quality == "complete"
+            and selection.observation.quality not in {"stale", "unavailable"}
         )
         results.append(
             selection.model_copy(
