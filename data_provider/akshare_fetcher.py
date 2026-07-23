@@ -1421,6 +1421,7 @@ class AkshareFetcher(BaseFetcher):
         last_error: Optional[Exception] = None
         df = None
         exhausted = False
+        attempted_upstream = False
         for attempt in range(1, 3):
             try:
                 self._market_radar_call_timeout(deadline_monotonic, monotonic)
@@ -1429,20 +1430,24 @@ class AkshareFetcher(BaseFetcher):
                 call_timeout = self._market_radar_call_timeout(
                     deadline_monotonic, monotonic
                 )
+                attempted_upstream = True
                 if deadline_monotonic is None:
-                    df = ak.fund_etf_spot_em()
+                    result = ak.fund_etf_spot_em()
                 else:
-                    df = _akshare_call_with_timeout(
+                    result = _akshare_call_with_timeout(
                         ak.fund_etf_spot_em,
                         timeout=call_timeout,
                         call_name="ak.fund_etf_spot_em",
                     )
+                if not isinstance(result, pd.DataFrame):
+                    raise ValueError("ETF spot API returned invalid result")
+                df = result
                 break
             except Exception as exc:
                 last_error = exc
+                if not attempted_upstream:
+                    raise
                 if attempt == 2:
-                    if deadline_monotonic is not None:
-                        raise
                     exhausted = True
                     df = pd.DataFrame()
                     break
@@ -1450,7 +1455,9 @@ class AkshareFetcher(BaseFetcher):
                 if deadline_monotonic is not None:
                     remaining = deadline_monotonic - monotonic()
                     if remaining <= delay:
-                        raise TimeoutError("market radar deadline exceeded") from exc
+                        exhausted = True
+                        df = pd.DataFrame()
+                        break
                 time.sleep(delay)
         if df is None:
             raise RuntimeError("ETF spot API returned no result") from last_error

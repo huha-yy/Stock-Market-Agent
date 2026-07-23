@@ -358,6 +358,122 @@ def test_etf_realtime_outage_uses_negative_cache_until_ttl_expires(
     assert cache["timestamp"] == 1301.0
 
 
+def test_etf_realtime_none_response_retries_and_uses_negative_cache(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def empty_spot():
+        calls.append(True)
+        return None
+
+    cache = {"data": None, "timestamp": 0, "ttl": 1200}
+    times = iter((100.0, 101.0, 1301.0))
+    monkeypatch.setattr(akshare_module, "_etf_realtime_cache", cache)
+    monkeypatch.setattr(akshare_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(akshare_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        akshare_module,
+        "get_realtime_circuit_breaker",
+        lambda: SimpleNamespace(
+            record_success=lambda key: None,
+            record_failure=lambda key, error: None,
+        ),
+    )
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(fund_etf_spot_em=empty_spot),
+    )
+
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert len(calls) == 2
+    assert isinstance(cache["data"], pd.DataFrame)
+    assert cache["data"].empty
+    assert cache["timestamp"] == 100.0
+
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert len(calls) == 2
+
+    assert fetcher._get_etf_realtime_quote("510300") is None
+    assert len(calls) == 4
+    assert cache["timestamp"] == 1301.0
+    assert cache["ttl"] == 1200
+
+
+def test_bounded_etf_snapshot_caches_failure_after_real_upstream_attempt(
+    monkeypatch,
+) -> None:
+    spot_calls = []
+    clock = SimpleNamespace(now=0.0)
+    history = pd.DataFrame(
+        {"日期": ["2026-07-22"], "收盘": [4.1], "成交额": [20_000.0]}
+    )
+
+    def failing_spot():
+        spot_calls.append(True)
+        clock.now = 9.0
+        raise RuntimeError("spot unavailable")
+
+    cache = {"data": None, "timestamp": 0, "ttl": 1200}
+    monkeypatch.setattr(akshare_module, "_etf_realtime_cache", cache)
+    monkeypatch.setattr(akshare_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(akshare_module.time, "sleep", lambda _: None)
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(
+            fund_etf_hist_em=lambda **kwargs: history,
+            fund_etf_spot_em=failing_spot,
+        ),
+    )
+
+    first = fetcher.get_market_radar_etf(
+        "510300",
+        as_of=datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc),
+        deadline_monotonic=10.0,
+        monotonic=lambda: clock.now,
+    )
+    second = fetcher.get_market_radar_etf(
+        "510500",
+        as_of=datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc),
+        deadline_monotonic=10.0,
+        monotonic=lambda: clock.now,
+    )
+
+    assert first["bars"] is history
+    assert second["bars"] is history
+    assert first["current_price"] is None
+    assert second["current_price"] is None
+    assert spot_calls == [True]
+    assert isinstance(cache["data"], pd.DataFrame)
+    assert cache["data"].empty
+    assert cache["timestamp"] == 100.0
+    assert clock.now < 10.0
+
+
+def test_etf_spot_pre_call_deadline_does_not_write_negative_cache(
+    monkeypatch,
+) -> None:
+    calls = []
+    cache = {"data": None, "timestamp": 0, "ttl": 1200}
+    monkeypatch.setattr(akshare_module, "_etf_realtime_cache", cache)
+    monkeypatch.setattr(akshare_module.time, "time", lambda: 100.0)
+    fetcher = _fetcher(
+        monkeypatch,
+        SimpleNamespace(
+            fund_etf_spot_em=lambda: calls.append(True),
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        fetcher._get_etf_spot_frame(
+            deadline_monotonic=10.0,
+            monotonic=lambda: 10.0,
+        )
+
+    assert calls == []
+    assert cache == {"data": None, "timestamp": 0, "ttl": 1200}
+
+
 @pytest.mark.parametrize(
     "invoke",
     [
