@@ -1161,6 +1161,61 @@ class RadarUniverseRecord(Base):
     )
 
 
+class RadarConstituentSetRecord(Base):
+    __tablename__ = "radar_constituent_sets"
+    __table_args__ = (
+        Index(
+            "idx_radar_constituent_set_identity",
+            "market",
+            "sector_id",
+            "source",
+        ),
+    )
+
+    set_key = Column(String(80), primary_key=True)
+    market = Column(String(16), nullable=False)
+    sector_id = Column(String(160), nullable=False)
+    source = Column(String(128), nullable=False)
+    codes_json = Column(Text, nullable=False)
+    constituent_count = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarConstituentObservationRecord(Base):
+    __tablename__ = "radar_constituent_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "market",
+            "sector_id",
+            "data_date",
+            "source",
+            name="uix_radar_constituent_observation_identity",
+        ),
+        Index(
+            "idx_radar_constituent_observation_history",
+            "market",
+            "sector_id",
+            "data_date",
+        ),
+        Index(
+            "idx_radar_constituent_observation_set_key",
+            "set_key",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(16), nullable=False)
+    sector_id = Column(String(160), nullable=False)
+    data_date = Column(Date, nullable=False)
+    observed_at = Column(DateTime, nullable=False)
+    source = Column(String(128), nullable=False)
+    set_key = Column(
+        String(80),
+        ForeignKey("radar_constituent_sets.set_key"),
+        nullable=False,
+    )
+
+
 class RadarRunRecord(Base):
     __tablename__ = "radar_runs"
 

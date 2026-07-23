@@ -337,6 +337,48 @@ def test_confidence_coverage_has_130_points_of_authority() -> None:
     assert sum(_COVERAGE_WEIGHTS.values()) == pytest.approx(130.0)
 
 
+def test_phase2a_full_market_evidence_without_catalyst_has_approved_confidence() -> None:
+    enriched = observation(
+        "Enriched",
+        "industry:enriched",
+        quality="partial",
+        catalyst_score=None,
+        raw_reference={"schema": "market-radar-observation-v2a"},
+    )
+
+    result = score_sectors([enriched], RankingConfig())[0]
+
+    assert result.confidence == 0.9231
+
+
+def test_phase1_sparse_partial_confidence_keeps_legacy_quality_multiplier() -> None:
+    sparse = observation(
+        "Sparse",
+        "industry:sparse",
+        quality="partial",
+        return_5d_pct=None,
+        return_20d_pct=None,
+        benchmark_return_20d_pct=None,
+        capital_flow_1d=None,
+        capital_flow_5d=None,
+        capital_flow_20d=None,
+        up_count=None,
+        down_count=None,
+        flat_count=None,
+    )
+
+    expected_coverage = sum(
+        weight
+        for field, weight in _COVERAGE_WEIGHTS.items()
+        if getattr(sparse, field) is not None
+    ) / sum(_COVERAGE_WEIGHTS.values())
+
+    result = score_sectors([sparse], RankingConfig())[0]
+
+    assert result.confidence == round(expected_coverage * 0.8, 4)
+    assert result.state == "insufficient_data"
+
+
 def test_relative_inputs_contribute_independent_cumulative_coverage() -> None:
     sector_missing = observation(
         "Sector Missing",

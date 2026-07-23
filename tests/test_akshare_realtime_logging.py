@@ -1,5 +1,6 @@
 import logging
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pandas as pd
@@ -11,6 +12,8 @@ from data_provider.akshare_fetcher import (
     SINA_REALTIME_ENDPOINT,
     TENCENT_REALTIME_ENDPOINT,
 )
+from data_provider.base import DataFetcherManager
+from src.market_radar.capability_provider import ProviderCapabilityAdapter
 
 
 class _DummyCircuitBreaker:
@@ -35,13 +38,17 @@ class _DummyResponse:
         self.encoding = None
 
 
-def _make_sina_payload() -> str:
+def _make_sina_payload(
+    *,
+    provider_date: str = "2026-07-22",
+    provider_time: str = "15:00:00",
+) -> str:
     fields = [
         "大秦铁路", "5.100", "5.000", "5.190", "5.200", "5.050", "5.180", "5.190",
         "123456", "789012"
     ]
     fields.extend(["0"] * 20)
-    fields.extend(["2026-03-08", "15:00:00"])
+    fields.extend([provider_date, provider_time])
     return f'var hq_str_sh601006="{",".join(fields)}";'
 
 
@@ -54,6 +61,7 @@ def _make_tencent_payload(
     turnover_rate: str = "0.69",
     circ_mv_yi: str = "0.93",
     total_mv_yi: str = "1.20",
+    provider_timestamp: str = "20260722150000",
 ) -> str:
     fields = ["0"] * 50
     fields[1] = "大秦铁路"
@@ -62,6 +70,7 @@ def _make_tencent_payload(
     fields[4] = "5.00"
     fields[5] = "5.10"
     fields[6] = volume
+    fields[30] = provider_timestamp
     fields[31] = "0.19"
     fields[32] = "3.80"
     fields[33] = "5.20"
@@ -100,6 +109,8 @@ def test_sina_realtime_success_logs_endpoint(caplog, monkeypatch, akshare_fetche
     assert quote is not None
     assert quote.name == "大秦铁路"
     assert quote.price == 5.19
+    assert quote.pre_close == 5.0
+    assert quote.provider_timestamp == "2026-07-22T15:00:00+08:00"
     assert breaker.successes == ["akshare_sina"]
     assert f"endpoint={SINA_REALTIME_ENDPOINT}" in caplog.text
     assert "[实时行情-新浪] 601006 大秦铁路:" in caplog.text
@@ -162,9 +173,98 @@ def test_tencent_realtime_success_logs_endpoint(caplog, monkeypatch, akshare_fet
     assert quote.price == 5.19
     assert quote.volume == 123400
     assert quote.amount == 6404500
+    assert quote.pre_close == 5.0
+    assert quote.provider_timestamp == "2026-07-22T15:00:00+08:00"
     assert breaker.successes == ["akshare_tencent"]
     assert f"endpoint={TENCENT_REALTIME_ENDPOINT}" in caplog.text
     assert "[实时行情-腾讯] 601006 大秦铁路:" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("source", "payload"),
+    [
+        ("sina", _make_sina_payload(provider_time="")),
+        ("tencent", _make_tencent_payload(provider_timestamp="not-a-time")),
+    ],
+)
+def test_realtime_quote_rejects_missing_or_malformed_authoritative_timestamp(
+    source, payload, monkeypatch, akshare_fetcher
+):
+    breaker = _DummyCircuitBreaker()
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.get_realtime_circuit_breaker",
+        lambda: breaker,
+    )
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.requests.get",
+        lambda *args, **kwargs: _DummyResponse(200, payload),
+    )
+
+    quote = akshare_fetcher.get_realtime_quote("601006", source=source)
+
+    assert quote is None
+    assert breaker.successes == []
+    assert breaker.failures
+
+
+def test_actual_quote_parser_manager_fallback_and_adapter_contract(
+    monkeypatch, akshare_fetcher
+):
+    breaker = _DummyCircuitBreaker()
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.get_realtime_circuit_breaker",
+        lambda: breaker,
+    )
+
+    def response(url, *args, **kwargs):
+        if TENCENT_REALTIME_ENDPOINT in url:
+            return _DummyResponse(
+                200,
+                _make_tencent_payload(provider_timestamp="malformed"),
+            )
+        if SINA_REALTIME_ENDPOINT in url:
+            return _DummyResponse(200, _make_sina_payload())
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("data_provider.akshare_fetcher.requests.get", response)
+    monkeypatch.setattr(
+        akshare_fetcher,
+        "_get_stock_realtime_quote_em",
+        lambda _code: None,
+    )
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="tencent,akshare_sina,efinance,akshare_em",
+            realtime_cache_ttl=1_000_000_000,
+        ),
+    )
+    manager = DataFetcherManager(fetchers=[akshare_fetcher])
+
+    result = ProviderCapabilityAdapter(manager).fetch_constituent_quotes(
+        ("601006",),
+        datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "ok"
+    assert result.data is not None
+    assert result.data_date.isoformat() == "2026-07-22"
+    assert result.source == "akshare_sina"
+    assert result.data.quotes[0].model_dump() == {
+        "code": "601006",
+        "current_price": 5.19,
+        "previous_close": 5.0,
+        "traded_amount": 789012.0,
+        "quoted_at": datetime.fromisoformat("2026-07-22T15:00:00+08:00"),
+    }
+    assert [item["result"] for item in result.trace[:2]] == ["empty", "ok"]
+    assert [item["provider"] for item in result.trace[:2]] == [
+        "tencent",
+        "akshare_sina",
+    ]
+    assert result.trace[-1]["result"] == "ok"
+    assert result.trace[-1]["provider"] == "akshare_sina"
 
 
 def test_tencent_realtime_volume_keeps_share_unit_when_turnover_matches(monkeypatch, akshare_fetcher):

@@ -41,6 +41,8 @@ _COVERAGE_WEIGHTS = {
     "catalyst_score": 10.0,
 }
 
+_PHASE_2A_OBSERVATION_SCHEMA = "market-radar-observation-v2a"
+
 
 @dataclass(frozen=True)
 class RankingConfig:
@@ -204,12 +206,18 @@ def _confidence(item: SectorObservation) -> float:
         if getattr(item, field_name) is not None
     )
     total_coverage_weight = sum(_COVERAGE_WEIGHTS.values())
-    quality_multiplier = {
-        "complete": 1.0,
-        "partial": 0.8,
-        "stale": 0.4,
-        "unavailable": 0.0,
-    }[item.quality]
+    if item.quality == "partial":
+        quality_multiplier = (
+            1.0
+            if item.raw_reference.get("schema") == _PHASE_2A_OBSERVATION_SCHEMA
+            else 0.8
+        )
+    else:
+        quality_multiplier = {
+            "complete": 1.0,
+            "stale": 0.4,
+            "unavailable": 0.0,
+        }[item.quality]
     return round(
         weighted_presence / total_coverage_weight * quality_multiplier,
         4,

@@ -1,13 +1,30 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import select
 
-from src.market_radar.models import DataQuality, SectorObservation
+from src.config import Config
+from src.market_radar.models import (
+    DataQuality,
+    RadarRunSnapshot,
+    SectorDefinition,
+    SectorObservation,
+)
+from src.market_radar.observation_builder import (
+    ConstituentEvidence,
+    canonical_constituent_set_key,
+)
 from src.market_radar.ranking import RankingConfig, score_sectors
+from src.market_radar.repository import MarketRadarRepository
 from src.market_radar.replay import MarketRadarReplayEngine, ReplayFrame
+from src.storage import (
+    DatabaseManager,
+    RadarConstituentObservationRecord,
+    RadarConstituentSetRecord,
+)
 
 
 START = datetime(2026, 7, 20, 7, 0, tzinfo=timezone.utc)
@@ -21,7 +38,21 @@ def observation(
     sector_id: str = "industry:semiconductor",
     name: str = "Semiconductor",
     quality: DataQuality = "partial",
+    constituent_set_key: str | None = None,
+    membership_source: str = "membership-fixture",
 ) -> SectorObservation:
+    raw_reference = {"return_1d_pct": return_1d_pct}
+    if constituent_set_key is not None:
+        raw_reference.update(
+            {
+                "schema": "market-radar-observation-v2a",
+                "data_date": observed_at.date(),
+                "capabilities": {
+                    "membership": {"source": membership_source},
+                },
+                "constituent_set_key": constituent_set_key,
+            }
+        )
     return SectorObservation(
         sector_id=sector_id,
         kind="industry",
@@ -36,8 +67,21 @@ def observation(
             for field in TRACKED_METRICS
             if field != "return_1d_pct" or return_1d_pct is None
         ),
-        raw_reference={"return_1d_pct": return_1d_pct},
+        raw_reference=raw_reference,
     )
+
+
+@pytest.fixture()
+def repository(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "replay.db"))
+    Config.reset_instance()
+    DatabaseManager.reset_instance()
+    db = DatabaseManager.get_instance()
+    try:
+        yield MarketRadarRepository(db)
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
 
 
 def test_replay_is_chronological_and_uses_deterministic_replay_identity() -> None:
@@ -249,6 +293,15 @@ def test_replay_scores_are_exactly_the_direct_ranking_output() -> None:
     assert list(snapshot.sectors) == score_sectors(observations, config)
 
 
+def test_legacy_partial_replay_keeps_phase1_confidence_and_state() -> None:
+    snapshot = MarketRadarReplayEngine(RankingConfig()).replay(
+        [ReplayFrame(as_of=START, observations=[observation(START, 1.0)])]
+    )[0]
+
+    assert snapshot.sectors[0].confidence == 0.0513
+    assert snapshot.sectors[0].state == "insufficient_data"
+
+
 @pytest.mark.parametrize(
     ("observations", "expected"),
     [
@@ -279,3 +332,128 @@ def test_replay_aggregates_frame_quality(
     )[0]
 
     assert snapshot.quality == expected
+
+
+def _persisted_replay_fixture() -> tuple[
+    ConstituentEvidence,
+    SectorDefinition,
+    RadarRunSnapshot,
+]:
+    codes = ("000001", "300750", "600519")
+    set_key = canonical_constituent_set_key(
+        "cn",
+        "industry:semiconductor",
+        "membership-fixture",
+        codes,
+    )
+    evidence = ConstituentEvidence(
+        market="cn",
+        sector_id="industry:semiconductor",
+        source="membership-fixture",
+        data_date=START.date(),
+        observed_at=START,
+        codes=codes,
+        set_key=set_key,
+    )
+    item = observation(START, 2.0, constituent_set_key=set_key)
+    config = RankingConfig()
+    snapshot = RadarRunSnapshot(
+        run_key="cn:20260720T070000Z:manual",
+        market="cn",
+        trigger="manual",
+        as_of=START,
+        quality="partial",
+        scoring_version=config.scoring_version,
+        sectors=score_sectors([item], config),
+        provider_trace=[{"source": "fixture", "result": "ok"}],
+    )
+    sector = SectorDefinition(
+        sector_id=item.sector_id,
+        kind=item.kind,
+        name=item.name,
+        effective_from=date(2026, 1, 1),
+    )
+    return evidence, sector, snapshot
+
+
+def test_repository_backed_replay_resolves_evidence_without_a_provider(
+    repository,
+) -> None:
+    evidence, sector, stored = _persisted_replay_fixture()
+    repository.save_enriched_run([sector], [evidence], stored)
+    provider_calls: list[str] = []
+
+    class ProviderSpy:
+        def __getattr__(self, name: str):
+            provider_calls.append(name)
+            raise AssertionError("persisted replay must not access a live provider")
+
+    repository.provider = ProviderSpy()
+    replayed = MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
+        repository,
+        stored.run_key,
+    )
+
+    assert replayed.run_key == "cn:20260720T070000Z:replay"
+    assert replayed.sectors == stored.sectors
+    assert repository.resolve_snapshot_constituent_evidence(stored) == (evidence,)
+    assert provider_calls == []
+
+
+def test_repository_backed_replay_resolves_evidence_before_scoring(
+    repository,
+    monkeypatch,
+) -> None:
+    evidence, sector, stored = _persisted_replay_fixture()
+    repository.save_enriched_run([sector], [evidence], stored)
+    with repository.db.session_scope() as session:
+        row = session.get(RadarConstituentSetRecord, evidence.set_key)
+        assert row is not None
+        session.delete(row)
+    scoring_calls = 0
+
+    def score_spy(*_args, **_kwargs):
+        nonlocal scoring_calls
+        scoring_calls += 1
+        return []
+
+    monkeypatch.setattr("src.market_radar.replay.score_sectors", score_spy)
+
+    with pytest.raises(ValueError, match="missing referenced constituent set"):
+        MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
+            repository,
+            stored.run_key,
+        )
+
+    assert scoring_calls == 0
+
+
+def test_repository_backed_replay_rejects_corrupted_future_evidence(
+    repository,
+    monkeypatch,
+) -> None:
+    evidence, sector, stored = _persisted_replay_fixture()
+    repository.save_enriched_run([sector], [evidence], stored)
+    with repository.db.session_scope() as session:
+        row = session.execute(
+            select(RadarConstituentObservationRecord).where(
+                RadarConstituentObservationRecord.set_key == evidence.set_key
+            )
+        ).scalar_one()
+        row.observed_at = (stored.as_of + timedelta(minutes=1)).replace(tzinfo=None)
+    scoring_calls = 0
+
+    def score_spy(*_args, **_kwargs):
+        nonlocal scoring_calls
+        scoring_calls += 1
+        return []
+
+    monkeypatch.setattr("src.market_radar.replay.score_sectors", score_spy)
+
+    with pytest.raises(ValueError, match="observed_at.*after snapshot"):
+        MarketRadarReplayEngine(RankingConfig()).replay_persisted_run(
+            repository,
+            stored.run_key,
+        )
+
+    assert scoring_calls == 0

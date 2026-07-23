@@ -16,11 +16,13 @@
 
 import logging
 import random
+import inspect
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Optional, List, Tuple, Dict, Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
@@ -34,6 +36,25 @@ from .realtime_types import CircuitBreaker
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+_PERSISTED_TEXT_REDACTED = "[REDACTED]"
+_PERSISTED_SENSITIVE_MARKERS = (
+    "authorization",
+    "proxy-authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+    "token",
+    "secret",
+    "password",
+    "sendkey",
+    "credential",
+    "headers",
+    "cookies",
+)
 
 
 # === 标准化列名定义 ===
@@ -65,6 +86,15 @@ def summarize_exception(exc: Exception) -> Tuple[str, str]:
     error_type = type(root).__name__
     message = str(exc).strip() or str(root).strip() or error_type
     return error_type, " ".join(message.split())
+
+
+def sanitize_persisted_text(value: Any, limit: int = 256) -> str:
+    """Return bounded text that cannot persist credential-bearing details."""
+    text = " ".join(str(value or "").split())
+    lowered = text.casefold()
+    if any(marker in lowered for marker in _PERSISTED_SENSITIVE_MARKERS):
+        return _PERSISTED_TEXT_REDACTED
+    return text[: max(0, int(limit))]
 
 
 def normalize_stock_code(stock_code: str) -> str:
@@ -422,6 +452,53 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_sector_history(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native sector history when supported."""
+        return None
+
+    def get_sector_flow(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native sector capital flow when supported."""
+        return None
+
+    def get_sector_constituents(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native current sector membership when supported."""
+        return None
+
+    def get_index_history(
+        self,
+        code: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame | List[Dict[str, Any]]]:
+        """Return provider-native index history when identity is explicit."""
+        return None
+
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """
         获取市场人气股榜。
@@ -630,6 +707,14 @@ class DataFetcherManager:
     _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 30.0
     _concept_rankings_cache_lock = RLock()
     _concept_rankings_cache: Dict[int, Tuple[float, List[Dict], List[Dict]]] = {}
+    _MARKET_RADAR_CAPABILITY_METHODS = {
+        "sector_history": "get_sector_history",
+        "sector_flow": "get_sector_flow",
+        "sector_constituents": "get_sector_constituents",
+        "benchmark_history": "get_index_history",
+    }
+    _MARKET_RADAR_ERROR_LIMIT = 256
+    _MARKET_RADAR_TRACE_LIMIT = 1000
 
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
@@ -1718,7 +1803,17 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        attempt_policy: Any = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        attempt_trace: Optional[List[Dict[str, Any]]] = None,
+        result_validator: Optional[Callable[[Any], bool]] = None,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1833,6 +1928,31 @@ class DataFetcherManager:
         primary_fallback_from: Optional[str] = None
         
         for source_index, source in enumerate(source_priority):
+            if (
+                deadline_monotonic is not None
+                and monotonic() >= deadline_monotonic
+            ):
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    priority=True,
+                    provider=source,
+                    result="deadline_exceeded",
+                    code=stock_code,
+                )
+                break
+            if (
+                attempt_policy is not None
+                and not attempt_policy.should_attempt(
+                    "constituent_quotes", source
+                )
+            ):
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    provider=source,
+                    result="circuit_open",
+                    code=stock_code,
+                )
+                continue
             attempt_start = time.time()
             fallback_to = source_priority[source_index + 1] if source_index + 1 < len(source_priority) else None
             fetcher = None
@@ -1902,6 +2022,50 @@ class DataFetcherManager:
                 provider_name = fetcher.name if fetcher is not None else source
                 
                 if quote is not None and quote.has_basic_data():
+                    validation_error = ""
+                    if result_validator is not None:
+                        try:
+                            if not result_validator(quote):
+                                validation_error = "quote result validation failed"
+                        except Exception as exc:
+                            _, reason = summarize_exception(exc)
+                            validation_error = self._safe_market_radar_text(reason)
+                    if validation_error:
+                        if attempt_policy is not None:
+                            attempt_policy.record_attempt(
+                                "constituent_quotes", source, "invalid"
+                            )
+                        self._append_market_radar_attempt_trace(
+                            attempt_trace,
+                            provider=source,
+                            result="invalid",
+                            code=stock_code,
+                            error=validation_error,
+                        )
+                        record_provider_run(
+                            data_type="realtime_quote",
+                            provider=provider_name,
+                            operation="get_realtime_quote",
+                            success=False,
+                            latency_ms=int((time.time() - attempt_start) * 1000),
+                            error_type="invalid",
+                            error_message=validation_error,
+                            fallback_to=fallback_to,
+                            record_count=0,
+                        )
+                        if primary_quote is None:
+                            failed_sources.append(source)
+                        continue
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(
+                            "constituent_quotes", source, "ok"
+                        )
+                    self._append_market_radar_attempt_trace(
+                        attempt_trace,
+                        provider=source,
+                        result="ok",
+                        code=stock_code,
+                    )
                     record_provider_run(
                         data_type="realtime_quote",
                         provider=provider_name,
@@ -1939,6 +2103,16 @@ class DataFetcherManager:
                         if not self._quote_needs_supplement(primary_quote):
                             break
                 else:
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(
+                            "constituent_quotes", source, "empty"
+                        )
+                    self._append_market_radar_attempt_trace(
+                        attempt_trace,
+                        provider=source,
+                        result="empty",
+                        code=stock_code,
+                    )
                     record_provider_run(
                         data_type="realtime_quote",
                         provider=provider_name,
@@ -1956,6 +2130,17 @@ class DataFetcherManager:
             except Exception as e:
                 error_msg = f"[{source}] 失败: {str(e)}"
                 error_type, error_reason = summarize_exception(e)
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(
+                        "constituent_quotes", source, "failed"
+                    )
+                self._append_market_radar_attempt_trace(
+                    attempt_trace,
+                    provider=source,
+                    result="failed",
+                    code=stock_code,
+                    error=error_reason,
+                )
                 record_provider_run(
                     data_type="realtime_quote",
                     provider=getattr(fetcher, "name", source),
@@ -3643,6 +3828,283 @@ class DataFetcherManager:
     ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
         """Return sector rankings with the complete ordered provider trace."""
         return self._get_sector_rankings_with_meta(n)
+
+    @classmethod
+    def _safe_market_radar_text(cls, value: Any) -> str:
+        return sanitize_persisted_text(value, cls._MARKET_RADAR_ERROR_LIMIT)
+
+    @classmethod
+    def _append_market_radar_attempt_trace(
+        cls,
+        trace: Optional[List[Dict[str, Any]]],
+        *,
+        priority: bool = False,
+        **values: Any,
+    ) -> None:
+        if trace is None:
+            return
+        entry: Dict[str, Any] = {}
+        for key in ("provider", "result", "code", "error"):
+            if key in values and values[key] is not None:
+                entry[key] = cls._safe_market_radar_text(values[key])
+        if priority:
+            if len(trace) >= cls._MARKET_RADAR_TRACE_LIMIT:
+                trace.pop()
+            trace.insert(0, entry)
+        elif len(trace) < cls._MARKET_RADAR_TRACE_LIMIT:
+            trace.append(entry)
+
+    @staticmethod
+    def _implements_market_radar_capability(
+        fetcher: BaseFetcher,
+        method_name: str,
+    ) -> bool:
+        declared_method = getattr(type(fetcher), method_name, None)
+        base_method = getattr(BaseFetcher, method_name, None)
+        if declared_method is not None and declared_method is not base_method:
+            return True
+        return callable(getattr(fetcher, "__dict__", {}).get(method_name))
+
+    def _call_market_radar_capability(
+        self,
+        fetcher: BaseFetcher,
+        method_name: str,
+        args: tuple[Any, ...],
+        as_of: Optional[datetime],
+        deadline_monotonic: Optional[float],
+        monotonic: Callable[[], float],
+    ) -> Any:
+        method = getattr(fetcher, method_name)
+        parameters = inspect.signature(method).parameters.values()
+        parameter_names = {parameter.name for parameter in parameters}
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        optional = {
+            "as_of": as_of,
+            "deadline_monotonic": deadline_monotonic,
+            "monotonic": monotonic,
+        }
+        kwargs = {
+            name: value
+            for name, value in optional.items()
+            if accepts_kwargs or name in parameter_names
+        }
+        return self._call_fetcher_method(
+            fetcher,
+            method_name,
+            *args,
+            **kwargs,
+        )
+
+    def _attempt_market_radar_source(
+        self,
+        fetcher: BaseFetcher,
+        *,
+        capability: str,
+        method_name: str,
+        kind: str,
+        name: str,
+        as_of: Optional[datetime],
+        target_date: Optional[date],
+        attempt_policy: Any,
+        deadline_monotonic: Optional[float],
+        monotonic: Callable[[], float],
+    ) -> Tuple[Any | None, Dict[str, Any], str, Optional[date]]:
+        from src.market_radar.capability_provider import (
+            provider_capability_data_date,
+            validate_provider_capability_payload,
+        )
+
+        provider = self._safe_market_radar_text(
+            getattr(fetcher, "name", type(fetcher).__name__)
+        )[:80]
+        started = time.monotonic()
+        with self._get_fetcher_call_lock(fetcher):
+            if (
+                deadline_monotonic is not None
+                and monotonic() >= deadline_monotonic
+            ):
+                return None, {
+                    "provider": provider,
+                    "result": "deadline_exceeded",
+                    "duration_ms": 0,
+                }, "deadline_exceeded", None
+            if (
+                attempt_policy is not None
+                and not attempt_policy.should_attempt(capability, provider)
+            ):
+                return None, {
+                    "provider": provider,
+                    "result": "circuit_open",
+                    "duration_ms": 0,
+                }, "", None
+            try:
+                args = (name,) if capability == "benchmark_history" else (kind, name)
+                payload = self._call_market_radar_capability(
+                    fetcher,
+                    method_name,
+                    args,
+                    as_of,
+                    deadline_monotonic,
+                    monotonic,
+                )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                if (
+                    deadline_monotonic is not None
+                    and monotonic() >= deadline_monotonic
+                ):
+                    return None, {
+                        "provider": provider,
+                        "result": "deadline_exceeded",
+                        "duration_ms": duration_ms,
+                    }, "deadline_exceeded", None
+                is_valid, reason = validate_provider_capability_payload(
+                    capability, payload, as_of=as_of
+                )
+                if is_valid:
+                    terminal = provider_capability_data_date(capability, payload)
+                    if target_date is not None and terminal is None:
+                        result = "partial"
+                        error = "unversioned_current_membership"
+                    elif (
+                        target_date is not None
+                        and terminal is not None
+                        and terminal < target_date
+                    ):
+                        result = "stale"
+                        error = "provider terminal date precedes requested as_of"
+                    else:
+                        result = "ok"
+                        error = ""
+                    if attempt_policy is not None:
+                        attempt_policy.record_attempt(capability, provider, result)
+                    entry: Dict[str, Any] = {
+                        "provider": provider,
+                        "result": result,
+                        "duration_ms": duration_ms,
+                    }
+                    if error:
+                        entry["error"] = error
+                    return payload, entry, "", terminal
+
+                result = "empty" if reason == "empty result" else "invalid"
+                last_error = self._safe_market_radar_text(
+                    f"{provider} returned {reason}"
+                )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, result)
+                return None, {
+                    "provider": provider,
+                    "result": result,
+                    "duration_ms": duration_ms,
+                    "error": last_error,
+                }, last_error, None
+            except Exception as exc:
+                if (
+                    deadline_monotonic is not None
+                    and monotonic() >= deadline_monotonic
+                ):
+                    return None, {
+                        "provider": provider,
+                        "result": "deadline_exceeded",
+                        "duration_ms": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                    }, "deadline_exceeded", None
+                error_type, error_reason = summarize_exception(exc)
+                safe_reason = self._safe_market_radar_text(error_reason)
+                last_error = self._safe_market_radar_text(
+                    f"{provider} ({error_type}) {safe_reason}"
+                )
+                if attempt_policy is not None:
+                    attempt_policy.record_attempt(capability, provider, "failed")
+                return None, {
+                    "provider": provider,
+                    "result": "failed",
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "error": safe_reason,
+                }, last_error, None
+
+    def get_market_radar_capability_with_meta(
+        self,
+        capability: str,
+        *,
+        kind: str,
+        name: str,
+        as_of: Optional[datetime] = None,
+        attempt_policy: Any = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Tuple[Any | None, List[Dict[str, Any]], str]:
+        """Fetch one enrichment capability with an ordered, bounded trace."""
+        method_name = self._MARKET_RADAR_CAPABILITY_METHODS.get(capability)
+        if method_name is None:
+            raise ValueError(f"unsupported Market Radar capability: {capability}")
+        allowed_kinds = {"index"} if capability == "benchmark_history" else {
+            "industry",
+            "concept",
+        }
+        if kind not in allowed_kinds:
+            raise ValueError(f"unsupported sector kind: {kind}")
+
+        source_chain: List[Dict[str, Any]] = []
+        last_error = ""
+        stale_candidate: Optional[Tuple[date, Any, int]] = None
+        partial_candidate: Optional[Tuple[Any, int]] = None
+        target_date = None
+        if as_of is not None:
+            if as_of.tzinfo is None or as_of.utcoffset() is None:
+                raise ValueError("as_of must be timezone-aware")
+            target_date = as_of.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        for fetcher in self._get_fetchers_snapshot():
+            method = getattr(fetcher, method_name, None)
+            if not callable(method) or not self._implements_market_radar_capability(
+                fetcher,
+                method_name,
+            ):
+                continue
+            payload, entry, attempt_error, terminal = (
+                self._attempt_market_radar_source(
+                    fetcher,
+                    capability=capability,
+                    method_name=method_name,
+                    kind=kind,
+                    name=name,
+                    as_of=as_of,
+                    target_date=target_date,
+                    attempt_policy=attempt_policy,
+                    deadline_monotonic=deadline_monotonic,
+                    monotonic=monotonic,
+                )
+            )
+            source_chain.append(entry)
+            result = entry["result"]
+            if attempt_error:
+                last_error = attempt_error
+            if result == "ok":
+                return payload, source_chain, ""
+            if result == "deadline_exceeded":
+                break
+            if result == "partial" and partial_candidate is None:
+                partial_candidate = (payload, len(source_chain) - 1)
+            elif result == "stale" and terminal is not None:
+                if stale_candidate is None or terminal > stale_candidate[0]:
+                    stale_candidate = (
+                        terminal,
+                        payload,
+                        len(source_chain) - 1,
+                    )
+        if stale_candidate is not None:
+            _, payload, trace_index = stale_candidate
+            source_chain[trace_index]["selected"] = True
+            return payload, source_chain, ""
+        if partial_candidate is not None:
+            payload, trace_index = partial_candidate
+            source_chain[trace_index]["selected"] = True
+            return payload, source_chain, ""
+        return None, source_chain, last_error
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""

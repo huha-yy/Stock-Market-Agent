@@ -8,8 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 修复 Market Radar 在运行开始后取得的有效实时报价被误判为未来数据的问题，并确保最终快照时间不早于已接受证据的获取时间。
 - [新功能] 新增 A 股 Market Radar 第一阶段基础能力，包括板块/ETF 契约、可追溯数据质量、确定性评分、快照持久化、离线回放基础与手动 CLI；暂不包含 Web、API、调度、告警、仓位策略和港股。
 - [修复] 修复 Market Radar 生效日期历史被后续同步覆盖、发现板块使用 UTC 日期、价量背离缺失被误判为否，以及回放 stale 质量降级为 partial 的契约问题。
+- [新功能] Market Radar Phase 2A 新增 A 股板块多周期行情、资金流、成分股广度与集中度观测增强。
+- [改进] Market Radar 增加有界候选筛选、超时并发控制和不可变成分股证据存储。
+- [文档] 补充 Market Radar Phase 2A 配置、当前时点、降级与持久化回放说明。
+- [修复] 修复 Market Radar 将无日期成分股回填为历史交易日的时点穿越，并补齐腾讯/新浪 A 股实时行情的权威时间戳与昨收价解析，确保默认 fallback 链路只发布同日有效报价。
 - [新功能] 新增 `--portfolio futu`，只读导入 Futu OpenD 真实账户的沪深 A 股、港股、美股 LONG 正股持仓作为分析列表。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->

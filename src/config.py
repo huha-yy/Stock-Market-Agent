@@ -1036,6 +1036,9 @@ class Config:
     market_radar_provider_limit: int = 1000
     market_radar_stale_after_seconds: int = 2700
     market_radar_scoring_version: str = "cn-v1"
+    market_radar_enrichment_limit: int = 60
+    market_radar_enrichment_budget_seconds: int = 180
+    market_radar_enrichment_max_concurrency: int = 6
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
@@ -2007,6 +2010,27 @@ class Config:
             market_radar_scoring_version=(
                 os.getenv('MARKET_RADAR_SCORING_VERSION', 'cn-v1').strip()
                 or 'cn-v1'
+            ),
+            market_radar_enrichment_limit=parse_env_int(
+                os.getenv('MARKET_RADAR_ENRICHMENT_LIMIT'),
+                60,
+                field_name='MARKET_RADAR_ENRICHMENT_LIMIT',
+                minimum=1,
+                maximum=200,
+            ),
+            market_radar_enrichment_budget_seconds=parse_env_int(
+                os.getenv('MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS'),
+                180,
+                field_name='MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS',
+                minimum=10,
+                maximum=900,
+            ),
+            market_radar_enrichment_max_concurrency=parse_env_int(
+                os.getenv('MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY'),
+                6,
+                field_name='MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY',
+                minimum=1,
+                maximum=16,
             ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',

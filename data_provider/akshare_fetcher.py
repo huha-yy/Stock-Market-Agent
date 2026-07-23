@@ -29,8 +29,9 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime, timedelta
+from typing import Callable, Optional, Dict, Any, List, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -64,6 +65,7 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
+_CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 # User-Agent 池，用于随机轮换
@@ -189,6 +191,15 @@ def _parse_tencent_amount(fields: List[str]) -> Optional[float]:
 
     amount_wan = safe_float(fields[37]) if len(fields) > 37 and fields[37] else None
     return amount_wan * 10000 if amount_wan is not None else None
+
+
+def _parse_cn_provider_timestamp(value: str, format_string: str) -> str:
+    """Parse an authoritative provider wall-clock time in Asia/Shanghai."""
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        raise ValueError("provider timestamp is missing")
+    parsed = datetime.strptime(raw_value, format_string)
+    return parsed.replace(tzinfo=_CN_MARKET_TIMEZONE).isoformat()
 
 
 def is_hk_stock_code(stock_code: str) -> bool:
@@ -984,7 +995,11 @@ class AkshareFetcher(BaseFetcher):
                         import time as _time
                         api_start = _time.time()
 
-                        df = ak.stock_zh_a_spot_em()
+                        df = _akshare_call_with_timeout(
+                            ak.stock_zh_a_spot_em,
+                            timeout=self._history_call_timeout,
+                            call_name="ak.stock_zh_a_spot_em",
+                        )
 
                         api_elapsed = _time.time() - api_start
                         logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
@@ -1149,14 +1164,16 @@ class AkshareFetcher(BaseFetcher):
                 circuit_breaker.record_failure(source_key, failure_message)
                 return None
             
-            circuit_breaker.record_success(source_key)
-            
             # 新浪数据字段顺序：
             # 0:名称 1:今开 2:昨收 3:最新价 4:最高 5:最低 6:买一价 7:卖一价
             # 8:成交量(股) 9:成交额(元) ... 30:日期 31:时间
             # 使用 realtime_types.py 中的统一转换函数
             price = safe_float(fields[3])
             pre_close = safe_float(fields[2])
+            provider_timestamp = _parse_cn_provider_timestamp(
+                f"{fields[30].strip()} {fields[31].strip()}",
+                "%Y-%m-%d %H:%M:%S",
+            )
             change_pct = None
             change_amount = None
             if price and pre_close and pre_close > 0:
@@ -1176,7 +1193,9 @@ class AkshareFetcher(BaseFetcher):
                 high=safe_float(fields[4]),
                 low=safe_float(fields[5]),
                 pre_close=pre_close,
+                provider_timestamp=provider_timestamp,
             )
+            circuit_breaker.record_success(source_key)
             
             logger.info(
                 f"[实时行情-新浪] {stock_code} {quote.name}: endpoint={SINA_REALTIME_ENDPOINT}, "
@@ -1299,8 +1318,6 @@ class AkshareFetcher(BaseFetcher):
                 circuit_breaker.record_failure(source_key, failure_message)
                 return None
             
-            circuit_breaker.record_success(source_key)
-            
             # 腾讯数据字段顺序（完整）：
             # 1:名称 2:代码 3:最新价 4:昨收 5:今开 6:成交量 7:外盘 8:内盘
             # 9-28:买卖五档 30:时间戳 31:涨跌额 32:涨跌幅(%) 33:最高 34:最低 35:收盘/成交量/成交额
@@ -1308,10 +1325,14 @@ class AkshareFetcher(BaseFetcher):
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
             # 使用 realtime_types.py 中的统一转换函数
             amount = _parse_tencent_amount(fields)
+            provider_timestamp = _parse_cn_provider_timestamp(
+                fields[30], "%Y%m%d%H%M%S"
+            )
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
                 source=RealtimeSource.TENCENT,
+                provider_timestamp=provider_timestamp,
                 price=safe_float(fields[3]),
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
@@ -1329,6 +1350,7 @@ class AkshareFetcher(BaseFetcher):
                 circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
                 total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
             )
+            circuit_breaker.record_success(source_key)
             
             logger.info(
                 f"[实时行情-腾讯] {stock_code} {quote.name}: endpoint={TENCENT_REALTIME_ENDPOINT}, "
@@ -2006,6 +2028,207 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Akshare] 获取概念排行失败: {e}")
             return None
+
+    def _get_sector_history_frame(
+        self,
+        ak: Any,
+        kind: str,
+        name: str,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame]:
+        if kind == "industry":
+            endpoint = ak.stock_board_industry_hist_em
+            period = "日k"
+            call_name = "ak.stock_board_industry_hist_em"
+        elif kind == "concept":
+            endpoint = ak.stock_board_concept_hist_em
+            period = "daily"
+            call_name = "ak.stock_board_concept_hist_em"
+        else:
+            return None
+
+        end = self._market_radar_request_date(as_of)
+        start = end - timedelta(days=180)
+        self._market_radar_call_timeout(deadline_monotonic, monotonic)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        call_timeout = self._market_radar_call_timeout(
+            deadline_monotonic, monotonic
+        )
+        return _akshare_call_with_timeout(
+            endpoint,
+            symbol=name,
+            period=period,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            adjust="",
+            timeout=call_timeout,
+            call_name=call_name,
+        )
+
+    def get_sector_history(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch industry or concept daily history from its explicit endpoint."""
+        import akshare as ak
+
+        return self._get_sector_history_frame(
+            ak,
+            kind,
+            name,
+            as_of,
+            deadline_monotonic,
+            monotonic,
+        )
+
+    @staticmethod
+    def _market_radar_request_date(as_of: Optional[datetime]):
+        if as_of is None:
+            return datetime.now(_CN_MARKET_TIMEZONE).date()
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        return as_of.astimezone(_CN_MARKET_TIMEZONE).date()
+
+    def _market_radar_call_timeout(
+        self,
+        deadline_monotonic: Optional[float],
+        monotonic: Callable[[], float],
+    ) -> float:
+        if deadline_monotonic is None:
+            return float(self._history_call_timeout)
+        remaining = float(deadline_monotonic) - float(monotonic())
+        if remaining <= 0:
+            raise TimeoutError("market radar deadline exceeded")
+        return min(float(self._history_call_timeout), remaining)
+
+    def get_index_history(
+        self,
+        code: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch A-share index history without treating its code as an equity."""
+        import akshare as ak
+
+        end = self._market_radar_request_date(as_of)
+        start = end - timedelta(days=180)
+        self._market_radar_call_timeout(deadline_monotonic, monotonic)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        call_timeout = self._market_radar_call_timeout(
+            deadline_monotonic, monotonic
+        )
+        return _akshare_call_with_timeout(
+            ak.index_zh_a_hist,
+            symbol=code,
+            period="daily",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            timeout=call_timeout,
+            call_name="ak.index_zh_a_hist",
+        )
+
+    def get_sector_flow(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch industry flow and join same-source traded amount by date."""
+        if kind != "industry":
+            return None
+
+        import akshare as ak
+
+        self._market_radar_call_timeout(deadline_monotonic, monotonic)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        call_timeout = self._market_radar_call_timeout(
+            deadline_monotonic, monotonic
+        )
+        flow = _akshare_call_with_timeout(
+            ak.stock_sector_fund_flow_hist,
+            symbol=name,
+            timeout=call_timeout,
+            call_name="ak.stock_sector_fund_flow_hist",
+        )
+        if flow is None or flow.empty:
+            return flow
+
+        history = self._get_sector_history_frame(
+            ak,
+            kind,
+            name,
+            as_of,
+            deadline_monotonic,
+            monotonic,
+        )
+        if history is None or history.empty:
+            return flow
+        if "日期" not in flow.columns or not {"日期", "成交额"}.issubset(
+            history.columns
+        ):
+            return flow
+
+        flow = flow.copy()
+        amount = history[["日期", "成交额"]].copy()
+        flow["日期"] = pd.to_datetime(flow["日期"], errors="coerce").dt.date
+        amount["日期"] = pd.to_datetime(amount["日期"], errors="coerce").dt.date
+        return flow.merge(amount, on="日期", how="inner", validate="many_to_one")
+
+    def get_sector_constituents(
+        self,
+        kind: str,
+        name: str,
+        *,
+        as_of: Optional[datetime] = None,
+        deadline_monotonic: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch undated observation-only membership.
+
+        This current snapshot cannot support dated breadth or dated evidence.
+        """
+        import akshare as ak
+
+        if kind == "industry":
+            endpoint = ak.stock_board_industry_cons_em
+            call_name = "ak.stock_board_industry_cons_em"
+        elif kind == "concept":
+            endpoint = ak.stock_board_concept_cons_em
+            call_name = "ak.stock_board_concept_cons_em"
+        else:
+            return None
+
+        self._market_radar_call_timeout(deadline_monotonic, monotonic)
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        call_timeout = self._market_radar_call_timeout(
+            deadline_monotonic, monotonic
+        )
+        constituents = _akshare_call_with_timeout(
+            endpoint,
+            symbol=name,
+            timeout=call_timeout,
+            call_name=call_name,
+        )
+        if constituents is None or constituents.empty:
+            return constituents
+
+        return constituents
 
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """获取人气股榜，按免配置热榜数据源降级。"""
