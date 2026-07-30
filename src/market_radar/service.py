@@ -11,6 +11,7 @@ from src.market_radar.candidates import CandidateSelector, EnrichmentCandidate
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.enrichment import EnrichmentBatch
 from src.market_radar.etf_selection import select_etfs
+from src.market_radar.lifecycle import MarketRadarLifecycleEngine
 from src.market_radar.models import (
     RadarRunSnapshot,
     SectorDefinition,
@@ -333,6 +334,7 @@ class MarketRadarService:
         etf_policy_config: EtfPolicyConfig | None = None,
         regime_config: RegimeConfig | None = None,
         position_policy_config: PositionPolicyConfig | None = None,
+        lifecycle_engine: MarketRadarLifecycleEngine | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.universe_loader = universe_loader
@@ -361,6 +363,7 @@ class MarketRadarService:
         self.position_policy_config = (
             position_policy_config or PositionPolicyConfig()
         )
+        self.lifecycle_engine = lifecycle_engine
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def run(
@@ -368,13 +371,27 @@ class MarketRadarService:
         *,
         market: str = "cn",
         as_of: datetime | None = None,
-        trigger: Literal["manual", "replay"] = "manual",
+        trigger: Literal["manual", "schedule", "replay"] = "manual",
+        schedule_kind: Literal["intraday", "eod"] | None = None,
         persist: bool = True,
         discovery_only: bool = False,
         previous_snapshot: RadarRunSnapshot | None = None,
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar supports market=cn only")
+        if trigger == "schedule":
+            if not persist or schedule_kind is None:
+                raise ValueError(
+                    "schedule runs require persistence and schedule_kind"
+                )
+            if discovery_only or self.enricher is None or self.etf_collector is None:
+                raise ValueError(
+                    "schedule runs require full Phase 2B enrichment"
+                )
+            if self.lifecycle_engine is None:
+                raise ValueError("lifecycle_engine is required for schedule runs")
+        elif schedule_kind is not None:
+            raise ValueError("schedule_kind is only valid for schedule runs")
         if trigger == "replay":
             raise ValueError(
                 "MarketRadarService.run does not perform live replay; use "
@@ -520,7 +537,21 @@ class MarketRadarService:
                     item.effective_from,
                 ),
             )
-            if enrichment is None and not phase2b_enabled:
+            if trigger == "schedule":
+                context = repository.load_lifecycle_context()
+                evaluation = self.lifecycle_engine.evaluate(
+                    snapshot,
+                    context,
+                    run_kind=schedule_kind,
+                )
+                run_id = repository.save_scheduled_enriched_run(
+                    sorted_universe,
+                    enrichment.constituent_evidence,
+                    etf_observations,
+                    snapshot,
+                    evaluation,
+                )
+            elif enrichment is None and not phase2b_enabled:
                 run_id = repository.save_run_with_universe(
                     sorted_universe,
                     snapshot,

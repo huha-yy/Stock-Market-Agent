@@ -10,6 +10,8 @@ import pytest
 
 from scripts import run_market_radar
 from src.config import Config
+from src.market_radar import factory as factory_module
+from src.market_radar.service import MarketRadarService
 
 
 MARKET_RADAR_ENV = (
@@ -120,7 +122,7 @@ def test_build_service_composes_enrichment_with_one_shared_manager(monkeypatch) 
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "get_config",
         lambda: _runtime_config(
             market_radar_enrichment_limit=75,
@@ -135,44 +137,44 @@ def test_build_service_composes_enrichment_with_one_shared_manager(monkeypatch) 
         manager_calls += 1
         return manager
 
-    monkeypatch.setattr(run_market_radar, "DataFetcherManager", build_manager)
+    monkeypatch.setattr(factory_module, "DataFetcherManager", build_manager)
 
     def build_universe_loader(path):
         captured["universe_path"] = path
         return universe_loader
 
-    monkeypatch.setattr(run_market_radar, "UniverseLoader", build_universe_loader)
+    monkeypatch.setattr(factory_module, "UniverseLoader", build_universe_loader)
 
     def build_provider(actual_manager, *, limit):
         captured["manager"] = actual_manager
         captured["limit"] = limit
         return provider
 
-    monkeypatch.setattr(run_market_radar, "LegacyRankingProvider", build_provider)
+    monkeypatch.setattr(factory_module, "LegacyRankingProvider", build_provider)
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "ProviderCapabilityAdapter",
         lambda actual_manager: (
             captured.setdefault("adapter_manager", actual_manager),
             adapter,
         )[1],
     )
-    monkeypatch.setattr(run_market_radar, "CandidateSelector", lambda: selector)
+    monkeypatch.setattr(factory_module, "CandidateSelector", lambda: selector)
 
     def build_enricher(*, provider, config):
         captured["adapter"] = provider
         captured["enrichment_config"] = config
         return enricher
 
-    monkeypatch.setattr(run_market_radar, "MarketRadarEnricher", build_enricher)
-    monkeypatch.setattr(run_market_radar, "MarketRadarRepository", lambda: repository)
+    monkeypatch.setattr(factory_module, "MarketRadarEnricher", build_enricher)
+    monkeypatch.setattr(factory_module, "MarketRadarRepository", lambda: repository)
 
     result = run_market_radar.build_service(persist=True)
 
-    assert isinstance(result, run_market_radar.MarketRadarService)
+    assert isinstance(result, MarketRadarService)
     assert manager_calls == 1
     assert captured["universe_path"] == (
-        run_market_radar.ROOT / "src/data/market_radar/a_share_etfs.yaml"
+        factory_module.ROOT / "src/data/market_radar/a_share_etfs.yaml"
     )
     assert captured["manager"] is manager
     assert captured["adapter_manager"] is manager
@@ -197,17 +199,17 @@ def test_build_service_default_mode_does_not_initialize_database(
     from src.storage import DatabaseManager
 
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "get_config",
         _runtime_config,
     )
-    monkeypatch.setattr(run_market_radar, "DataFetcherManager", lambda: object())
+    monkeypatch.setattr(factory_module, "DataFetcherManager", lambda: object())
 
     def unexpected_database(*_args, **_kwargs):
         raise AssertionError("non-persistent CLI must not initialize the database")
 
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "MarketRadarRepository",
         unexpected_database,
     )
@@ -215,23 +217,56 @@ def test_build_service_default_mode_does_not_initialize_database(
 
     service = run_market_radar.build_service(persist=False)
 
-    assert isinstance(service, run_market_radar.MarketRadarService)
+    assert isinstance(service, MarketRadarService)
     assert service.repository is None
+
+
+def test_reusable_factory_reuses_injected_repository(monkeypatch) -> None:
+    factory = importlib.import_module("src.market_radar.factory")
+
+    class FalseyRepository:
+        def __bool__(self) -> bool:
+            return False
+
+    repository = FalseyRepository()
+    monkeypatch.setattr(factory, "get_config", _runtime_config)
+    monkeypatch.setattr(factory, "DataFetcherManager", lambda: object())
+
+    def unexpected_repository():
+        raise AssertionError("an injected repository must be reused")
+
+    monkeypatch.setattr(factory, "MarketRadarRepository", unexpected_repository)
+
+    service = factory.build_market_radar_service(
+        persist=True,
+        repository=repository,
+    )
+
+    assert service.repository is repository
+    assert service.enricher is not None
+    assert service.etf_collector is not None
+    assert service.lifecycle_engine is not None
+
+
+def test_cli_build_service_is_factory_compatibility_alias() -> None:
+    from src.market_radar.factory import build_market_radar_service
+
+    assert run_market_radar.build_service is build_market_radar_service
 
 
 def test_build_service_discovery_only_skips_enrichment_construction(
     monkeypatch,
 ) -> None:
     manager = object()
-    monkeypatch.setattr(run_market_radar, "get_config", _runtime_config)
-    monkeypatch.setattr(run_market_radar, "DataFetcherManager", lambda: manager)
+    monkeypatch.setattr(factory_module, "get_config", _runtime_config)
+    monkeypatch.setattr(factory_module, "DataFetcherManager", lambda: manager)
 
     def unexpected(*_args, **_kwargs):
         raise AssertionError("discovery-only mode must not construct enrichment")
 
-    monkeypatch.setattr(run_market_radar, "ProviderCapabilityAdapter", unexpected)
-    monkeypatch.setattr(run_market_radar, "CandidateSelector", unexpected)
-    monkeypatch.setattr(run_market_radar, "MarketRadarEnricher", unexpected)
+    monkeypatch.setattr(factory_module, "ProviderCapabilityAdapter", unexpected)
+    monkeypatch.setattr(factory_module, "CandidateSelector", unexpected)
+    monkeypatch.setattr(factory_module, "MarketRadarEnricher", unexpected)
 
     service = run_market_radar.build_service(
         persist=False,
@@ -248,7 +283,7 @@ def test_invalid_scoring_version_fails_before_side_effectful_construction(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "get_config",
         lambda: _runtime_config(market_radar_scoring_version="cn-v2"),
     )
@@ -262,17 +297,17 @@ def test_invalid_scoring_version_fails_before_side_effectful_construction(
         return construct
 
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "DataFetcherManager",
         unexpected("manager"),
     )
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "UniverseLoader",
         unexpected("universe"),
     )
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "MarketRadarRepository",
         unexpected("repository"),
     )
@@ -287,7 +322,7 @@ def test_invalid_enrichment_config_fails_before_side_effectful_construction(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "get_config",
         lambda: _runtime_config(market_radar_enrichment_limit=0),
     )
@@ -300,10 +335,10 @@ def test_invalid_enrichment_config_fails_before_side_effectful_construction(
 
         return construct
 
-    monkeypatch.setattr(run_market_radar, "DataFetcherManager", unexpected("manager"))
-    monkeypatch.setattr(run_market_radar, "UniverseLoader", unexpected("universe"))
+    monkeypatch.setattr(factory_module, "DataFetcherManager", unexpected("manager"))
+    monkeypatch.setattr(factory_module, "UniverseLoader", unexpected("universe"))
     monkeypatch.setattr(
-        run_market_radar,
+        factory_module,
         "MarketRadarRepository",
         unexpected("repository"),
     )

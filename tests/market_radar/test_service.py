@@ -11,6 +11,7 @@ from src.market_radar.candidates import EnrichmentCandidate
 from src.market_radar.capabilities import MarketRadarEnrichmentConfig
 from src.market_radar.enrichment import EnrichmentBatch
 from src.market_radar.etf_collection import EtfCollectionBatch
+from src.market_radar.lifecycle import LifecycleContext, LifecycleEvaluation
 from src.market_radar.models import (
     EtfDefinition,
     RadarRunSnapshot,
@@ -142,6 +143,9 @@ class FakeRepository:
         self.enriched_writes: list[
             tuple[list[SectorDefinition], tuple[object, ...], RadarRunSnapshot]
         ] = []
+        self.lifecycle_context = LifecycleContext()
+        self.lifecycle_loads = 0
+        self.scheduled_writes: list[tuple[object, ...]] = []
 
     def save_run_with_universe(
         self,
@@ -189,6 +193,29 @@ class FakeRepository:
         self.enriched_writes.append((sectors, evidence, snapshot))
         return 7
 
+    def load_lifecycle_context(self) -> LifecycleContext:
+        if self.events is not None:
+            self.events.append("load_lifecycle")
+        self.lifecycle_loads += 1
+        return self.lifecycle_context
+
+    def save_scheduled_enriched_run(
+        self,
+        sectors,
+        evidence,
+        etf_observations,
+        snapshot,
+        evaluation,
+    ) -> int:
+        if self.events is not None:
+            self.events.append("persist_scheduled")
+        self.universe = sectors
+        self.snapshot = snapshot
+        self.scheduled_writes.append(
+            (sectors, evidence, etf_observations, snapshot, evaluation)
+        )
+        return 7
+
 
 class RecordingSelector:
     def __init__(
@@ -228,6 +255,22 @@ class RecordingEnricher:
         return self.result
 
 
+class RecordingLifecycleEngine:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events
+        self.calls: list[tuple[object, ...]] = []
+
+    def evaluate(self, snapshot, context, *, run_kind):
+        if self.events is not None:
+            self.events.append("evaluate_lifecycle")
+        self.calls.append((snapshot, context, run_kind))
+        return LifecycleEvaluation(
+            run_key=snapshot.run_key,
+            signals=(),
+            transitions=(),
+        )
+
+
 def _service(
     *,
     universe: FakeUniverse | None = None,
@@ -237,9 +280,10 @@ def _service(
     candidate_selector: RecordingSelector | None = None,
     enrichment_config: MarketRadarEnrichmentConfig | None = None,
     etf_collector=None,
+    lifecycle_engine=None,
     clock=lambda: NOW,
 ) -> MarketRadarService:
-    return MarketRadarService(
+    service_kwargs = dict(
         universe_loader=universe or FakeUniverse(),
         provider=provider or FakeProvider(),
         repository=repository or FakeRepository(),
@@ -250,6 +294,125 @@ def _service(
         etf_collector=etf_collector,
         clock=clock,
     )
+    if lifecycle_engine is not None:
+        service_kwargs["lifecycle_engine"] = lifecycle_engine
+    return MarketRadarService(**service_kwargs)
+
+
+class EmptyEtfCollector:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events
+
+    def collect(self, universe, sectors, as_of):
+        if self.events is not None:
+            self.events.append("collect_etfs")
+        return EtfCollectionBatch((), (), as_of)
+
+
+def test_schedule_run_requires_persistence_and_schedule_kind() -> None:
+    service = _service(repository=FakeRepository())
+
+    with pytest.raises(ValueError, match="schedule runs require persistence"):
+        service.run(
+            trigger="schedule",
+            persist=False,
+            schedule_kind="intraday",
+        )
+    with pytest.raises(ValueError, match="schedule_kind"):
+        service.run(trigger="schedule", persist=True)
+    with pytest.raises(ValueError, match="only valid for schedule runs"):
+        service.run(trigger="manual", schedule_kind="eod")
+
+
+@pytest.mark.parametrize(
+    ("enricher", "etf_collector", "discovery_only"),
+    [
+        (None, EmptyEtfCollector(), False),
+        (RecordingEnricher(EnrichmentBatch((), (), ())), None, False),
+        (
+            RecordingEnricher(EnrichmentBatch((), (), ())),
+            EmptyEtfCollector(),
+            True,
+        ),
+    ],
+)
+def test_schedule_run_requires_full_phase2b_enrichment(
+    enricher,
+    etf_collector,
+    discovery_only,
+) -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="full Phase 2B enrichment"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=FakeRepository(events=events),
+            enricher=enricher,
+            etf_collector=etf_collector,
+            lifecycle_engine=RecordingLifecycleEngine(events),
+        ).run(
+            trigger="schedule",
+            schedule_kind="intraday",
+            discovery_only=discovery_only,
+        )
+
+    assert events == []
+
+
+def test_schedule_run_saves_snapshot_and_lifecycle_once() -> None:
+    events: list[str] = []
+    repository = FakeRepository(events=events)
+    lifecycle_engine = RecordingLifecycleEngine(events)
+    service = _service(
+        universe=FakeUniverse(events=events),
+        provider=FakeProvider(events=events),
+        repository=repository,
+        enricher=RecordingEnricher(EnrichmentBatch((), (), ()), events=events),
+        candidate_selector=RecordingSelector(events=events),
+        etf_collector=EmptyEtfCollector(events),
+        lifecycle_engine=lifecycle_engine,
+    )
+
+    result = service.run(
+        trigger="schedule",
+        persist=True,
+        schedule_kind="intraday",
+    )
+
+    assert result.trigger == "schedule"
+    assert repository.lifecycle_loads == 1
+    assert len(repository.scheduled_writes) == 1
+    assert repository.enriched_writes == []
+    assert lifecycle_engine.calls == [
+        (repository.snapshot, repository.lifecycle_context, "intraday")
+    ]
+    assert events == [
+        "load",
+        "fetch",
+        "latest",
+        "select",
+        "enrich",
+        "collect_etfs",
+        "load_lifecycle",
+        "evaluate_lifecycle",
+        "persist_scheduled",
+        "get",
+    ]
+
+
+def test_manual_run_does_not_load_or_save_lifecycle() -> None:
+    repository = FakeRepository()
+    lifecycle_engine = RecordingLifecycleEngine()
+
+    _service(
+        repository=repository,
+        lifecycle_engine=lifecycle_engine,
+    ).run(trigger="manual", persist=True)
+
+    assert repository.lifecycle_loads == 0
+    assert repository.scheduled_writes == []
+    assert lifecycle_engine.calls == []
 
 
 def test_phase2b_policy_runs_after_sector_scoring_and_persists_once(
