@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from src.market_radar.models import (
     FrozenModel,
@@ -33,12 +33,28 @@ class LifecycleSignal(FrozenModel):
     previous_run_key: str | None = None
     current_run_key: str
     effective_at: datetime
-    qualifying_streak: int = Field(ge=0)
+    intraday_qualifying_streak: int = Field(ge=0)
     confidence: float = Field(ge=0, le=1)
     etf_code: str | None = None
     reason_codes: tuple[str, ...] = ()
     closed_at: datetime | None = None
     terminal_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_identity_and_terminal_state(self) -> "LifecycleSignal":
+        expected_key = f"{self.market}:{self.sector_id}:{self.instance_number}"
+        if self.signal_key != expected_key:
+            raise ValueError(f"signal_key must equal {expected_key}")
+        if self.state == "exited":
+            if self.closed_at is None or not self.terminal_reason:
+                raise ValueError(
+                    "exited signal requires closed_at and terminal_reason"
+                )
+        elif self.closed_at is not None or self.terminal_reason is not None:
+            raise ValueError(
+                "open lifecycle states cannot carry terminal fields"
+            )
+        return self
 
 
 class LifecycleTransition(FrozenModel):
@@ -55,6 +71,19 @@ class LifecycleTransition(FrozenModel):
 class LifecycleContext(FrozenModel):
     open_signals: tuple[LifecycleSignal, ...] = ()
     latest_instance_by_sector: Mapping[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_signal_instances(self) -> "LifecycleContext":
+        sector_ids = [signal.sector_id for signal in self.open_signals]
+        if len(sector_ids) != len(set(sector_ids)):
+            raise ValueError("duplicate open signal sector_id")
+        if any(value < 1 for value in self.latest_instance_by_sector.values()):
+            raise ValueError("latest instance values must be positive")
+        for signal in self.open_signals:
+            latest = self.latest_instance_by_sector.get(signal.sector_id)
+            if latest != signal.instance_number:
+                raise ValueError("latest instance must match signal instance")
+        return self
 
 
 class LifecycleEvaluation(FrozenModel):
@@ -87,6 +116,9 @@ class MarketRadarLifecycleEngine:
             sector = sectors.get(sector_id)
             old = previous.get(sector_id)
             suggestion = suggestions.get(sector_id)
+            invalidation_codes = (
+                suggestion.invalidation_codes if suggestion is not None else ()
+            )
             watch = bool(
                 sector
                 and sector.state in {"leading", "improving"}
@@ -97,10 +129,14 @@ class MarketRadarLifecycleEngine:
             risk_down = bool(
                 old
                 and old.state in {"confirmed", "active"}
-                and not qualifying
+                and (not qualifying or bool(invalidation_codes))
+            )
+            raw_reference = (
+                sector.observation.get("raw_reference") if sector else None
             )
             finalized = bool(
-                sector and sector.observation.get("bar_status") == "finalized"
+                isinstance(raw_reference, Mapping)
+                and raw_reference.get("bar_status") == "finalized"
             )
             new_state, preconfirmation_close = _next_state(
                 old,
@@ -122,6 +158,8 @@ class MarketRadarLifecycleEngine:
                 new_state,
                 context.latest_instance_by_sector,
                 qualifying=qualifying,
+                run_kind=run_kind,
+                invalidation_codes=invalidation_codes,
                 preconfirmation_close=preconfirmation_close,
             )
             signals.append(signal)
@@ -169,14 +207,17 @@ def _next_state(
     if old.state == "candidate":
         if candidate and (
             eod_confirmed
-            or (streak_confirmed and old.qualifying_streak >= 1)
+            or (
+                streak_confirmed
+                and old.intraday_qualifying_streak >= 1
+            )
         ):
             return "confirmed", False
-        return "candidate", not candidate
+        return ("candidate", False) if candidate else ("exited", True)
     if old.state == "watching":
         if candidate:
             return ("confirmed" if eod_confirmed else "candidate"), False
-        return "watching", not watch
+        return ("watching", False) if watch else ("exited", True)
     raise ValueError(f"unsupported lifecycle state: {old.state}")
 
 
@@ -200,6 +241,8 @@ def _build_signal(
     latest_instances: Mapping[str, int],
     *,
     qualifying: bool,
+    run_kind: RunKind,
+    invalidation_codes: tuple[str, ...],
     preconfirmation_close: bool,
 ) -> LifecycleSignal:
     new_instance = old is None or old.state == "exited"
@@ -209,17 +252,29 @@ def _build_signal(
     )
     instance_number = latest_instance + 1 if new_instance else old.instance_number
     signal_key = f"cn:{sector_id}:{instance_number}"
-    streak = (
-        old.qualifying_streak + 1
-        if old is not None and qualifying and not preconfirmation_close
-        else (1 if qualifying and not preconfirmation_close else 0)
-    )
+    if preconfirmation_close or new_state in {"downgraded", "exited"}:
+        intraday_streak = 0
+    elif not qualifying:
+        intraday_streak = 0
+    elif run_kind == "intraday":
+        intraday_streak = (
+            old.intraday_qualifying_streak + 1
+            if old is not None and not new_instance
+            else 1
+        )
+    elif old is not None and not new_instance:
+        intraday_streak = old.intraday_qualifying_streak
+    else:
+        intraday_streak = 0
 
     reason_codes: set[str] = set()
     if preconfirmation_close:
         reason_codes.add("preconfirmation_no_longer_qualifies")
     elif new_state == "downgraded":
-        reason_codes.add("position_suggestion_no_longer_qualifies")
+        reason_codes.update(
+            invalidation_codes
+            or ("position_suggestion_no_longer_qualifies",)
+        )
     elif new_state == "exited":
         reason_codes.add("downgrade_confirmed")
     elif new_state == "confirmed":
@@ -235,7 +290,7 @@ def _build_signal(
         previous_run_key=old.current_run_key if old else None,
         current_run_key=snapshot.run_key,
         effective_at=snapshot.as_of,
-        qualifying_streak=streak,
+        intraday_qualifying_streak=intraday_streak,
         confidence=(
             suggestion.joint_confidence
             if suggestion

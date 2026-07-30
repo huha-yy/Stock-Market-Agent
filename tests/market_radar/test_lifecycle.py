@@ -19,6 +19,7 @@ from src.market_radar.models import (
     PositionPlan,
     PositionSuggestion,
     RadarRunSnapshot,
+    SectorObservation,
     SectorScore,
 )
 
@@ -34,9 +35,20 @@ def _sector_score(
     state: str = "leading",
     quality: str = "complete",
 ) -> SectorScore:
-    return SectorScore(
+    observation = SectorObservation(
         sector_id=sector_id,
         name=sector_id.rsplit(":", 1)[-1].title(),
+        kind="industry",
+        observed_at=NOW,
+        source="test",
+        freshness_seconds=0,
+        quality=quality,
+        missing_fields=SectorObservation.tracked_metric_fields,
+        raw_reference={"bar_status": bar_status},
+    )
+    return SectorScore(
+        sector_id=sector_id,
+        name=observation.name,
         kind="industry",
         scoring_version="cn-v1",
         gross_score=80.0,
@@ -50,7 +62,7 @@ def _sector_score(
         source="test",
         observed_at=NOW,
         quality=quality,
-        observation={"bar_status": bar_status},
+        observation=observation.model_dump(mode="json"),
     )
 
 
@@ -89,6 +101,7 @@ def snapshot_factory():
         bar_status: str = "provisional",
         sector_ids: tuple[str, ...] = ("industry:semiconductor",),
         run_key: str = "cn:20260721T070000Z:manual",
+        invalidation_codes: tuple[str, ...] = (),
     ) -> RadarRunSnapshot:
         sectors = tuple(
             _sector_score(sector_id, bar_status=bar_status)
@@ -120,6 +133,7 @@ def snapshot_factory():
                 sector_cap_pct=10.0,
                 etf_cap_pct=10.0,
                 joint_confidence=0.8,
+                invalidation_codes=invalidation_codes,
             )
             for index, (sector, selection) in enumerate(
                 zip(sectors, selections), start=1
@@ -163,12 +177,16 @@ def context_factory():
         previous_state: str | None,
         latest_instance: int = 0,
         sector_id: str = "industry:semiconductor",
+        intraday_qualifying_streak: int = 1,
     ) -> LifecycleContext:
         if previous_state is None:
             return LifecycleContext(
-                latest_instance_by_sector={sector_id: latest_instance}
+                latest_instance_by_sector=(
+                    {sector_id: latest_instance} if latest_instance else {}
+                )
             )
         previous_at = NOW - timedelta(hours=1)
+        exited = previous_state == "exited"
         signal = LifecycleSignal(
             signal_key=f"cn:{sector_id}:{max(latest_instance, 1)}",
             sector_id=sector_id,
@@ -177,9 +195,11 @@ def context_factory():
             first_run_key="cn:20260721T060000Z:manual",
             current_run_key="cn:20260721T060000Z:manual",
             effective_at=previous_at,
-            qualifying_streak=1,
+            intraday_qualifying_streak=intraday_qualifying_streak,
             confidence=0.7,
             etf_code="510999",
+            closed_at=previous_at if exited else None,
+            terminal_reason="lifecycle_exited" if exited else None,
         )
         return LifecycleContext(
             open_signals=(signal,),
@@ -253,11 +273,142 @@ def test_preconfirmation_loss_closes_without_exited_transition(
     )
 
     signal = evaluation.signals[0]
-    assert signal.state == "candidate"
+    assert signal.state == "exited"
     assert signal.closed_at == NOW
     assert signal.terminal_reason == "preconfirmation_no_longer_qualifies"
     assert signal.reason_codes == ("preconfirmation_no_longer_qualifies",)
     assert evaluation.transitions == ()
+
+
+def test_finalized_eod_uses_production_observation_payload(
+    snapshot_factory,
+) -> None:
+    snapshot = snapshot_factory(qualifying=True, bar_status="finalized")
+    observation = snapshot.sectors[0].observation
+
+    assert "bar_status" not in observation
+    assert observation["raw_reference"]["bar_status"] == "finalized"
+
+    evaluation = MarketRadarLifecycleEngine().evaluate(
+        snapshot,
+        LifecycleContext(),
+        run_kind="eod",
+    )
+
+    assert evaluation.signals[0].state == "confirmed"
+
+
+@pytest.mark.parametrize(
+    ("previous_state", "invalidation_codes", "expected_reasons"),
+    [
+        (
+            "confirmed",
+            ("critical_evidence_stale",),
+            ("critical_evidence_stale",),
+        ),
+        (
+            "active",
+            ("market_regime_deteriorated", "critical_evidence_stale"),
+            ("critical_evidence_stale", "market_regime_deteriorated"),
+        ),
+    ],
+)
+def test_current_invalidation_downgrades_confirmed_or_active_signal(
+    previous_state,
+    invalidation_codes,
+    expected_reasons,
+    snapshot_factory,
+    context_factory,
+) -> None:
+    evaluation = MarketRadarLifecycleEngine().evaluate(
+        snapshot_factory(
+            qualifying=True,
+            invalidation_codes=invalidation_codes,
+        ),
+        context_factory(previous_state=previous_state),
+        run_kind="intraday",
+    )
+
+    assert evaluation.signals[0].state == "downgraded"
+    assert evaluation.signals[0].reason_codes == expected_reasons
+    assert evaluation.transitions[0].reason_codes == expected_reasons
+
+
+def test_provisional_eod_does_not_advance_intraday_confirmation_streak(
+    snapshot_factory,
+) -> None:
+    engine = MarketRadarLifecycleEngine()
+    eod = engine.evaluate(
+        snapshot_factory(
+            qualifying=True,
+            bar_status="provisional",
+            run_key="cn:20260721T070000Z:schedule",
+        ),
+        LifecycleContext(),
+        run_kind="eod",
+    )
+    first_intraday = engine.evaluate(
+        snapshot_factory(
+            qualifying=True,
+            run_key="cn:20260722T020000Z:schedule",
+        ),
+        LifecycleContext(
+            open_signals=eod.signals,
+            latest_instance_by_sector={"industry:semiconductor": 1},
+        ),
+        run_kind="intraday",
+    )
+    second_intraday = engine.evaluate(
+        snapshot_factory(
+            qualifying=True,
+            run_key="cn:20260722T030000Z:schedule",
+        ),
+        LifecycleContext(
+            open_signals=first_intraday.signals,
+            latest_instance_by_sector={"industry:semiconductor": 1},
+        ),
+        run_kind="intraday",
+    )
+
+    assert (eod.signals[0].state, eod.signals[0].intraday_qualifying_streak) == (
+        "candidate",
+        0,
+    )
+    assert (
+        first_intraday.signals[0].state,
+        first_intraday.signals[0].intraday_qualifying_streak,
+    ) == ("candidate", 1)
+    assert (
+        second_intraday.signals[0].state,
+        second_intraday.signals[0].intraday_qualifying_streak,
+    ) == ("confirmed", 2)
+
+
+def test_nonqualifying_eligible_run_closes_and_resets_candidate_streak(
+    snapshot_factory,
+) -> None:
+    engine = MarketRadarLifecycleEngine()
+    candidate = engine.evaluate(
+        snapshot_factory(qualifying=True),
+        LifecycleContext(),
+        run_kind="intraday",
+    )
+
+    closed = engine.evaluate(
+        snapshot_factory(
+            qualifying=False,
+            run_key="cn:20260721T080000Z:schedule",
+        ),
+        LifecycleContext(
+            open_signals=candidate.signals,
+            latest_instance_by_sector={"industry:semiconductor": 1},
+        ),
+        run_kind="intraday",
+    )
+
+    assert closed.signals[0].state == "exited"
+    assert closed.signals[0].intraday_qualifying_streak == 0
+    assert closed.transitions == ()
 
 
 def test_downgraded_exits_only_on_next_successful_evaluation(
@@ -330,6 +481,98 @@ def test_lifecycle_contracts_are_immutable(snapshot_factory) -> None:
         LifecycleContext(
             latest_instance_by_sector={"industry:semiconductor": 1}
         ).latest_instance_by_sector["industry:semiconductor"] = 2
+
+
+def _signal_for_validation(**overrides) -> LifecycleSignal:
+    payload = {
+        "signal_key": "cn:industry:semiconductor:1",
+        "sector_id": "industry:semiconductor",
+        "instance_number": 1,
+        "state": "candidate",
+        "first_run_key": "cn:20260721T060000Z:manual",
+        "current_run_key": "cn:20260721T060000Z:manual",
+        "effective_at": NOW,
+        "intraday_qualifying_streak": 1,
+        "confidence": 0.8,
+    }
+    payload.update(overrides)
+    return LifecycleSignal(**payload)
+
+
+@pytest.mark.parametrize(
+    ("closed_at", "terminal_reason"),
+    [
+        (None, None),
+        (NOW, None),
+        (None, "lifecycle_exited"),
+        (NOW, ""),
+    ],
+)
+def test_exited_signal_requires_complete_terminal_fields(
+    closed_at,
+    terminal_reason,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="exited signal requires closed_at and terminal_reason",
+    ):
+        _signal_for_validation(
+            state="exited",
+            closed_at=closed_at,
+            terminal_reason=terminal_reason,
+        )
+
+
+@pytest.mark.parametrize(
+    ("closed_at", "terminal_reason"),
+    [
+        (NOW, None),
+        (None, "preconfirmation_no_longer_qualifies"),
+        (NOW, "preconfirmation_no_longer_qualifies"),
+    ],
+)
+def test_open_signal_rejects_terminal_fields(
+    closed_at,
+    terminal_reason,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="open lifecycle states cannot carry terminal fields",
+    ):
+        _signal_for_validation(
+            closed_at=closed_at,
+            terminal_reason=terminal_reason,
+        )
+
+
+def test_signal_key_must_match_canonical_identity() -> None:
+    with pytest.raises(ValidationError, match="signal_key must equal"):
+        _signal_for_validation(signal_key="cn:industry:banking:1")
+
+
+def test_lifecycle_context_rejects_duplicate_sector_signals() -> None:
+    with pytest.raises(ValidationError, match="duplicate open signal sector_id"):
+        LifecycleContext(
+            open_signals=(
+                _signal_for_validation(),
+                _signal_for_validation(
+                    signal_key="cn:industry:semiconductor:2",
+                    instance_number=2,
+                ),
+            ),
+            latest_instance_by_sector={"industry:semiconductor": 2},
+        )
+
+
+def test_lifecycle_context_rejects_inconsistent_latest_instance() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="latest instance must match signal instance",
+    ):
+        LifecycleContext(
+            open_signals=(_signal_for_validation(),),
+            latest_instance_by_sector={"industry:semiconductor": 2},
+        )
 
 
 def test_schedule_is_a_supported_snapshot_trigger() -> None:
