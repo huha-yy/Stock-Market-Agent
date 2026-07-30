@@ -197,7 +197,7 @@ Information is presented in this order:
 3. the selected sector's factor scores, risk reasons, and missing evidence;
 4. ETF alternatives, sector and ETF caps, joint confidence, and invalidation codes.
 
-The page selects the first persisted rank initially and loads another sector detail only when the user selects it. Refresh requests the latest snapshot and ranking together. A run-key mismatch is treated as a summary error rather than combining two snapshots. A detail error stays local so the overview and ranking remain usable, and stale detail responses cannot replace a newer selection. With no persisted run, the page shows an empty bootstrap state; legacy snapshots show unavailable regime and policy values instead of zero.
+The page selects the first persisted rank initially and loads another sector detail only when the user selects it. Refresh requests the latest snapshot and ranking together, invalidates any in-flight detail request, and reloads the current sector against the accepted run. A missing or different run key on either summary response is treated as a summary error rather than combining two snapshots; detail responses with another run key are rejected as a local detail error. A detail error stays local so the overview and ranking remain usable, and stale detail responses cannot replace a newer selection or refresh. With no persisted run on both summary routes, the page shows an empty bootstrap state; legacy snapshots show unavailable regime and policy values instead of zero.
 
 This cockpit is A-share-only and read-only. It has no run, scheduling, alert, notification, report, configuration, or mutation controls. Creating a fresh snapshot remains an operator workflow through `scripts/run_market_radar.py --market cn --persist`.
 

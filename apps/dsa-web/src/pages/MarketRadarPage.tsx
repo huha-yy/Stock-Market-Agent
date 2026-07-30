@@ -51,14 +51,17 @@ const MarketRadarPage: React.FC = () => {
 
   const loadSummary = useCallback(async () => {
     const requestId = ++summaryRequestRef.current;
+    ++detailRequestRef.current;
     setSummaryState({ status: 'loading' });
+    setDetailState({ status: 'idle' });
     try {
       const [latest, sectors] = await Promise.all([
         marketRadarApi.getLatest(),
         marketRadarApi.listSectors(),
       ]);
       if (requestId !== summaryRequestRef.current) return;
-      if (latest.run && sectors.runKey && latest.run.runKey !== sectors.runKey) {
+      const latestRunKey = latest.run?.runKey ?? null;
+      if (latestRunKey !== sectors.runKey) {
         throw new Error('Market Radar summary snapshot mismatch');
       }
       setSummaryState({ status: 'ready', latest, sectors });
@@ -78,8 +81,12 @@ const MarketRadarPage: React.FC = () => {
     void loadSummary();
   }, [loadSummary]);
 
+  const acceptedRunKey = summaryState.status === 'ready'
+    ? summaryState.latest.run?.runKey ?? null
+    : null;
+
   useEffect(() => {
-    if (!selectedSectorId) {
+    if (!selectedSectorId || !acceptedRunKey) {
       ++detailRequestRef.current;
       setDetailState({ status: 'idle' });
       return;
@@ -88,16 +95,20 @@ const MarketRadarPage: React.FC = () => {
     setDetailState({ status: 'loading' });
     void marketRadarApi.getSector(selectedSectorId)
       .then((detail) => {
-        if (requestId === detailRequestRef.current) {
-          setDetailState({ status: 'ready', detail });
+        if (detail.runKey !== acceptedRunKey) {
+          throw new Error('Market Radar detail snapshot mismatch');
         }
+        if (requestId !== detailRequestRef.current) {
+          return;
+        }
+        setDetailState({ status: 'ready', detail });
       })
       .catch((error) => {
         if (requestId === detailRequestRef.current) {
           setDetailState({ status: 'error', error: toSectionError(error, 'marketRadar.detailError') });
         }
       });
-  }, [selectedSectorId, toSectionError]);
+  }, [acceptedRunKey, selectedSectorId, toSectionError]);
 
   const ready = summaryState.status === 'ready' ? summaryState : null;
   const hasSnapshot = Boolean(ready?.latest.available && ready.latest.run && ready.sectors.available);

@@ -205,11 +205,15 @@ describe('MarketRadarPage', () => {
     renderPage();
 
     expect(await screen.findByText('Selective')).toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'Sector ranking' })).toBeInTheDocument();
     const rows = screen.getAllByRole('button', { name: /sector rank/i });
     expect(rows.map((row) => row.textContent)).toEqual([
       expect.stringContaining('Semiconductor'),
       expect.stringContaining('Bank'),
     ]);
+    expect(rows[0]).toHaveAccessibleName(
+      'Sector rank 1: Semiconductor, Leading, score 78.0, confidence 82%',
+    );
     expect(screen.getByText('35.0% - 55.0%')).toBeInTheDocument();
   });
 
@@ -241,6 +245,26 @@ describe('MarketRadarPage', () => {
     expect(screen.queryByText('Semiconductor')).not.toBeInTheDocument();
   });
 
+  it.each([
+    {
+      name: 'latest is missing',
+      latestResponse: { available: false, run: null },
+      sectorsResponse: sectors,
+    },
+    {
+      name: 'sector ranking is missing',
+      latestResponse: latest,
+      sectorsResponse: { available: false, runKey: null, asOf: null, items: [], total: 0 },
+    },
+  ])('rejects a one-sided summary snapshot when $name', async ({ latestResponse, sectorsResponse }) => {
+    getLatest.mockResolvedValue(latestResponse);
+    listSectors.mockResolvedValue(sectorsResponse);
+    renderPage();
+
+    expect(await screen.findByText('Market Radar overview could not be loaded')).toBeInTheDocument();
+    expect(screen.queryByText('No Market Radar snapshot yet')).not.toBeInTheDocument();
+  });
+
   it('keeps the summary usable when sector detail fails', async () => {
     getSector.mockRejectedValue(new Error('detail unavailable'));
     renderPage();
@@ -248,6 +272,14 @@ describe('MarketRadarPage', () => {
     expect(await screen.findByText('Semiconductor')).toBeInTheDocument();
     expect(await screen.findByText('Sector detail could not be loaded')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Bank/ })).toBeEnabled();
+  });
+
+  it('rejects sector detail from a different snapshot', async () => {
+    getSector.mockResolvedValue({ ...detailFor(semiconductor), runKey: 'cn:other' });
+    renderPage();
+
+    expect(await screen.findByText('Sector detail could not be loaded')).toBeInTheDocument();
+    expect(screen.queryByText('Chip ETF')).not.toBeInTheDocument();
   });
 
   it('renders legacy snapshots without regime or position policy', async () => {
@@ -281,12 +313,27 @@ describe('MarketRadarPage', () => {
     expect(await screen.findByText('Unknown (future_status)')).toBeInTheDocument();
   });
 
-  it('refreshes summaries manually', async () => {
+  it('refreshes summaries and reloads detail for the accepted snapshot', async () => {
     renderPage();
+    expect(await screen.findByText('Chip ETF')).toBeInTheDocument();
+
+    const refreshedRunKey = 'cn:20260730T080000Z:manual';
+    getLatest.mockResolvedValue({
+      ...latest,
+      run: latest.run ? { ...latest.run, runKey: refreshedRunKey } : null,
+    });
+    listSectors.mockResolvedValue({ ...sectors, runKey: refreshedRunKey });
+    getSector.mockResolvedValue({
+      ...detailFor(semiconductor),
+      runKey: refreshedRunKey,
+      etfs: [{ ...detailFor(semiconductor).etfs[0], name: 'Refreshed Chip ETF' }],
+    });
     fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }));
 
-    await waitFor(() => expect(getLatest).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Refreshed Chip ETF')).toBeInTheDocument();
+    expect(getLatest).toHaveBeenCalledTimes(2);
     expect(listSectors).toHaveBeenCalledTimes(2);
+    expect(getSector).toHaveBeenCalledTimes(2);
   });
 
   it('ignores a stale detail response after a newer selection', async () => {
