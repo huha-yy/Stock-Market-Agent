@@ -1543,6 +1543,24 @@ def test_get_run_reconstructs_the_exact_snapshot_by_id(isolated_db) -> None:
     assert repo.get_run(run_id + 1) is None
 
 
+def test_get_run_id_by_key_resolves_persisted_identity(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    snapshot = _snapshot()
+    run_id = repo.save_run(snapshot)
+
+    assert repo.get_run_id_by_key(snapshot.run_key) == run_id
+
+
+def test_get_run_id_by_key_rejects_unknown_identity(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+
+    with pytest.raises(
+        ValueError,
+        match="stored Market Radar run not found: missing-run-key",
+    ):
+        repo.get_run_id_by_key("missing-run-key")
+
+
 def test_save_run_retries_one_integrity_race_then_succeeds(
     isolated_db,
     monkeypatch,

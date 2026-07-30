@@ -1273,6 +1273,15 @@ class MarketRadarRepository:
                 return None
             return self._snapshot_from_run_in_session(session, run)
 
+    def get_run_id_by_key(self, run_key: str) -> int:
+        with self.db.get_session() as session:
+            run_id = session.execute(
+                select(RadarRunRecord.id).where(RadarRunRecord.run_key == run_key)
+            ).scalar_one_or_none()
+            if run_id is None:
+                raise ValueError(f"stored Market Radar run not found: {run_key}")
+            return int(run_id)
+
     def get_run(self, run_id: int) -> RadarRunSnapshot | None:
         with self.db.get_session() as session:
             run = session.execute(
