@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from src.config import Config, get_config
+from src.market_radar.runtime_worker import MarketRadarRuntimeWorker
 from src.scheduler import Scheduler, normalize_schedule_times
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,20 @@ def build_agent_event_monitor_background_tasks(
     }]
 
 
+def build_market_radar_background_task(config: Config) -> Optional[Dict[str, Any]]:
+    """Build the opt-in Market Radar scheduler task."""
+    if not getattr(config, "market_radar_schedule_enabled", False):
+        return None
+    worker = MarketRadarRuntimeWorker()
+    return {
+        "task": worker.run_once,
+        "interval_seconds": 60,
+        "run_immediately": True,
+        "name": "market_radar",
+        "status_provider": worker.status,
+    }
+
+
 class RuntimeSchedulerService:
     """Manage scheduled analysis inside the current API/Web/Desktop process."""
 
@@ -131,6 +146,7 @@ class RuntimeSchedulerService:
         }
         self._background_task_cache: Dict[str, Dict[str, Any]] = {}
         self._background_task_registered_names: Set[str] = set()
+        self._background_status_providers: Dict[str, Callable[[], Dict[str, Any]]] = {}
         self._lock = threading.RLock()
         self._run_lock = _RUNTIME_ANALYSIS_LOCK
         self._scheduler: Optional[Scheduler] = None
@@ -210,10 +226,53 @@ class RuntimeSchedulerService:
     def _is_schedule_enabled(self, config: Config) -> bool:
         return self._force_enabled or bool(getattr(config, "schedule_enabled", False))
 
+    def _runtime_is_enabled(
+        self,
+        config: Config,
+        background_tasks: List[Dict[str, Any]],
+    ) -> bool:
+        return self._is_schedule_enabled(config) or bool(background_tasks)
+
     def _current_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         if self._background_tasks_provider is not None:
             return self._background_tasks_provider(config)
-        return self._current_agent_event_monitor_background_tasks(config)
+        tasks = self._current_agent_event_monitor_background_tasks(config)
+        radar_task = self._current_market_radar_background_task(config)
+        if radar_task is not None:
+            tasks.append(radar_task)
+        return tasks
+
+    def _current_market_radar_background_task(
+        self,
+        config: Config,
+    ) -> Optional[Dict[str, Any]]:
+        name = "market_radar"
+        if not getattr(config, "market_radar_schedule_enabled", False):
+            self._background_task_cache.pop(name, None)
+            self._background_task_registered_names.discard(name)
+            self._background_status_providers.pop(name, None)
+            return None
+
+        cached = self._background_task_cache.get(name)
+        if cached is None:
+            entry = build_market_radar_background_task(config)
+            if entry is None:  # pragma: no cover - guarded by the config check above.
+                return None
+            cached = dict(entry)
+            self._background_task_cache[name] = cached
+            self._background_status_providers[name] = cached["status_provider"]
+
+        run_immediately = (
+            bool(cached.get("run_immediately", False))
+            and name not in self._background_task_registered_names
+        )
+        self._background_task_registered_names.add(name)
+        return {
+            "task": cached["task"],
+            "interval_seconds": 60,
+            "run_immediately": run_immediately,
+            "name": name,
+        }
 
     def _current_agent_event_monitor_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         name = "agent_event_monitor"
@@ -269,10 +328,10 @@ class RuntimeSchedulerService:
                 self.stop()
                 return
             config = self._config_provider()
-            if not self._is_schedule_enabled(config):
+            background_tasks = self._current_background_tasks(config)
+            if not self._runtime_is_enabled(config, background_tasks):
                 self.stop()
                 return
-            background_tasks = self._current_background_tasks(config)
             self.stop()
             times = normalize_schedule_times(
                 getattr(config, "schedule_times", None),
@@ -284,10 +343,15 @@ class RuntimeSchedulerService:
                 schedule_times_provider=self._current_times,
                 register_signals=False,
             )
-            if run_immediately and self._run_immediately_in_background:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
-            else:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=run_immediately)
+            schedule_enabled = self._is_schedule_enabled(config)
+            if schedule_enabled:
+                if run_immediately and self._run_immediately_in_background:
+                    scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
+                else:
+                    scheduler.set_daily_task(
+                        self._run_analysis_once,
+                        run_immediately=run_immediately,
+                    )
             for entry in background_tasks:
                 scheduler.add_background_task(
                     entry["task"],
@@ -295,7 +359,11 @@ class RuntimeSchedulerService:
                     run_immediately=entry.get("run_immediately", False),
                     name=entry.get("name"),
                 )
-            if run_immediately and self._run_immediately_in_background:
+            if (
+                schedule_enabled
+                and run_immediately
+                and self._run_immediately_in_background
+            ):
                 self._run_in_background_thread(self._run_analysis_once)
             thread = threading.Thread(
                 target=scheduler.run,
@@ -326,11 +394,7 @@ class RuntimeSchedulerService:
         if not self._owns_schedule:
             self.stop()
             return
-        config = self._config_provider()
-        if self._is_schedule_enabled(config):
-            self.start(run_immediately=run_immediately)
-        else:
-            self.stop()
+        self.start(run_immediately=run_immediately)
 
     def run_now(self) -> Dict[str, Any]:
         if not self._run_lock.acquire(blocking=False):
@@ -383,4 +447,8 @@ class RuntimeSchedulerService:
             "last_error": self._last_error,
             "last_skipped_at": self._last_skipped_at,
             "last_skip_reason": self._last_skip_reason,
+            "background_tasks": {
+                name: provider()
+                for name, provider in sorted(self._background_status_providers.items())
+            },
         }

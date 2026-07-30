@@ -86,7 +86,178 @@ class _SynchronousThread(_NoopThread):
             self.target()
 
 
+class _RecordingScheduler:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.schedule_times = kwargs["schedule_times"]
+        self.background_tasks = []
+        self.daily_task = None
+        self.__class__.instances.append(self)
+
+    def set_daily_task(self, task, run_immediately: bool) -> None:
+        self.daily_task = task
+
+    def add_background_task(
+        self,
+        task: callable,
+        interval_seconds: int,
+        run_immediately: bool,
+        name: str | None = None,
+    ) -> None:
+        self.background_tasks.append({
+            "task": task,
+            "interval_seconds": interval_seconds,
+            "run_immediately": run_immediately,
+            "name": name,
+        })
+
+    def run(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    @property
+    def schedule(self):
+        class _Namespace:
+            @staticmethod
+            def get_jobs():
+                return []
+
+        return _Namespace
+
+
 class RuntimeSchedulerServiceTestCase(unittest.TestCase):
+    def test_radar_only_config_starts_without_daily_analysis(self) -> None:
+        _RecordingScheduler.instances = []
+        fake_worker = MagicMock()
+        fake_worker.status.return_value = {
+            "running": False,
+            "last_decision": None,
+            "last_success_at": None,
+            "last_error": None,
+        }
+        config = SimpleNamespace(
+            schedule_enabled=False,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+            market_radar_schedule_enabled=True,
+            agent_event_monitor_enabled=False,
+        )
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+
+        with patch(
+            "src.services.runtime_scheduler.Scheduler",
+            _RecordingScheduler,
+        ), patch(
+            "src.services.runtime_scheduler.threading.Thread",
+            _NoopThread,
+        ), patch(
+            "src.services.runtime_scheduler.MarketRadarRuntimeWorker",
+            return_value=fake_worker,
+        ):
+            service.start()
+
+        scheduler = service._scheduler
+        self.assertIsNotNone(scheduler)
+        self.assertIsNone(scheduler.daily_task)  # type: ignore[attr-defined]
+        self.assertEqual(
+            [entry["name"] for entry in scheduler.background_tasks],  # type: ignore[attr-defined]
+            ["market_radar"],
+        )
+        radar_task = scheduler.background_tasks[0]  # type: ignore[attr-defined]
+        self.assertEqual(radar_task["interval_seconds"], 60)
+        self.assertTrue(radar_task["run_immediately"])
+        self.assertEqual(
+            service.status()["background_tasks"]["market_radar"]["running"],
+            False,
+        )
+
+    def test_radar_worker_and_status_survive_reconciliation(self) -> None:
+        _RecordingScheduler.instances = []
+        radar_status = {
+            "running": False,
+            "last_decision": None,
+            "last_success_at": None,
+            "last_error": None,
+        }
+        fake_worker = MagicMock()
+        fake_worker.status.side_effect = lambda: dict(radar_status)
+        config = SimpleNamespace(
+            schedule_enabled=False,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+            market_radar_schedule_enabled=True,
+            agent_event_monitor_enabled=False,
+        )
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+
+        with patch(
+            "src.services.runtime_scheduler.Scheduler",
+            _RecordingScheduler,
+        ), patch(
+            "src.services.runtime_scheduler.threading.Thread",
+            _NoopThread,
+        ), patch(
+            "src.services.runtime_scheduler.MarketRadarRuntimeWorker",
+            return_value=fake_worker,
+        ) as worker_cls:
+            service.reconcile_from_config()
+            radar_status["last_success_at"] = "2026-07-30T12:00:00+00:00"
+            config.schedule_times = ["19:00"]
+            service.reconcile_from_config()
+
+        self.assertEqual(worker_cls.call_count, 1)
+        self.assertEqual(len(_RecordingScheduler.instances), 2)
+        first_task = _RecordingScheduler.instances[0].background_tasks[0]
+        second_task = _RecordingScheduler.instances[1].background_tasks[0]
+        self.assertIs(first_task["task"], second_task["task"])
+        self.assertTrue(first_task["run_immediately"])
+        self.assertFalse(second_task["run_immediately"])
+        self.assertEqual(
+            service.status()["background_tasks"]["market_radar"]["last_success_at"],
+            "2026-07-30T12:00:00+00:00",
+        )
+
+    def test_daily_event_monitor_and_radar_tasks_are_additive(self) -> None:
+        _RecordingScheduler.instances = []
+        radar_worker = MagicMock()
+        radar_worker.status.return_value = {"running": False}
+        alert_worker = MagicMock()
+        config = SimpleNamespace(
+            schedule_enabled=True,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+            market_radar_schedule_enabled=True,
+            agent_event_monitor_enabled=True,
+            agent_event_monitor_interval_minutes=5,
+        )
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+
+        with patch(
+            "src.services.runtime_scheduler.Scheduler",
+            _RecordingScheduler,
+        ), patch(
+            "src.services.runtime_scheduler.threading.Thread",
+            _NoopThread,
+        ), patch(
+            "src.services.runtime_scheduler.MarketRadarRuntimeWorker",
+            return_value=radar_worker,
+        ), patch(
+            "src.services.alert_worker.AlertWorker",
+            return_value=alert_worker,
+        ):
+            service.start()
+
+        scheduler = service._scheduler
+        self.assertIsNotNone(scheduler)
+        self.assertIsNotNone(scheduler.daily_task)  # type: ignore[attr-defined]
+        self.assertEqual(
+            [entry["name"] for entry in scheduler.background_tasks],  # type: ignore[attr-defined]
+            ["agent_event_monitor", "market_radar"],
+        )
+
     def test_run_analysis_args_include_workers(self) -> None:
         config = SimpleNamespace(
             schedule_enabled=True,
@@ -375,7 +546,7 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         fake_worker.run_once.return_value = {"triggered": 2}
 
         config = SimpleNamespace(
-            schedule_enabled=True,
+            schedule_enabled=False,
             schedule_time="18:00",
             schedule_times=["18:00"],
             agent_event_monitor_enabled=True,
@@ -396,6 +567,7 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
 
         scheduler = service._scheduler
         self.assertIsNotNone(scheduler)
+        self.assertIsNone(scheduler.daily_task)  # type: ignore[attr-defined]
         self.assertEqual(len(scheduler.background_tasks), 1)  # type: ignore[attr-defined]
         self.assertEqual(scheduler.background_tasks[0]["name"], "agent_event_monitor")  # type: ignore[index]
         self.assertEqual(scheduler.background_tasks[0]["interval_seconds"], 7 * 60)  # type: ignore[index]
