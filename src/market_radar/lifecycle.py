@@ -20,6 +20,8 @@ LifecycleState = Literal[
     "watching", "candidate", "confirmed", "active", "downgraded", "exited"
 ]
 RunKind = Literal["intraday", "eod"]
+_PRECONFIRMATION_REASON = "preconfirmation_no_longer_qualifies"
+_EXIT_REASON = "lifecycle_exited"
 
 
 class LifecycleSignal(FrozenModel):
@@ -45,16 +47,24 @@ class LifecycleSignal(FrozenModel):
         expected_key = f"{self.market}:{self.sector_id}:{self.instance_number}"
         if self.signal_key != expected_key:
             raise ValueError(f"signal_key must equal {expected_key}")
+
         if self.state == "exited":
             if self.closed_at is None or not self.terminal_reason:
                 raise ValueError(
                     "exited signal requires closed_at and terminal_reason"
                 )
-        elif self.closed_at is not None or self.terminal_reason is not None:
-            raise ValueError(
-                "open lifecycle states cannot carry terminal fields"
-            )
-        return self
+            if self.terminal_reason == _EXIT_REASON:
+                return self
+        elif self.closed_at is None and self.terminal_reason is None:
+            return self
+        elif (
+            self.state in {"watching", "candidate"}
+            and self.closed_at is not None
+            and self.terminal_reason == _PRECONFIRMATION_REASON
+        ):
+            return self
+
+        raise ValueError("invalid terminal fields for lifecycle state")
 
 
 class LifecycleTransition(FrozenModel):
@@ -213,11 +223,11 @@ def _next_state(
             )
         ):
             return "confirmed", False
-        return ("candidate", False) if candidate else ("exited", True)
+        return ("candidate", False) if candidate else ("candidate", True)
     if old.state == "watching":
         if candidate:
             return ("confirmed" if eod_confirmed else "candidate"), False
-        return ("watching", False) if watch else ("exited", True)
+        return ("watching", False) if watch else ("watching", True)
     raise ValueError(f"unsupported lifecycle state: {old.state}")
 
 
@@ -269,7 +279,7 @@ def _build_signal(
 
     reason_codes: set[str] = set()
     if preconfirmation_close:
-        reason_codes.add("preconfirmation_no_longer_qualifies")
+        reason_codes.add(_PRECONFIRMATION_REASON)
     elif new_state == "downgraded":
         reason_codes.update(
             invalidation_codes
@@ -312,9 +322,9 @@ def _build_signal(
             else None
         ),
         terminal_reason=(
-            "preconfirmation_no_longer_qualifies"
+            _PRECONFIRMATION_REASON
             if preconfirmation_close
-            else "lifecycle_exited"
+            else _EXIT_REASON
             if new_state == "exited"
             else None
         ),

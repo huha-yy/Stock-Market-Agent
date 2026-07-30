@@ -102,9 +102,14 @@ def snapshot_factory():
         sector_ids: tuple[str, ...] = ("industry:semiconductor",),
         run_key: str = "cn:20260721T070000Z:manual",
         invalidation_codes: tuple[str, ...] = (),
+        watch: bool = True,
     ) -> RadarRunSnapshot:
         sectors = tuple(
-            _sector_score(sector_id, bar_status=bar_status)
+            _sector_score(
+                sector_id,
+                bar_status=bar_status,
+                state="leading" if watch else "neutral",
+            )
             for sector_id in sector_ids
         )
         if not qualifying:
@@ -273,7 +278,25 @@ def test_preconfirmation_loss_closes_without_exited_transition(
     )
 
     signal = evaluation.signals[0]
-    assert signal.state == "exited"
+    assert signal.state == "candidate"
+    assert signal.closed_at == NOW
+    assert signal.terminal_reason == "preconfirmation_no_longer_qualifies"
+    assert signal.reason_codes == ("preconfirmation_no_longer_qualifies",)
+    assert evaluation.transitions == ()
+
+
+def test_watching_loss_closes_without_changing_state_or_emitting_transition(
+    snapshot_factory,
+    context_factory,
+) -> None:
+    evaluation = MarketRadarLifecycleEngine().evaluate(
+        snapshot_factory(qualifying=False, watch=False),
+        context_factory(previous_state="watching"),
+        run_kind="intraday",
+    )
+
+    signal = evaluation.signals[0]
+    assert signal.state == "watching"
     assert signal.closed_at == NOW
     assert signal.terminal_reason == "preconfirmation_no_longer_qualifies"
     assert signal.reason_codes == ("preconfirmation_no_longer_qualifies",)
@@ -406,7 +429,7 @@ def test_nonqualifying_eligible_run_closes_and_resets_candidate_streak(
         run_kind="intraday",
     )
 
-    assert closed.signals[0].state == "exited"
+    assert closed.signals[0].state == "candidate"
     assert closed.signals[0].intraday_qualifying_streak == 0
     assert closed.transitions == ()
 
@@ -523,23 +546,44 @@ def test_exited_signal_requires_complete_terminal_fields(
         )
 
 
+@pytest.mark.parametrize("state", ["watching", "candidate"])
+def test_preconfirmation_states_allow_exact_closed_terminal_combination(
+    state,
+) -> None:
+    signal = _signal_for_validation(
+        state=state,
+        closed_at=NOW,
+        terminal_reason="preconfirmation_no_longer_qualifies",
+    )
+
+    assert signal.state == state
+    assert signal.closed_at == NOW
+
+
 @pytest.mark.parametrize(
-    ("closed_at", "terminal_reason"),
+    ("state", "closed_at", "terminal_reason"),
     [
-        (NOW, None),
-        (None, "preconfirmation_no_longer_qualifies"),
-        (NOW, "preconfirmation_no_longer_qualifies"),
+        ("candidate", NOW, None),
+        ("watching", None, "preconfirmation_no_longer_qualifies"),
+        ("candidate", NOW, "lifecycle_exited"),
+        ("watching", NOW, "unknown_reason"),
+        ("confirmed", NOW, "preconfirmation_no_longer_qualifies"),
+        ("active", NOW, "preconfirmation_no_longer_qualifies"),
+        ("downgraded", NOW, "preconfirmation_no_longer_qualifies"),
+        ("exited", NOW, "preconfirmation_no_longer_qualifies"),
     ],
 )
-def test_open_signal_rejects_terminal_fields(
+def test_signal_rejects_invalid_terminal_reason_state_combinations(
+    state,
     closed_at,
     terminal_reason,
 ) -> None:
     with pytest.raises(
         ValidationError,
-        match="open lifecycle states cannot carry terminal fields",
+        match="invalid terminal fields for lifecycle state",
     ):
         _signal_for_validation(
+            state=state,
             closed_at=closed_at,
             terminal_reason=terminal_reason,
         )
