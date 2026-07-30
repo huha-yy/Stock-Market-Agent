@@ -1227,6 +1227,7 @@ class RadarRunRecord(Base):
     quality = Column(String(32), nullable=False)
     scoring_version = Column(String(32), nullable=False)
     provider_trace_json = Column(Text, nullable=False, default="[]")
+    lifecycle_evaluation_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
 
@@ -1544,10 +1545,28 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             )
 
     def _ensure_market_radar_lifecycle_schema(self) -> None:
-        """Add lifecycle indexes without rewriting existing Radar tables."""
+        """Add lifecycle columns/indexes without rewriting existing Radar tables."""
         if not self._is_sqlite_engine:
             return
         inspector = inspect(self._engine)
+        run_table_name = RadarRunRecord.__tablename__
+        if inspector.has_table(run_table_name):
+            run_columns = {
+                column["name"] for column in inspector.get_columns(run_table_name)
+            }
+            if "lifecycle_evaluation_json" not in run_columns:
+                try:
+                    with self._engine.begin() as connection:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {run_table_name} "
+                            "ADD COLUMN lifecycle_evaluation_json TEXT"
+                        )
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(
+                        exc,
+                        "lifecycle_evaluation_json",
+                    ):
+                        raise
         indexes = {
             RadarRunAttemptRecord.__tablename__: (
                 ("ix_radar_run_attempts_market", "market"),

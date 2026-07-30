@@ -114,11 +114,21 @@ class MarketRadarRepository:
         current_naive = to_utc_naive_datetime(current)
 
         def write(session: Any) -> AttemptReservation:
-            row = session.get(RadarRunAttemptRecord, decision.attempt_key)
+            if self.db._is_sqlite_engine:
+                row = session.get(RadarRunAttemptRecord, decision.attempt_key)
+            else:
+                row = session.execute(
+                    select(RadarRunAttemptRecord)
+                    .where(
+                        RadarRunAttemptRecord.attempt_key
+                        == decision.attempt_key
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
             if row is None:
                 row = RadarRunAttemptRecord(
                     attempt_key=decision.attempt_key,
-                    market="cn",
+                    market=decision.market,
                     trigger_type=decision.kind,
                     trading_date=decision.trading_date,
                     decided_at=to_utc_naive_datetime(decision.decided_at),
@@ -128,6 +138,22 @@ class MarketRadarRepository:
                 session.add(row)
                 session.flush()
                 return AttemptReservation(row.attempt_key, True, "started", None)
+
+            expected_identity = (
+                decision.market,
+                decision.kind,
+                decision.trading_date,
+            )
+            stored_identity = (
+                row.market,
+                row.trigger_type,
+                row.trading_date,
+            )
+            if stored_identity != expected_identity:
+                raise ValueError(
+                    "scheduled attempt identity conflict for "
+                    f"{decision.attempt_key}"
+                )
 
             expired = (
                 row.status == "started"
@@ -166,6 +192,8 @@ class MarketRadarRepository:
         failure_category: str | None = None,
         failure_summary: str | None = None,
     ) -> None:
+        if status not in {"succeeded", "skipped", "failed"}:
+            raise ValueError(f"invalid scheduled attempt terminal status: {status}")
         values = {
             "status": status,
             "run_id": run_id,
@@ -473,9 +501,8 @@ class MarketRadarRepository:
             write,
         )
 
-    @classmethod
     def _save_lifecycle_in_session(
-        cls,
+        self,
         session: Any,
         run_id: int,
         evaluation: LifecycleEvaluation,
@@ -492,6 +519,30 @@ class MarketRadarRepository:
         current_run = session.get(RadarRunRecord, run_id)
         if current_run is None or current_run.run_key != evaluation.run_key:
             raise ValueError("lifecycle evaluation run does not match persisted run")
+
+        evaluation_json = _dump(evaluation.model_dump(mode="json"))
+        if current_run.lifecycle_evaluation_json is not None:
+            if current_run.lifecycle_evaluation_json != evaluation_json:
+                raise ValueError(
+                    f"lifecycle evaluation semantic conflict for {evaluation.run_key}"
+                )
+            return
+
+        locked_signal_rows: dict[str, RadarSignalInstanceRecord] = {}
+        if signal_keys and not self.db._is_sqlite_engine:
+            locked_signal_rows = {
+                row.signal_key: row
+                for row in session.execute(
+                    select(RadarSignalInstanceRecord)
+                    .where(
+                        RadarSignalInstanceRecord.signal_key.in_(
+                            sorted(signal_keys)
+                        )
+                    )
+                    .order_by(RadarSignalInstanceRecord.signal_key)
+                    .with_for_update()
+                ).scalars()
+            }
 
         stored_signal_keys = set(
             session.execute(
@@ -546,7 +597,11 @@ class MarketRadarRepository:
             first_run_id = run_ids[signal.first_run_key]
             last_run_id = run_ids[signal.current_run_key]
             signal_json = _dump(signal.model_dump(mode="json"))
-            row = session.get(RadarSignalInstanceRecord, signal.signal_key)
+            row = (
+                session.get(RadarSignalInstanceRecord, signal.signal_key)
+                if self.db._is_sqlite_engine
+                else locked_signal_rows.get(signal.signal_key)
+            )
             identity = (
                 signal.market,
                 signal.sector_id,
@@ -620,6 +675,8 @@ class MarketRadarRepository:
             )
             row.updated_at = utc_naive_now()
 
+        session.flush()
+
         evaluation_signal_keys = set(signal_keys)
         for transition in evaluation.transitions:
             if transition.signal_key not in evaluation_signal_keys:
@@ -658,6 +715,7 @@ class MarketRadarRepository:
                     "lifecycle transition semantic conflict for "
                     f"{transition.transition_key}"
                 )
+        current_run.lifecycle_evaluation_json = evaluation_json
 
     @classmethod
     def _validate_enriched_traceability(

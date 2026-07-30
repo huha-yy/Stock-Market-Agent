@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import delete, event, func, inspect, select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 from src.config import Config
@@ -49,8 +50,10 @@ from src.storage import (
     RadarEtfSelectionRecord,
     RadarPositionPlanRecord,
     RadarRegimeAssessmentRecord,
+    RadarRunAttemptRecord,
     RadarRunRecord,
     RadarSectorSnapshotRecord,
+    RadarSignalTransitionRecord,
     RadarUniverseRecord,
 )
 
@@ -261,8 +264,12 @@ def _scheduled_bundle(
     run_key: str = "cn:20260721T060000Z:schedule",
     as_of: datetime = NOW,
     context: LifecycleContext | None = None,
+    evidence_source: str = "membership-fixture",
 ) -> dict[str, object]:
-    evidence = _constituent_evidence(observed_at=as_of)
+    evidence = _constituent_evidence(
+        observed_at=as_of,
+        source=evidence_source,
+    )
     snapshot, observations = _phase2b_snapshot(evidence)
     observation_data = observations[0].model_dump(mode="json")
     observation_data["observed_at"] = as_of
@@ -388,6 +395,27 @@ def _run_concurrently_after_first_select(db, table_name, operation):
             return [future.result(timeout=10) for future in futures]
     finally:
         event.remove(db._engine, "after_cursor_execute", delay_first_select)
+
+
+def _capture_non_sqlite_statements(db, operation):
+    statements = []
+
+    def capture_statement(
+        _connection,
+        clauseelement,
+        _multiparams,
+        _params,
+        _execution_options,
+    ) -> None:
+        statements.append(clauseelement)
+
+    event.listen(db._engine, "before_execute", capture_statement)
+    db._is_sqlite_engine = False
+    try:
+        return operation(), statements
+    finally:
+        db._is_sqlite_engine = True
+        event.remove(db._engine, "before_execute", capture_statement)
 
 
 def test_tables_are_created(isolated_db) -> None:
@@ -802,6 +830,30 @@ def test_started_attempt_can_only_be_reclaimed_after_lease(isolated_db) -> None:
     assert at_expiry.acquired is True
 
 
+def test_non_sqlite_expired_attempt_reclaim_locks_the_row(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    decision = _intraday_decision()
+    repo.reserve_scheduled_attempt(decision, lease_seconds=900, now=NOW)
+    reservation, statements = _capture_non_sqlite_statements(
+        isolated_db,
+        lambda: repo.reserve_scheduled_attempt(
+            decision,
+            lease_seconds=900,
+            now=NOW + timedelta(seconds=900),
+        ),
+    )
+
+    attempt_sql = [
+        str(statement.compile(dialect=postgresql.dialect()))
+        for statement in statements
+        if "radar_run_attempts" in str(statement)
+    ]
+    assert reservation.acquired is True
+    assert any("FOR UPDATE" in statement for statement in attempt_sql)
+
+
 def test_concurrent_attempt_reservations_have_one_database_winner(
     isolated_db,
 ) -> None:
@@ -861,6 +913,73 @@ def test_finish_attempt_is_semantically_idempotent_and_bounds_summary(
         )
 
 
+@pytest.mark.parametrize(
+    ("column_name", "corrupted_value", "reserve_at", "terminalize"),
+    [
+        ("market", "us", NOW + timedelta(seconds=1), True),
+        ("trigger_type", "eod_due", NOW + timedelta(seconds=900), False),
+        (
+            "trading_date",
+            date(2026, 7, 22),
+            NOW + timedelta(seconds=1),
+            False,
+        ),
+    ],
+)
+def test_attempt_key_rejects_conflicting_decision_identity(
+    isolated_db,
+    column_name,
+    corrupted_value,
+    reserve_at,
+    terminalize,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    decision = _intraday_decision()
+    reservation = repo.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW,
+    )
+    if terminalize:
+        repo.finish_scheduled_attempt(
+            reservation.attempt_key,
+            status="skipped",
+            reason_code="calendar_unavailable",
+        )
+    with isolated_db.session_scope() as session:
+        row = session.get(RadarRunAttemptRecord, decision.attempt_key)
+        setattr(row, column_name, corrupted_value)
+
+    with pytest.raises(ValueError, match="identity conflict"):
+        repo.reserve_scheduled_attempt(
+            decision,
+            lease_seconds=900,
+            now=reserve_at,
+        )
+
+
+def test_finish_attempt_rejects_invalid_terminal_status(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    reservation = repo.reserve_scheduled_attempt(
+        _intraday_decision(),
+        lease_seconds=900,
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="terminal status"):
+        repo.finish_scheduled_attempt(
+            reservation.attempt_key,
+            status="cancelled",
+        )
+
+    duplicate = repo.reserve_scheduled_attempt(
+        _intraday_decision(),
+        lease_seconds=900,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert duplicate.status == "started"
+
+
 def test_scheduled_lifecycle_context_updates_current_row_and_appends_transitions(
     isolated_db,
 ) -> None:
@@ -889,6 +1008,106 @@ def test_scheduled_lifecycle_context_updates_current_row_and_appends_transitions
         assert session.execute(
             select(func.count()).select_from(text("radar_signal_transitions"))
         ).scalar_one() == 2
+
+
+def test_identical_historical_retry_is_accepted_after_signal_advances(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first_bundle = _scheduled_bundle()
+    first_id = repo.save_scheduled_enriched_run(**first_bundle)
+    second_bundle = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=repo.load_lifecycle_context(),
+    )
+    repo.save_scheduled_enriched_run(**second_bundle)
+    advanced_context = repo.load_lifecycle_context()
+
+    assert repo.save_scheduled_enriched_run(**first_bundle) == first_id
+    assert repo.load_lifecycle_context() == advanced_context
+
+
+def test_historical_retry_rejects_empty_or_conflicting_evaluation(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first_bundle = _scheduled_bundle()
+    repo.save_scheduled_enriched_run(**first_bundle)
+    second_bundle = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=repo.load_lifecycle_context(),
+    )
+    repo.save_scheduled_enriched_run(**second_bundle)
+    original = first_bundle["evaluation"]
+    changed_signal = original.signals[0].model_copy(update={"confidence": 0.7})
+    retries = (
+        LifecycleEvaluation(run_key=original.run_key, signals=(), transitions=()),
+        LifecycleEvaluation(
+            run_key=original.run_key,
+            signals=(changed_signal,),
+            transitions=original.transitions,
+        ),
+    )
+
+    for evaluation in retries:
+        with pytest.raises(ValueError, match="semantic conflict"):
+            repo.save_scheduled_enriched_run(
+                **{**first_bundle, "evaluation": evaluation}
+            )
+
+
+def test_non_sqlite_lifecycle_update_locks_current_signal_rows(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    repo.save_scheduled_enriched_run(**_scheduled_bundle())
+    second_bundle = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=repo.load_lifecycle_context(),
+    )
+    _, statements = _capture_non_sqlite_statements(
+        isolated_db,
+        lambda: repo.save_scheduled_enriched_run(**second_bundle),
+    )
+
+    signal_sql = [
+        str(statement.compile(dialect=postgresql.dialect()))
+        for statement in statements
+        if "radar_signal_instances" in str(statement)
+    ]
+    assert any("FOR UPDATE" in statement for statement in signal_sql)
+
+
+def test_stale_lifecycle_branch_rolls_back_before_extra_transition(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    repo.save_scheduled_enriched_run(**_scheduled_bundle())
+    stale_context = repo.load_lifecycle_context()
+    winner = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=stale_context,
+    )
+    loser = _scheduled_bundle(
+        run_key="cn:20260721T063100Z:schedule",
+        as_of=NOW + timedelta(minutes=31),
+        context=stale_context,
+    )
+    repo.save_scheduled_enriched_run(**winner)
+
+    with pytest.raises(ValueError, match="semantic conflict"):
+        repo.save_scheduled_enriched_run(**loser)
+
+    assert repo.get_run_by_key(loser["snapshot"].run_key) is None
+    with isolated_db.get_session() as session:
+        transition_count = session.scalar(
+            select(func.count()).select_from(RadarSignalTransitionRecord)
+        )
+    assert transition_count == 2
 
 
 def test_scheduled_retry_rejects_changed_signal_semantics(isolated_db) -> None:
@@ -930,24 +1149,74 @@ def test_scheduled_retry_rejects_omitted_transition(isolated_db) -> None:
         )
 
 
-def test_scheduled_snapshot_and_transitions_roll_back_together(
+def test_real_transition_failure_rolls_back_scheduled_lifecycle_transaction(
     isolated_db,
-    monkeypatch,
 ) -> None:
     repo = MarketRadarRepository(isolated_db)
-    bundle = _scheduled_bundle()
-    monkeypatch.setattr(
-        repo,
-        "_save_lifecycle_in_session",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("transition failed")),
-        raising=False,
+    repo.save_scheduled_enriched_run(**_scheduled_bundle())
+    baseline_context = repo.load_lifecycle_context()
+    bundle = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=baseline_context,
+        evidence_source="membership-rollback",
     )
+    with isolated_db._engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER reject_lifecycle_transition
+            BEFORE INSERT ON radar_signal_transitions
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected lifecycle transition');
+            END
+            """
+        )
+    executed_statements = []
 
-    with pytest.raises(RuntimeError, match="transition failed"):
-        repo.save_scheduled_enriched_run(**bundle)
+    def capture_sql(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        executed_statements.append(statement.lower())
+
+    event.listen(isolated_db._engine, "before_cursor_execute", capture_sql)
+    try:
+        with pytest.raises(IntegrityError, match="rejected lifecycle transition"):
+            repo.save_scheduled_enriched_run(**bundle)
+    finally:
+        event.remove(isolated_db._engine, "before_cursor_execute", capture_sql)
 
     assert repo.get_run_by_key(bundle["snapshot"].run_key) is None
-    assert repo.load_lifecycle_context().open_signals == ()
+    assert repo.load_lifecycle_context() == baseline_context
+    signal_update_index = next(
+        index
+        for index, statement in enumerate(executed_statements)
+        if statement.startswith("update radar_signal_instances")
+    )
+    transition_insert_index = next(
+        index
+        for index, statement in enumerate(executed_statements)
+        if statement.startswith("insert into radar_signal_transitions")
+    )
+    assert signal_update_index < transition_insert_index
+    with isolated_db.get_session() as session:
+        assert session.scalar(select(func.count()).select_from(RadarRunRecord)) == 1
+        assert session.scalar(
+            select(func.count()).select_from(RadarEtfObservationRecord)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(RadarConstituentSetRecord)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(RadarConstituentObservationRecord)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(RadarSignalTransitionRecord)
+        ) == 1
 
 
 def test_existing_snapshot_table_gains_nullable_position_and_index(
@@ -1010,10 +1279,17 @@ def test_existing_lifecycle_tables_gain_indexes_without_rewriting_rows(
                 signal_key TEXT NOT NULL,
                 effective_run_id INTEGER NOT NULL
             );
+            CREATE TABLE radar_runs (
+                id INTEGER PRIMARY KEY,
+                run_key TEXT NOT NULL,
+                legacy_note TEXT
+            );
             INSERT INTO radar_run_attempts
                 (attempt_key, market, trading_date, legacy_note)
             VALUES
                 ('legacy-attempt', 'cn', '2026-07-21', 'keep-me');
+            INSERT INTO radar_runs (id, run_key, legacy_note)
+            VALUES (7, 'legacy-run', 'keep-run');
             """
         )
     monkeypatch.setenv("DATABASE_PATH", str(db_path))
@@ -1051,6 +1327,16 @@ def test_existing_lifecycle_tables_gain_indexes_without_rewriting_rows(
             item["name"]
             for item in inspector.get_columns("radar_run_attempts")
         }
+        run_columns = {
+            item["name"]: item for item in inspector.get_columns("radar_runs")
+        }
+        assert run_columns["lifecycle_evaluation_json"]["nullable"] is True
+        with db._engine.connect() as connection:
+            legacy_run = connection.exec_driver_sql(
+                "SELECT id, legacy_note, lifecycle_evaluation_json "
+                "FROM radar_runs"
+            ).one()
+        assert legacy_run == (7, "keep-run", None)
     finally:
         DatabaseManager.reset_instance()
         Config.reset_instance()

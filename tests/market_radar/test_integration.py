@@ -671,6 +671,16 @@ def test_scheduled_lifecycle_and_attempt_survive_database_restart(
         status="succeeded",
         run_id=run_id,
     )
+    with isolated_db._engine.connect() as connection:
+        lifecycle_payloads = dict(
+            connection.exec_driver_sql(
+                "SELECT run_key, lifecycle_evaluation_json FROM radar_runs"
+            ).all()
+        )
+    assert lifecycle_payloads[manual_snapshot.run_key] is None
+    assert LifecycleEvaluation.model_validate_json(
+        lifecycle_payloads[scheduled_snapshot.run_key]
+    ) == evaluation
 
     DatabaseManager.reset_instance()
     reopened = market_radar.MarketRadarRepository(
