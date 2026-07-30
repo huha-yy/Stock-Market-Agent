@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import delete, event, func, inspect, select
+from sqlalchemy import delete, event, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from src.config import Config
@@ -29,11 +29,18 @@ from src.market_radar.models import (
     SectorObservation,
     SectorScore,
 )
+from src.market_radar.lifecycle import (
+    LifecycleContext,
+    LifecycleEvaluation,
+    LifecycleSignal,
+    MarketRadarLifecycleEngine,
+)
 from src.market_radar.observation_builder import (
     ConstituentEvidence,
     canonical_constituent_set_key,
 )
 from src.market_radar.repository import ConstituentSetContent, MarketRadarRepository
+from src.market_radar.session_policy import RadarRunDecision
 from src.storage import (
     DatabaseManager,
     RadarConstituentObservationRecord,
@@ -146,6 +153,7 @@ def _phase2b_evidence(
     selection_score: float = 80.0,
     regime_score: float = 70.0,
     total_position_max_pct: float = 60.0,
+    as_of: datetime = NOW,
 ) -> tuple[
     tuple[EtfObservation, ...],
     tuple[EtfSelection, ...],
@@ -156,7 +164,7 @@ def _phase2b_evidence(
         sector_id="industry:semiconductor",
         code="512480",
         name="Semiconductor ETF",
-        observed_at=NOW,
+        observed_at=as_of,
         data_date=None,
         bar_status=None,
         source="provider-fixture",
@@ -192,7 +200,7 @@ def _phase2b_evidence(
         observation=observation,
     )
     regime = MarketRegimeAssessment(
-        as_of=NOW,
+        as_of=as_of,
         score=regime_score,
         regime="selective",
         confidence=0.8,
@@ -207,7 +215,7 @@ def _phase2b_evidence(
         cohort_sector_ids=("industry:semiconductor",),
     )
     plan = PositionPlan(
-        as_of=NOW,
+        as_of=as_of,
         regime="selective",
         total_position_min_pct=35.0,
         total_position_max_pct=total_position_max_pct,
@@ -241,10 +249,53 @@ def _phase2b_snapshot(
         selection_score=selection_score,
         regime_score=regime_score,
         total_position_max_pct=total_position_max_pct,
+        as_of=evidence.observed_at,
     )
     data = _enriched_snapshot(evidence).model_dump(mode="json")
     data.update(etfs=selections, regime=regime, position_plan=plan)
     return RadarRunSnapshot.model_validate(data), observations
+
+
+def _scheduled_bundle(
+    *,
+    run_key: str = "cn:20260721T060000Z:schedule",
+    as_of: datetime = NOW,
+    context: LifecycleContext | None = None,
+) -> dict[str, object]:
+    evidence = _constituent_evidence(observed_at=as_of)
+    snapshot, observations = _phase2b_snapshot(evidence)
+    observation_data = observations[0].model_dump(mode="json")
+    observation_data["observed_at"] = as_of
+    observations = (EtfObservation.model_validate(observation_data),)
+    snapshot_data = snapshot.model_dump(mode="json")
+    snapshot_data.update(run_key=run_key, trigger="schedule", as_of=as_of)
+    snapshot_data["etfs"][0]["observation"] = observations[0]
+    snapshot_data["regime"]["as_of"] = as_of
+    snapshot_data["position_plan"]["as_of"] = as_of
+    snapshot = RadarRunSnapshot.model_validate(snapshot_data)
+    evaluation = MarketRadarLifecycleEngine().evaluate(
+        snapshot,
+        context or LifecycleContext(),
+        run_kind="intraday",
+    )
+    return {
+        "sectors": [_sector_definition()],
+        "evidence": [evidence],
+        "etf_observations": observations,
+        "snapshot": snapshot,
+        "evaluation": evaluation,
+    }
+
+
+def _intraday_decision(*, decided_at: datetime = NOW) -> RadarRunDecision:
+    return RadarRunDecision(
+        kind="intraday_due",
+        decided_at=decided_at,
+        trading_date=date(2026, 7, 21),
+        attempt_key="cn:intraday:2026-07-21:morning:1400",
+        session_segment="morning",
+        slot_start=decided_at,
+    )
 
 
 def _constituent_evidence(
@@ -349,6 +400,9 @@ def test_tables_are_created(isolated_db) -> None:
         "radar_constituent_observations",
         "radar_runs",
         "radar_sector_snapshots",
+        "radar_run_attempts",
+        "radar_signal_instances",
+        "radar_signal_transitions",
     } <= names
     snapshot_columns = {
         column["name"]: column
@@ -445,6 +499,27 @@ def test_tables_are_created(isolated_db) -> None:
         and tuple(item["referred_columns"]) == ("set_key",)
         for item in constituent_foreign_keys
     )
+
+    expected_indexes = {
+        "radar_run_attempts": {
+            "ix_radar_run_attempts_market": ("market",),
+            "ix_radar_run_attempts_trading_date": ("trading_date",),
+        },
+        "radar_signal_instances": {
+            "ix_radar_signal_instances_market": ("market",),
+            "ix_radar_signal_instances_sector_id": ("sector_id",),
+        },
+        "radar_signal_transitions": {
+            "ix_radar_signal_transitions_signal_key": ("signal_key",),
+            "ix_radar_signal_transitions_effective_run_id": ("effective_run_id",),
+        },
+    }
+    for table_name, expected in expected_indexes.items():
+        actual = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_indexes(table_name)
+        }
+        assert expected.items() <= actual.items()
 
 
 def test_phase2b_tables_are_additive_and_cascade_with_run(isolated_db) -> None:
@@ -684,6 +759,197 @@ def test_phase2b_retry_rejects_changed_semantics(
         )
 
 
+def test_reserve_attempt_reuses_terminal_identity(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    run_id = repo.save_run(_snapshot())
+    decision = _intraday_decision()
+
+    first = repo.reserve_scheduled_attempt(decision, lease_seconds=900, now=NOW)
+    repo.finish_scheduled_attempt(
+        first.attempt_key,
+        status="succeeded",
+        run_id=run_id,
+    )
+    second = repo.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert second.acquired is False
+    assert second.status == "succeeded"
+    assert second.run_id == run_id
+
+
+def test_started_attempt_can_only_be_reclaimed_after_lease(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    decision = _intraday_decision()
+
+    first = repo.reserve_scheduled_attempt(decision, lease_seconds=900, now=NOW)
+    before_expiry = repo.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW + timedelta(seconds=899),
+    )
+    at_expiry = repo.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW + timedelta(seconds=900),
+    )
+
+    assert first.acquired is True
+    assert before_expiry.acquired is False
+    assert at_expiry.acquired is True
+
+
+def test_concurrent_attempt_reservations_have_one_database_winner(
+    isolated_db,
+) -> None:
+    decision = _intraday_decision()
+
+    reservations = _run_concurrently_after_first_select(
+        isolated_db,
+        "radar_run_attempts",
+        lambda: MarketRadarRepository(isolated_db).reserve_scheduled_attempt(
+            decision,
+            lease_seconds=900,
+            now=NOW,
+        ),
+    )
+
+    assert sorted(item.acquired for item in reservations) == [False, True]
+    assert {item.attempt_key for item in reservations} == {decision.attempt_key}
+
+
+def test_finish_attempt_is_semantically_idempotent_and_bounds_summary(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    reservation = repo.reserve_scheduled_attempt(
+        _intraday_decision(),
+        lease_seconds=900,
+        now=NOW,
+    )
+    long_summary = "x" * 700
+
+    repo.finish_scheduled_attempt(
+        reservation.attempt_key,
+        status="failed",
+        failure_category="provider_error",
+        failure_summary=long_summary,
+    )
+    repo.finish_scheduled_attempt(
+        reservation.attempt_key,
+        status="failed",
+        failure_category="provider_error",
+        failure_summary=long_summary,
+    )
+
+    with isolated_db.get_session() as session:
+        stored_summary = session.execute(
+            select(text("failure_summary")).select_from(
+                text("radar_run_attempts")
+            )
+        ).scalar_one()
+    assert stored_summary == "x" * 512
+
+    with pytest.raises(ValueError, match="already terminal"):
+        repo.finish_scheduled_attempt(
+            reservation.attempt_key,
+            status="skipped",
+            reason_code="duplicate_slot",
+        )
+
+
+def test_scheduled_lifecycle_context_updates_current_row_and_appends_transitions(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    first_bundle = _scheduled_bundle()
+    first_id = repo.save_scheduled_enriched_run(**first_bundle)
+    first_context = repo.load_lifecycle_context()
+
+    second_bundle = _scheduled_bundle(
+        run_key="cn:20260721T063000Z:schedule",
+        as_of=NOW + timedelta(minutes=30),
+        context=first_context,
+    )
+    second_id = repo.save_scheduled_enriched_run(**second_bundle)
+    current = repo.load_lifecycle_context()
+
+    assert first_id != second_id
+    assert len(current.open_signals) == 1
+    assert current.open_signals[0].state == "confirmed"
+    assert current.open_signals[0].current_run_key == second_bundle["snapshot"].run_key
+    assert current.latest_instance_by_sector == {"industry:semiconductor": 1}
+    with isolated_db.get_session() as session:
+        assert session.execute(
+            select(func.count()).select_from(text("radar_signal_instances"))
+        ).scalar_one() == 1
+        assert session.execute(
+            select(func.count()).select_from(text("radar_signal_transitions"))
+        ).scalar_one() == 2
+
+
+def test_scheduled_retry_rejects_changed_signal_semantics(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    bundle = _scheduled_bundle()
+    run_id = repo.save_scheduled_enriched_run(**bundle)
+    evaluation = bundle["evaluation"]
+    changed_signal_data = evaluation.signals[0].model_dump(mode="json")
+    changed_signal_data["confidence"] = 0.7
+    changed_evaluation = LifecycleEvaluation(
+        run_key=evaluation.run_key,
+        signals=(LifecycleSignal.model_validate(changed_signal_data),),
+        transitions=evaluation.transitions,
+    )
+
+    with pytest.raises(ValueError, match="semantic conflict"):
+        repo.save_scheduled_enriched_run(
+            **{**bundle, "evaluation": changed_evaluation}
+        )
+
+    assert repo.get_run_by_key(bundle["snapshot"].run_key) is not None
+    assert repo.save_scheduled_enriched_run(**bundle) == run_id
+
+
+def test_scheduled_retry_rejects_omitted_transition(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    bundle = _scheduled_bundle()
+    repo.save_scheduled_enriched_run(**bundle)
+    evaluation = bundle["evaluation"]
+    incomplete = LifecycleEvaluation(
+        run_key=evaluation.run_key,
+        signals=evaluation.signals,
+        transitions=(),
+    )
+
+    with pytest.raises(ValueError, match="semantic conflict"):
+        repo.save_scheduled_enriched_run(
+            **{**bundle, "evaluation": incomplete}
+        )
+
+
+def test_scheduled_snapshot_and_transitions_roll_back_together(
+    isolated_db,
+    monkeypatch,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    bundle = _scheduled_bundle()
+    monkeypatch.setattr(
+        repo,
+        "_save_lifecycle_in_session",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("transition failed")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="transition failed"):
+        repo.save_scheduled_enriched_run(**bundle)
+
+    assert repo.get_run_by_key(bundle["snapshot"].run_key) is None
+    assert repo.load_lifecycle_context().open_signals == ()
+
+
 def test_existing_snapshot_table_gains_nullable_position_and_index(
     tmp_path,
     monkeypatch,
@@ -715,6 +981,76 @@ def test_existing_snapshot_table_gains_nullable_position_and_index(
         }
         assert columns["position"]["nullable"] is True
         assert indexes["idx_radar_sector_run_position"] == ("run_id", "position")
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+
+
+def test_existing_lifecycle_tables_gain_indexes_without_rewriting_rows(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "legacy_lifecycle.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE radar_run_attempts (
+                attempt_key TEXT PRIMARY KEY,
+                market TEXT NOT NULL,
+                trading_date DATE NOT NULL,
+                legacy_note TEXT
+            );
+            CREATE TABLE radar_signal_instances (
+                signal_key TEXT PRIMARY KEY,
+                market TEXT NOT NULL,
+                sector_id TEXT NOT NULL
+            );
+            CREATE TABLE radar_signal_transitions (
+                transition_key TEXT PRIMARY KEY,
+                signal_key TEXT NOT NULL,
+                effective_run_id INTEGER NOT NULL
+            );
+            INSERT INTO radar_run_attempts
+                (attempt_key, market, trading_date, legacy_note)
+            VALUES
+                ('legacy-attempt', 'cn', '2026-07-21', 'keep-me');
+            """
+        )
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    Config.reset_instance()
+    DatabaseManager.reset_instance()
+    try:
+        db = DatabaseManager.get_instance()
+        inspector = inspect(db._engine)
+        expected_indexes = {
+            "radar_run_attempts": {
+                "ix_radar_run_attempts_market",
+                "ix_radar_run_attempts_trading_date",
+            },
+            "radar_signal_instances": {
+                "ix_radar_signal_instances_market",
+                "ix_radar_signal_instances_sector_id",
+            },
+            "radar_signal_transitions": {
+                "ix_radar_signal_transitions_signal_key",
+                "ix_radar_signal_transitions_effective_run_id",
+            },
+        }
+        for table_name, expected in expected_indexes.items():
+            actual = {
+                item["name"] for item in inspector.get_indexes(table_name)
+            }
+            assert expected <= actual
+
+        with db._engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT attempt_key, legacy_note FROM radar_run_attempts"
+            ).one()
+        assert row == ("legacy-attempt", "keep-me")
+        assert "legacy_note" in {
+            item["name"]
+            for item in inspector.get_columns("radar_run_attempts")
+        }
     finally:
         DatabaseManager.reset_instance()
         Config.reset_instance()

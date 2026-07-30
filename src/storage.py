@@ -1351,6 +1351,67 @@ class RadarPositionPlanRecord(Base):
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
 
+class RadarRunAttemptRecord(Base):
+    __tablename__ = "radar_run_attempts"
+
+    attempt_key = Column(String(192), primary_key=True)
+    market = Column(String(16), nullable=False, index=True)
+    trigger_type = Column(String(32), nullable=False)
+    trading_date = Column(Date, nullable=False, index=True)
+    decided_at = Column(DateTime, nullable=False)
+    lease_expires_at = Column(DateTime, nullable=True)
+    status = Column(String(32), nullable=False)
+    reason_code = Column(String(96), nullable=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    failure_category = Column(String(96), nullable=True)
+    failure_summary = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarSignalInstanceRecord(Base):
+    __tablename__ = "radar_signal_instances"
+
+    signal_key = Column(String(192), primary_key=True)
+    market = Column(String(16), nullable=False, index=True)
+    sector_id = Column(String(160), nullable=False, index=True)
+    instance_number = Column(Integer, nullable=False)
+    state = Column(String(32), nullable=False)
+    lifecycle_version = Column(String(32), nullable=False)
+    first_run_id = Column(Integer, ForeignKey("radar_runs.id"), nullable=False)
+    last_run_id = Column(Integer, ForeignKey("radar_runs.id"), nullable=False)
+    signal_json = Column(Text, nullable=False)
+    closed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarSignalTransitionRecord(Base):
+    __tablename__ = "radar_signal_transitions"
+
+    transition_key = Column(String(224), primary_key=True)
+    signal_key = Column(
+        String(192),
+        ForeignKey("radar_signal_instances.signal_key"),
+        nullable=False,
+        index=True,
+    )
+    effective_run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id"),
+        nullable=False,
+        index=True,
+    )
+    previous_state = Column(String(32), nullable=True)
+    new_state = Column(String(32), nullable=False)
+    transition_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1434,6 +1495,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_market_radar_snapshot_position_schema()
+            self._ensure_market_radar_lifecycle_schema()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1480,6 +1542,38 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "CREATE INDEX IF NOT EXISTS idx_radar_sector_run_position "
                 f"ON {table_name} (run_id, position)"
             )
+
+    def _ensure_market_radar_lifecycle_schema(self) -> None:
+        """Add lifecycle indexes without rewriting existing Radar tables."""
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        indexes = {
+            RadarRunAttemptRecord.__tablename__: (
+                ("ix_radar_run_attempts_market", "market"),
+                ("ix_radar_run_attempts_trading_date", "trading_date"),
+            ),
+            RadarSignalInstanceRecord.__tablename__: (
+                ("ix_radar_signal_instances_market", "market"),
+                ("ix_radar_signal_instances_sector_id", "sector_id"),
+            ),
+            RadarSignalTransitionRecord.__tablename__: (
+                ("ix_radar_signal_transitions_signal_key", "signal_key"),
+                (
+                    "ix_radar_signal_transitions_effective_run_id",
+                    "effective_run_id",
+                ),
+            ),
+        }
+        with self._engine.begin() as connection:
+            for table_name, definitions in indexes.items():
+                if not inspector.has_table(table_name):
+                    continue
+                for index_name, column_name in definitions:
+                    connection.exec_driver_sql(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {table_name} ({column_name})"
+                    )
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()

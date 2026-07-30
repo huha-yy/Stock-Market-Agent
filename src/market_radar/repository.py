@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, desc, or_, select
@@ -22,10 +22,17 @@ from src.market_radar.models import (
     SectorObservation,
     SectorScore,
 )
+from src.market_radar.lifecycle import (
+    LifecycleContext,
+    LifecycleEvaluation,
+    LifecycleSignal,
+    LifecycleTransition,
+)
 from src.market_radar.observation_builder import (
     ConstituentEvidence,
     canonical_constituent_set_key,
 )
+from src.market_radar.session_policy import RadarRunDecision
 from src.storage import (
     DatabaseManager,
     RadarConstituentObservationRecord,
@@ -34,10 +41,14 @@ from src.storage import (
     RadarEtfSelectionRecord,
     RadarPositionPlanRecord,
     RadarRegimeAssessmentRecord,
+    RadarRunAttemptRecord,
     RadarRunRecord,
     RadarSectorSnapshotRecord,
+    RadarSignalInstanceRecord,
+    RadarSignalTransitionRecord,
     RadarUniverseRecord,
     to_utc_naive_datetime,
+    utc_naive_now,
 )
 
 
@@ -65,6 +76,14 @@ class ConstituentSetContent:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class AttemptReservation:
+    attempt_key: str
+    acquired: bool
+    status: str
+    run_id: int | None = None
+
+
 class MarketRadarRepository:
     def __init__(self, db: DatabaseManager | None = None) -> None:
         self.db = db or DatabaseManager.get_instance()
@@ -77,6 +96,104 @@ class MarketRadarRepository:
                 f"{operation_name}[integrity-retry]",
                 operation,
             )
+
+    def reserve_scheduled_attempt(
+        self,
+        decision: RadarRunDecision,
+        *,
+        lease_seconds: int = 900,
+        now: datetime | None = None,
+    ) -> AttemptReservation:
+        if not decision.attempt_key:
+            raise ValueError("scheduled decision requires an attempt_key")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        current = current.astimezone(timezone.utc)
+        lease_expires = current + timedelta(seconds=lease_seconds)
+        current_naive = to_utc_naive_datetime(current)
+
+        def write(session: Any) -> AttemptReservation:
+            row = session.get(RadarRunAttemptRecord, decision.attempt_key)
+            if row is None:
+                row = RadarRunAttemptRecord(
+                    attempt_key=decision.attempt_key,
+                    market="cn",
+                    trigger_type=decision.kind,
+                    trading_date=decision.trading_date,
+                    decided_at=to_utc_naive_datetime(decision.decided_at),
+                    lease_expires_at=to_utc_naive_datetime(lease_expires),
+                    status="started",
+                )
+                session.add(row)
+                session.flush()
+                return AttemptReservation(row.attempt_key, True, "started", None)
+
+            expired = (
+                row.status == "started"
+                and row.lease_expires_at is not None
+                and row.lease_expires_at <= current_naive
+            )
+            if expired:
+                row.decided_at = to_utc_naive_datetime(decision.decided_at)
+                row.lease_expires_at = to_utc_naive_datetime(lease_expires)
+                row.updated_at = current_naive
+                return AttemptReservation(
+                    row.attempt_key,
+                    True,
+                    "started",
+                    row.run_id,
+                )
+            return AttemptReservation(
+                row.attempt_key,
+                False,
+                row.status,
+                row.run_id,
+            )
+
+        return self._run_idempotent_write(
+            f"reserve_radar_attempt[{decision.attempt_key}]",
+            write,
+        )
+
+    def finish_scheduled_attempt(
+        self,
+        attempt_key: str,
+        *,
+        status: Literal["succeeded", "skipped", "failed"],
+        run_id: int | None = None,
+        reason_code: str | None = None,
+        failure_category: str | None = None,
+        failure_summary: str | None = None,
+    ) -> None:
+        values = {
+            "status": status,
+            "run_id": run_id,
+            "reason_code": reason_code,
+            "failure_category": failure_category,
+            "failure_summary": failure_summary[:512] if failure_summary else None,
+        }
+
+        def write(session: Any) -> None:
+            row = session.get(RadarRunAttemptRecord, attempt_key)
+            if row is None:
+                raise ValueError(f"unknown scheduled attempt: {attempt_key}")
+            actual = {key: getattr(row, key) for key in values}
+            if row.status != "started":
+                if actual == values:
+                    return
+                raise ValueError(
+                    f"scheduled attempt is already terminal: {attempt_key}"
+                )
+            for key, value in values.items():
+                setattr(row, key, value)
+            row.lease_expires_at = None
+            row.updated_at = utc_naive_now()
+
+        self._run_idempotent_write(
+            f"finish_radar_attempt[{attempt_key}]",
+            write,
+        )
 
     def sync_universe(self, sectors: list[SectorDefinition]) -> None:
         self._validate_universe(sectors)
@@ -260,6 +377,287 @@ class MarketRadarRepository:
             f"save_market_radar_enriched_run[{snapshot.run_key}]",
             write,
         )
+
+    def load_lifecycle_context(self) -> LifecycleContext:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(RadarSignalInstanceRecord).order_by(
+                    RadarSignalInstanceRecord.sector_id,
+                    RadarSignalInstanceRecord.instance_number,
+                )
+            ).scalars().all()
+            latest: dict[str, int] = {}
+            open_signals: list[LifecycleSignal] = []
+            for row in rows:
+                latest[row.sector_id] = max(
+                    latest.get(row.sector_id, 0),
+                    row.instance_number,
+                )
+                if row.closed_at is None:
+                    open_signals.append(
+                        LifecycleSignal.model_validate_json(row.signal_json)
+                    )
+            return LifecycleContext(
+                open_signals=tuple(open_signals),
+                latest_instance_by_sector=latest,
+            )
+
+    def save_scheduled_enriched_run(
+        self,
+        sectors: list[SectorDefinition],
+        evidence: Sequence[ConstituentEvidence],
+        etf_observations: Sequence[EtfObservation],
+        snapshot: RadarRunSnapshot,
+        evaluation: LifecycleEvaluation,
+    ) -> int:
+        if snapshot.trigger != "schedule" or evaluation.run_key != snapshot.run_key:
+            raise ValueError("scheduled snapshot and lifecycle evaluation must match")
+        self._validate_universe(sectors)
+        self._validate_snapshot_traceability(snapshot)
+        validated_observations = tuple(etf_observations)
+        self._validate_etf_observations(snapshot, validated_observations)
+        validated_evidence = self._validate_enriched_traceability(
+            snapshot,
+            evidence,
+        )
+
+        def write(session: Any) -> int:
+            existing_id = session.execute(
+                select(RadarRunRecord.id).where(
+                    RadarRunRecord.run_key == snapshot.run_key
+                )
+            ).scalar_one_or_none()
+            if existing_id is not None:
+                self._assert_constituent_evidence_compatible_in_session(
+                    session,
+                    validated_evidence,
+                )
+                self._validate_effective_constituent_evidence_in_session(
+                    session,
+                    validated_evidence,
+                    snapshot,
+                )
+                self._assert_run_semantically_equal_in_session(
+                    session,
+                    int(existing_id),
+                    snapshot,
+                    validated_observations,
+                )
+                self._save_lifecycle_in_session(
+                    session,
+                    int(existing_id),
+                    evaluation,
+                )
+                return int(existing_id)
+
+            self._sync_universe_in_session(session, sectors)
+            self._save_constituent_evidence_in_session(
+                session,
+                validated_evidence,
+            )
+            self._validate_effective_constituent_evidence_in_session(
+                session,
+                validated_evidence,
+                snapshot,
+            )
+            run_id = self._save_run_in_session(
+                session,
+                snapshot,
+                validated_observations,
+            )
+            self._save_lifecycle_in_session(session, run_id, evaluation)
+            return run_id
+
+        return self._run_idempotent_write(
+            f"save_scheduled_market_radar_run[{snapshot.run_key}]",
+            write,
+        )
+
+    @classmethod
+    def _save_lifecycle_in_session(
+        cls,
+        session: Any,
+        run_id: int,
+        evaluation: LifecycleEvaluation,
+    ) -> None:
+        signal_keys = [signal.signal_key for signal in evaluation.signals]
+        transition_keys = [
+            transition.transition_key for transition in evaluation.transitions
+        ]
+        if len(signal_keys) != len(set(signal_keys)):
+            raise ValueError("duplicate lifecycle signal key")
+        if len(transition_keys) != len(set(transition_keys)):
+            raise ValueError("duplicate lifecycle transition key")
+
+        current_run = session.get(RadarRunRecord, run_id)
+        if current_run is None or current_run.run_key != evaluation.run_key:
+            raise ValueError("lifecycle evaluation run does not match persisted run")
+
+        stored_signal_keys = set(
+            session.execute(
+                select(RadarSignalInstanceRecord.signal_key).where(
+                    RadarSignalInstanceRecord.last_run_id == run_id
+                )
+            ).scalars()
+        )
+        stored_transition_keys = set(
+            session.execute(
+                select(RadarSignalTransitionRecord.transition_key).where(
+                    RadarSignalTransitionRecord.effective_run_id == run_id
+                )
+            ).scalars()
+        )
+        if stored_signal_keys or stored_transition_keys:
+            if (
+                stored_signal_keys != set(signal_keys)
+                or stored_transition_keys != set(transition_keys)
+            ):
+                raise ValueError(
+                    f"lifecycle evaluation semantic conflict for {evaluation.run_key}"
+                )
+
+        required_run_keys = {evaluation.run_key}
+        for signal in evaluation.signals:
+            if signal.current_run_key != evaluation.run_key:
+                raise ValueError("lifecycle signal run does not match evaluation")
+            required_run_keys.add(signal.first_run_key)
+            required_run_keys.add(signal.current_run_key)
+            if signal.previous_run_key is not None:
+                required_run_keys.add(signal.previous_run_key)
+        for transition in evaluation.transitions:
+            if transition.effective_run_key != evaluation.run_key:
+                raise ValueError("lifecycle transition run does not match evaluation")
+            required_run_keys.add(transition.effective_run_key)
+
+        run_ids = {
+            run_key: int(stored_run_id)
+            for run_key, stored_run_id in session.execute(
+                select(RadarRunRecord.run_key, RadarRunRecord.id).where(
+                    RadarRunRecord.run_key.in_(required_run_keys)
+                )
+            ).all()
+        }
+        missing_run_keys = required_run_keys - set(run_ids)
+        if missing_run_keys:
+            missing = ", ".join(sorted(missing_run_keys))
+            raise ValueError(f"lifecycle run reference is not persisted: {missing}")
+
+        for signal in evaluation.signals:
+            first_run_id = run_ids[signal.first_run_key]
+            last_run_id = run_ids[signal.current_run_key]
+            signal_json = _dump(signal.model_dump(mode="json"))
+            row = session.get(RadarSignalInstanceRecord, signal.signal_key)
+            identity = (
+                signal.market,
+                signal.sector_id,
+                signal.instance_number,
+                signal.lifecycle_version,
+                first_run_id,
+            )
+            if row is None:
+                row = RadarSignalInstanceRecord(
+                    signal_key=signal.signal_key,
+                    market=signal.market,
+                    sector_id=signal.sector_id,
+                    instance_number=signal.instance_number,
+                    state=signal.state,
+                    lifecycle_version=signal.lifecycle_version,
+                    first_run_id=first_run_id,
+                    last_run_id=last_run_id,
+                    signal_json=signal_json,
+                    closed_at=(
+                        to_utc_naive_datetime(signal.closed_at)
+                        if signal.closed_at is not None
+                        else None
+                    ),
+                )
+                session.add(row)
+                session.flush()
+                continue
+
+            stored_identity = (
+                row.market,
+                row.sector_id,
+                row.instance_number,
+                row.lifecycle_version,
+                row.first_run_id,
+            )
+            if stored_identity != identity:
+                raise ValueError(
+                    f"lifecycle signal semantic conflict for {signal.signal_key}"
+                )
+            stored_signal = LifecycleSignal.model_validate_json(row.signal_json)
+            if stored_signal.current_run_key == signal.current_run_key:
+                expected_closed_at = (
+                    to_utc_naive_datetime(signal.closed_at)
+                    if signal.closed_at is not None
+                    else None
+                )
+                if (
+                    stored_signal != signal
+                    or row.state != signal.state
+                    or row.last_run_id != last_run_id
+                    or row.closed_at != expected_closed_at
+                ):
+                    raise ValueError(
+                        f"lifecycle signal semantic conflict for {signal.signal_key}"
+                    )
+                continue
+            if (
+                row.closed_at is not None
+                or signal.previous_run_key != stored_signal.current_run_key
+            ):
+                raise ValueError(
+                    f"lifecycle signal semantic conflict for {signal.signal_key}"
+                )
+            row.state = signal.state
+            row.last_run_id = last_run_id
+            row.signal_json = signal_json
+            row.closed_at = (
+                to_utc_naive_datetime(signal.closed_at)
+                if signal.closed_at is not None
+                else None
+            )
+            row.updated_at = utc_naive_now()
+
+        evaluation_signal_keys = set(signal_keys)
+        for transition in evaluation.transitions:
+            if transition.signal_key not in evaluation_signal_keys:
+                raise ValueError(
+                    "lifecycle transition must reference an evaluated signal"
+                )
+            transition_json = _dump(transition.model_dump(mode="json"))
+            effective_run_id = run_ids[transition.effective_run_key]
+            row = session.get(
+                RadarSignalTransitionRecord,
+                transition.transition_key,
+            )
+            if row is None:
+                session.add(
+                    RadarSignalTransitionRecord(
+                        transition_key=transition.transition_key,
+                        signal_key=transition.signal_key,
+                        effective_run_id=effective_run_id,
+                        previous_state=transition.previous_state,
+                        new_state=transition.new_state,
+                        transition_json=transition_json,
+                    )
+                )
+                continue
+            stored_transition = LifecycleTransition.model_validate_json(
+                row.transition_json
+            )
+            if (
+                stored_transition != transition
+                or row.signal_key != transition.signal_key
+                or row.effective_run_id != effective_run_id
+                or row.previous_state != transition.previous_state
+                or row.new_state != transition.new_state
+            ):
+                raise ValueError(
+                    "lifecycle transition semantic conflict for "
+                    f"{transition.transition_key}"
+                )
 
     @classmethod
     def _validate_enriched_traceability(
