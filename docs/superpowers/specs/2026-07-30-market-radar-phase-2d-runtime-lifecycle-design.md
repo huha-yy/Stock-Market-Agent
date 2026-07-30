@@ -1,6 +1,6 @@
 # Market Radar Phase 2D Runtime and Lifecycle Design
 
-**Status:** Draft for written review
+**Status:** Approved design
 
 **Date:** 2026-07-30
 
