@@ -151,6 +151,20 @@ describe('SidebarNav', () => {
     expect(signalsLink).toHaveClass('font-medium');
   });
 
+  it('renders the Market Radar navigation item after AI signals and marks it active', () => {
+    render(
+      <MemoryRouter initialEntries={['/market-radar']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const radarLink = screen.getByRole('link', { name: '市场雷达' });
+    expect(radarLink).toHaveAttribute('href', '/market-radar');
+    expect(radarLink).toHaveClass('font-medium');
+    const hrefs = screen.getAllByRole('link').map((link) => link.getAttribute('href'));
+    expect(hrefs.indexOf('/market-radar')).toBe(hrefs.indexOf('/decision-signals') + 1);
+  });
+
   it('opens the logout confirmation and confirms logout', async () => {
     render(
       <MemoryRouter initialEntries={['/chat']}>

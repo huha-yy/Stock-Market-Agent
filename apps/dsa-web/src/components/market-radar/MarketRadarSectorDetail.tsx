@@ -16,6 +16,7 @@ const factorKeys: Record<string, UiTextKey> = {
   liquidityExpansion: 'marketRadar.factor.liquidityExpansion',
   catalyst: 'marketRadar.factor.catalyst',
 };
+const etfStatuses = ['best_supported', 'candidate', 'rejected', 'insufficient_data'];
 
 function humanize(value: string): string {
   return value.replaceAll('_', ' ');
@@ -70,7 +71,9 @@ export const MarketRadarSectorDetail: React.FC<MarketRadarSectorDetailProps> = (
         ) : (
           <div className="divide-y divide-border/40">
             {detail.etfs.map((etf) => {
-              const statusKey = `marketRadar.etf.${etf.status}` as UiTextKey;
+              const status = etfStatuses.includes(etf.status)
+                ? t(`marketRadar.etf.${etf.status}` as UiTextKey)
+                : t('marketRadar.unknown', { value: etf.status });
               return (
                 <div key={etf.code} className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0">
                   <div className="min-w-0">
@@ -78,7 +81,7 @@ export const MarketRadarSectorDetail: React.FC<MarketRadarSectorDetailProps> = (
                     <p className="mt-1 font-mono text-xs text-secondary-text">{etf.code}</p>
                   </div>
                   <div className="flex items-center gap-3">
-                    <Badge className="rounded-md" variant={etf.eligible ? 'success' : 'warning'}>{t(statusKey)}</Badge>
+                    <Badge className="rounded-md" variant={etf.eligible ? 'success' : 'warning'}>{status}</Badge>
                     <span className="font-mono text-sm text-foreground">{etf.score == null ? unavailable : etf.score.toFixed(1)}</span>
                   </div>
                 </div>

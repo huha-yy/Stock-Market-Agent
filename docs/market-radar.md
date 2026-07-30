@@ -186,15 +186,30 @@ Phase 2C exposes the latest persisted A-share snapshot under the authenticated F
 
 These routes always read market `cn` through `MarketRadarRepository`; they do not accept a market override, call a provider, start a scan, recompute policy, or write data. When `ADMIN_AUTH_ENABLED=true`, the existing administrator session cookie is required. Legacy persisted snapshots remain readable with an empty ETF list and null regime, position suggestion, and position plan.
 
-## Phase 2B Out Of Scope
+## Web Monitoring Cockpit (Phase 2C)
 
-The exact Phase 2B exclusions are:
+The authenticated Web shell exposes the read-only cockpit at `/market-radar`. The page preserves the API ranking and policy outputs without recomputing score, regime, ETF eligibility, confidence, or position limits in the browser. It supports the existing Chinese and English UI languages and the existing light/dark themes.
+
+Information is presented in this order:
+
+1. market regime, run quality and coverage, suggested total-position range, and snapshot metadata;
+2. the complete persisted sector ranking in API order;
+3. the selected sector's factor scores, risk reasons, and missing evidence;
+4. ETF alternatives, sector and ETF caps, joint confidence, and invalidation codes.
+
+The page selects the first persisted rank initially and loads another sector detail only when the user selects it. Refresh requests the latest snapshot and ranking together. A run-key mismatch is treated as a summary error rather than combining two snapshots. A detail error stays local so the overview and ranking remain usable, and stale detail responses cannot replace a newer selection. With no persisted run, the page shows an empty bootstrap state; legacy snapshots show unavailable regime and policy values instead of zero.
+
+This cockpit is A-share-only and read-only. It has no run, scheduling, alert, notification, report, configuration, or mutation controls. Creating a fresh snapshot remains an operator workflow through `scripts/run_market_radar.py --market cn --persist`.
+
+## Phase 2C Out Of Scope
+
+The current exclusions are:
 
 - historical provider backfill;
 - reconstructing old observations from current constituents;
 - catalyst/news/policy scoring;
 - lifecycle hysteresis, signals, state-transition alerts, scheduling, or notifications;
-- write APIs, Web, Desktop, or report rendering;
+- write APIs, Desktop, or report rendering;
 - outcomes and calibration;
 - Hong Kong data and A/H links;
 - LLM calls or narrative generation;

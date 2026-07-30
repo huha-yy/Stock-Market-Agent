@@ -48,6 +48,10 @@ vi.mock('./pages/DecisionSignalsPage', () => ({
   default: () => <div data-testid="decision-signals-page">Decision signals</div>,
 }));
 
+vi.mock('./pages/MarketRadarPage', () => ({
+  default: () => <div data-testid="market-radar-page">Market Radar</div>,
+}));
+
 vi.mock('./pages/BacktestPage', () => ({
   default: () => <div data-testid="backtest-page">Backtest</div>,
 }));
@@ -149,6 +153,16 @@ describe('App routing behavior', () => {
 
     expect(await screen.findByTestId('decision-signals-page')).toBeInTheDocument();
     expect(setCurrentRoute).toHaveBeenCalledWith('/decision-signals');
+    expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
+  });
+
+  it('routes /market-radar to the cockpit after auth is ready', async () => {
+    window.history.pushState({}, '', '/market-radar');
+
+    render(<App />);
+
+    expect(await screen.findByTestId('market-radar-page')).toBeInTheDocument();
+    expect(setCurrentRoute).toHaveBeenCalledWith('/market-radar');
     expect(screen.queryByTestId('home-page')).not.toBeInTheDocument();
   });
 

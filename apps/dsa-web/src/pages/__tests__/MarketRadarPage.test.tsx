@@ -270,10 +270,15 @@ describe('MarketRadarPage', () => {
         regime: latest.run.regime ? { ...latest.run.regime, regime: 'future_regime' } : null,
       } : null,
     });
+    getSector.mockResolvedValue({
+      ...detailFor(semiconductor),
+      etfs: [{ ...detailFor(semiconductor).etfs[0], status: 'future_status' }],
+    });
     renderPage();
 
     expect(await screen.findByText('Unknown (future_regime)')).toBeInTheDocument();
     expect(screen.getByText('Unknown (future_quality)')).toBeInTheDocument();
+    expect(await screen.findByText('Unknown (future_status)')).toBeInTheDocument();
   });
 
   it('refreshes summaries manually', async () => {
