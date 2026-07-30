@@ -11,9 +11,9 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import delete, event, func, inspect, select, text
+from sqlalchemy import create_engine, delete, event, func, inspect, select, text
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.config import Config
 from src.market_radar.models import (
@@ -854,6 +854,31 @@ def test_non_sqlite_expired_attempt_reclaim_locks_the_row(
     assert any("FOR UPDATE" in statement for statement in attempt_sql)
 
 
+def test_non_sqlite_finish_attempt_locks_the_row(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    reservation = repo.reserve_scheduled_attempt(
+        _intraday_decision(),
+        lease_seconds=900,
+        now=NOW,
+    )
+
+    _, statements = _capture_non_sqlite_statements(
+        isolated_db,
+        lambda: repo.finish_scheduled_attempt(
+            reservation.attempt_key,
+            status="failed",
+            failure_category="provider_error",
+        ),
+    )
+
+    attempt_sql = [
+        str(statement.compile(dialect=postgresql.dialect()))
+        for statement in statements
+        if "radar_run_attempts" in str(statement)
+    ]
+    assert any("FOR UPDATE" in statement for statement in attempt_sql)
+
+
 def test_concurrent_attempt_reservations_have_one_database_winner(
     isolated_db,
 ) -> None:
@@ -1132,6 +1157,36 @@ def test_scheduled_retry_rejects_changed_signal_semantics(isolated_db) -> None:
     assert repo.save_scheduled_enriched_run(**bundle) == run_id
 
 
+def test_scheduled_retry_accepts_timezone_equivalent_evaluation(isolated_db) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    bundle = _scheduled_bundle()
+    run_id = repo.save_scheduled_enriched_run(**bundle)
+    evaluation = bundle["evaluation"]
+    shanghai = ZoneInfo("Asia/Shanghai")
+    equivalent = LifecycleEvaluation(
+        run_key=evaluation.run_key,
+        signals=tuple(
+            signal.model_copy(
+                update={"effective_at": signal.effective_at.astimezone(shanghai)}
+            )
+            for signal in evaluation.signals
+        ),
+        transitions=tuple(
+            transition.model_copy(
+                update={
+                    "effective_at": transition.effective_at.astimezone(shanghai)
+                }
+            )
+            for transition in evaluation.transitions
+        ),
+    )
+
+    assert equivalent == evaluation
+    assert repo.save_scheduled_enriched_run(
+        **{**bundle, "evaluation": equivalent}
+    ) == run_id
+
+
 def test_scheduled_retry_rejects_omitted_transition(isolated_db) -> None:
     repo = MarketRadarRepository(isolated_db)
     bundle = _scheduled_bundle()
@@ -1340,6 +1395,125 @@ def test_existing_lifecycle_tables_gain_indexes_without_rewriting_rows(
     finally:
         DatabaseManager.reset_instance()
         Config.reset_instance()
+
+
+@pytest.mark.parametrize(
+    ("column_sql", "expected_alter_count"),
+    [
+        ("", 1),
+        (", lifecycle_evaluation_json TEXT", 0),
+    ],
+)
+def test_non_sqlite_lifecycle_schema_adds_only_missing_evaluation_column(
+    column_sql,
+    expected_alter_count,
+) -> None:
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE radar_runs (id INTEGER PRIMARY KEY"
+            f"{column_sql})"
+        )
+    manager = object.__new__(DatabaseManager)
+    manager._engine = engine
+    manager._is_sqlite_engine = False
+    statements = []
+
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        manager._ensure_market_radar_lifecycle_schema()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    columns = {item["name"] for item in inspect(engine).get_columns("radar_runs")}
+    alter_statements = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("ALTER TABLE")
+    ]
+    assert "lifecycle_evaluation_json" in columns
+    assert len(alter_statements) == expected_alter_count
+    assert not any(
+        token in statement.upper()
+        for statement in statements
+        for token in ("DROP ", "DELETE ", "TRUNCATE ", "RENAME ")
+    )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "message", "should_raise"),
+    [
+        ("42701", "column lifecycle_evaluation_json already exists", False),
+        ("XX000", "database unavailable", True),
+    ],
+)
+def test_non_sqlite_lifecycle_schema_handles_only_duplicate_column_races(
+    monkeypatch,
+    sqlstate,
+    message,
+    should_raise,
+) -> None:
+    class DriverError(Exception):
+        def __init__(self) -> None:
+            super().__init__(message)
+            self.sqlstate = sqlstate
+
+    error = OperationalError("ALTER TABLE", {}, DriverError())
+    statements = []
+
+    class Connection:
+        def exec_driver_sql(self, statement):
+            statements.append(statement)
+            raise error
+
+    class Transaction:
+        def __enter__(self):
+            return Connection()
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            return False
+
+    class Engine:
+        dialect = postgresql.dialect()
+
+        @staticmethod
+        def begin():
+            return Transaction()
+
+    class Inspector:
+        @staticmethod
+        def has_table(_table_name):
+            return True
+
+        @staticmethod
+        def get_columns(_table_name):
+            return [{"name": "id"}]
+
+    manager = object.__new__(DatabaseManager)
+    manager._engine = Engine()
+    manager._is_sqlite_engine = False
+    monkeypatch.setattr("src.storage.inspect", lambda _engine: Inspector())
+
+    if should_raise:
+        with pytest.raises(OperationalError, match=message):
+            manager._ensure_market_radar_lifecycle_schema()
+    else:
+        manager._ensure_market_radar_lifecycle_schema()
+
+    assert statements == [
+        "ALTER TABLE radar_runs ADD COLUMN lifecycle_evaluation_json TEXT"
+    ]
 
 
 def test_save_run_is_idempotent_and_preserves_first_snapshot(isolated_db) -> None:

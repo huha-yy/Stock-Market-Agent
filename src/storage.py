@@ -53,7 +53,8 @@ from sqlalchemy.orm import (
     sessionmaker,
     Session,
 )
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.schema import CreateColumn
 
 from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
@@ -1546,8 +1547,6 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
     def _ensure_market_radar_lifecycle_schema(self) -> None:
         """Add lifecycle columns/indexes without rewriting existing Radar tables."""
-        if not self._is_sqlite_engine:
-            return
         inspector = inspect(self._engine)
         run_table_name = RadarRunRecord.__tablename__
         if inspector.has_table(run_table_name):
@@ -1555,18 +1554,27 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 column["name"] for column in inspector.get_columns(run_table_name)
             }
             if "lifecycle_evaluation_json" not in run_columns:
+                dialect = self._engine.dialect
+                table_sql = dialect.identifier_preparer.quote(run_table_name)
+                column_sql = str(
+                    CreateColumn(
+                        RadarRunRecord.__table__.c.lifecycle_evaluation_json
+                    ).compile(dialect=dialect)
+                )
+                add_column_sql = "ADD" if dialect.name == "mssql" else "ADD COLUMN"
                 try:
                     with self._engine.begin() as connection:
                         connection.exec_driver_sql(
-                            f"ALTER TABLE {run_table_name} "
-                            "ADD COLUMN lifecycle_evaluation_json TEXT"
+                            f"ALTER TABLE {table_sql} {add_column_sql} {column_sql}"
                         )
-                except OperationalError as exc:
-                    if not self._is_sqlite_duplicate_column_error(
+                except DBAPIError as exc:
+                    if not self._is_duplicate_column_error(
                         exc,
                         "lifecycle_evaluation_json",
                     ):
                         raise
+        if not self._is_sqlite_engine:
+            return
         indexes = {
             RadarRunAttemptRecord.__tablename__: (
                 ("ix_radar_run_attempts_market", "market"),
@@ -2096,6 +2104,34 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     def _is_sqlite_duplicate_column_error(exc: OperationalError, column: str) -> bool:
         err_text = str(getattr(exc, "orig", exc)).lower()
         return "duplicate column name" in err_text and column.lower() in err_text
+
+    @staticmethod
+    def _is_duplicate_column_error(exc: DBAPIError, column: str) -> bool:
+        original = getattr(exc, "orig", exc)
+        codes = {
+            str(code)
+            for code in (
+                getattr(original, "sqlstate", None),
+                getattr(original, "pgcode", None),
+            )
+            if code is not None
+        }
+        args = getattr(original, "args", ())
+        if args:
+            codes.add(str(args[0]))
+        if codes & {"42701", "42S21", "1060", "2705"}:
+            return True
+
+        err_text = str(original).lower()
+        return column.lower() in err_text and any(
+            marker in err_text
+            for marker in (
+                "duplicate column name",
+                "duplicate column",
+                "already exists",
+                "specified more than once",
+            )
+        )
 
     @staticmethod
     def _normalize_daily_date(value: Any) -> Any:

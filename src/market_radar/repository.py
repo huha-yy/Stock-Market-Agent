@@ -97,6 +97,19 @@ class MarketRadarRepository:
                 operation,
             )
 
+    def _load_attempt_for_update(
+        self,
+        session: Any,
+        attempt_key: str,
+    ) -> RadarRunAttemptRecord | None:
+        if self.db._is_sqlite_engine:
+            return session.get(RadarRunAttemptRecord, attempt_key)
+        return session.execute(
+            select(RadarRunAttemptRecord)
+            .where(RadarRunAttemptRecord.attempt_key == attempt_key)
+            .with_for_update()
+        ).scalar_one_or_none()
+
     def reserve_scheduled_attempt(
         self,
         decision: RadarRunDecision,
@@ -114,17 +127,7 @@ class MarketRadarRepository:
         current_naive = to_utc_naive_datetime(current)
 
         def write(session: Any) -> AttemptReservation:
-            if self.db._is_sqlite_engine:
-                row = session.get(RadarRunAttemptRecord, decision.attempt_key)
-            else:
-                row = session.execute(
-                    select(RadarRunAttemptRecord)
-                    .where(
-                        RadarRunAttemptRecord.attempt_key
-                        == decision.attempt_key
-                    )
-                    .with_for_update()
-                ).scalar_one_or_none()
+            row = self._load_attempt_for_update(session, decision.attempt_key)
             if row is None:
                 row = RadarRunAttemptRecord(
                     attempt_key=decision.attempt_key,
@@ -203,7 +206,7 @@ class MarketRadarRepository:
         }
 
         def write(session: Any) -> None:
-            row = session.get(RadarRunAttemptRecord, attempt_key)
+            row = self._load_attempt_for_update(session, attempt_key)
             if row is None:
                 raise ValueError(f"unknown scheduled attempt: {attempt_key}")
             actual = {key: getattr(row, key) for key in values}
@@ -522,7 +525,10 @@ class MarketRadarRepository:
 
         evaluation_json = _dump(evaluation.model_dump(mode="json"))
         if current_run.lifecycle_evaluation_json is not None:
-            if current_run.lifecycle_evaluation_json != evaluation_json:
+            stored_evaluation = LifecycleEvaluation.model_validate_json(
+                current_run.lifecycle_evaluation_json
+            )
+            if stored_evaluation != evaluation:
                 raise ValueError(
                     f"lifecycle evaluation semantic conflict for {evaluation.run_key}"
                 )
