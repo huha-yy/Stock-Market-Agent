@@ -14,6 +14,13 @@ import pandas as pd
 from src.core import trading_calendar
 
 
+def test_get_market_session_bounds_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(trading_calendar, "_XCALS_AVAILABLE", False)
+    assert trading_calendar.get_market_session_bounds(
+        "cn", datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc)
+    ) is None
+
+
 class _FakeCalendar:
     def __init__(
         self,

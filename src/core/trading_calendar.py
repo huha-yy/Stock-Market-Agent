@@ -85,6 +85,17 @@ class MarketPhase(str, Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class MarketSessionBounds:
+    """Calendar-backed regular-session bounds in a market's local timezone."""
+
+    session_date: date
+    open_at: datetime
+    close_at: datetime
+    break_start: Optional[datetime]
+    break_end: Optional[datetime]
+
+
 @dataclass
 class MarketPhaseContext:
     """Runtime market-phase context for stock analysis plumbing."""
@@ -280,6 +291,53 @@ def _as_market_datetime(value: Any, tz_name: str) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=tz)
     return dt.astimezone(tz)
+
+
+def get_market_session_bounds(
+    market: str,
+    current_time: datetime,
+) -> Optional[MarketSessionBounds]:
+    """Return today's calendar-backed session bounds, failing closed on uncertainty."""
+    if market not in MARKET_EXCHANGE or market not in MARKET_TIMEZONE or not _XCALS_AVAILABLE:
+        return None
+
+    market_now = get_market_now(market, current_time=current_time)
+    try:
+        calendar = xcals.get_calendar(MARKET_EXCHANGE[market])
+        if not calendar.is_session(market_now.date()):
+            return None
+
+        session = calendar.date_to_session(market_now.date(), direction="previous")
+        open_at = _as_market_datetime(calendar.session_open(session), MARKET_TIMEZONE[market])
+        close_at = _as_market_datetime(calendar.session_close(session), MARKET_TIMEZONE[market])
+        if open_at is None or close_at is None:
+            return None
+
+        has_break = (
+            bool(calendar.session_has_break(session))
+            if hasattr(calendar, "session_has_break")
+            else True
+        )
+        break_start = (
+            _as_market_datetime(calendar.session_break_start(session), MARKET_TIMEZONE[market])
+            if has_break
+            else None
+        )
+        break_end = (
+            _as_market_datetime(calendar.session_break_end(session), MARKET_TIMEZONE[market])
+            if has_break
+            else None
+        )
+        return MarketSessionBounds(
+            session_date=session.date(),
+            open_at=open_at,
+            close_at=close_at,
+            break_start=break_start,
+            break_end=break_end,
+        )
+    except Exception as exc:
+        logger.warning("trading_calendar.get_market_session_bounds fail-closed: %s", exc)
+        return None
 
 
 def infer_market_phase(
