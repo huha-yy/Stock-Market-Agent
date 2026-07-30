@@ -206,13 +206,24 @@ class FakeRepository:
         etf_observations,
         snapshot,
         evaluation,
+        *,
+        attempt_key,
+        attempt_owner_token,
     ) -> int:
         if self.events is not None:
             self.events.append("persist_scheduled")
         self.universe = sectors
         self.snapshot = snapshot
         self.scheduled_writes.append(
-            (sectors, evidence, etf_observations, snapshot, evaluation)
+            (
+                sectors,
+                evidence,
+                etf_observations,
+                snapshot,
+                evaluation,
+                attempt_key,
+                attempt_owner_token,
+            )
         )
         return 7
 
@@ -412,12 +423,18 @@ def test_schedule_run_saves_snapshot_and_lifecycle_once(schedule_kind) -> None:
         trigger="schedule",
         persist=True,
         schedule_kind=schedule_kind,
+        attempt_key="cn:intraday:2026-07-21:morning:1400",
+        attempt_owner_token="owner-token",
     )
 
     assert result.trigger == "schedule"
     assert repository.lifecycle_loads == 1
     assert len(repository.scheduled_writes) == 1
     assert repository.enriched_writes == []
+    assert repository.scheduled_writes[0][-2:] == (
+        "cn:intraday:2026-07-21:morning:1400",
+        "owner-token",
+    )
     assert lifecycle_engine.calls == [
         (repository.snapshot, repository.lifecycle_context, schedule_kind)
     ]

@@ -6,6 +6,7 @@ import sys
 import textwrap
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -27,6 +28,7 @@ from src.market_radar.lifecycle import (
     LifecycleSignal,
     LifecycleTransition,
 )
+from src.market_radar.runtime_worker import MarketRadarRuntimeWorker
 from src.market_radar.session_policy import RadarRunDecision
 from src.storage import DatabaseManager
 
@@ -646,13 +648,6 @@ def test_scheduled_lifecycle_and_attempt_survive_database_restart(
         signals=(signal,),
         transitions=(transition,),
     )
-    run_id = repository.save_scheduled_enriched_run(
-        repository.list_universe(NOW.date()),
-        repository.resolve_snapshot_constituent_evidence(manual_snapshot),
-        tuple(selection.observation for selection in scheduled_snapshot.etfs),
-        scheduled_snapshot,
-        evaluation,
-    )
     decision = RadarRunDecision(
         kind="intraday_due",
         decided_at=NOW,
@@ -666,10 +661,14 @@ def test_scheduled_lifecycle_and_attempt_survive_database_restart(
         lease_seconds=900,
         now=NOW,
     )
-    repository.finish_scheduled_attempt(
-        reservation.attempt_key,
-        status="succeeded",
-        run_id=run_id,
+    run_id = repository.save_scheduled_enriched_run(
+        repository.list_universe(NOW.date()),
+        repository.resolve_snapshot_constituent_evidence(manual_snapshot),
+        tuple(selection.observation for selection in scheduled_snapshot.etfs),
+        scheduled_snapshot,
+        evaluation,
+        attempt_key=reservation.attempt_key,
+        attempt_owner_token=reservation.owner_token,
     )
     with isolated_db._engine.connect() as connection:
         lifecycle_payloads = dict(
@@ -691,6 +690,8 @@ def test_scheduled_lifecycle_and_attempt_survive_database_restart(
     context = reopened.load_lifecycle_context()
     assert context.open_signals == (signal,)
     assert context.latest_instance_by_sector == {sector.sector_id: 1}
+    assert context.head_run_key == scheduled_snapshot.run_key
+    assert context.head_effective_at == scheduled_snapshot.as_of
     duplicate = reopened.reserve_scheduled_attempt(
         decision,
         lease_seconds=900,
@@ -699,3 +700,21 @@ def test_scheduled_lifecycle_and_attempt_survive_database_restart(
     assert duplicate.acquired is False
     assert duplicate.status == "succeeded"
     assert duplicate.run_id == run_id
+
+    policy = Mock()
+    policy.decide.return_value = decision
+    service_factory = Mock(side_effect=AssertionError("provider path reran"))
+    recovered = MarketRadarRuntimeWorker(
+        policy=policy,
+        repository=reopened,
+        service_factory=service_factory,
+        clock=lambda: NOW + timedelta(hours=1),
+    ).run_once()
+
+    assert recovered == {
+        "status": "succeeded",
+        "reason": "duplicate_slot",
+        "attempt_key": reservation.attempt_key,
+        "run_id": run_id,
+    }
+    service_factory.assert_not_called()

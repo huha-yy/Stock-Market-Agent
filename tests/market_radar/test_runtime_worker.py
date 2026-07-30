@@ -52,6 +52,7 @@ def repository() -> Mock:
         "cn:intraday:2026-07-30:morning:1030",
         True,
         "started",
+        owner_token="owner-token",
     )
     value.get_run_id_by_key.return_value = 12
     return value
@@ -122,6 +123,7 @@ def test_calendar_unavailable_persists_bounded_skip_without_service(
         "cn:calendar-error:2026-07-30:1030",
         True,
         "started",
+        owner_token="calendar-owner",
     )
 
     assert worker.run_once() == {
@@ -135,6 +137,7 @@ def test_calendar_unavailable_persists_bounded_skip_without_service(
     )
     repository.finish_scheduled_attempt.assert_called_once_with(
         "cn:calendar-error:2026-07-30:1030",
+        owner_token="calendar-owner",
         status="skipped",
         reason_code="calendar_unavailable",
     )
@@ -179,6 +182,7 @@ def test_calendar_terminalization_failure_is_safely_logged(
         "cn:calendar-error:2026-07-30:1030",
         True,
         "started",
+        owner_token="calendar-owner",
     )
     repository.finish_scheduled_attempt.side_effect = RuntimeError(
         "database password=calendar-secret"
@@ -211,7 +215,7 @@ def test_calendar_reservation_failure_is_not_logged_as_terminalization(
     assert "attempt status persistence failed" not in caplog.text
 
 
-def test_due_run_finishes_attempt_after_service_commit(
+def test_due_run_passes_attempt_identity_to_atomic_service_commit(
     worker: MarketRadarRuntimeWorker,
     repository: Mock,
     service: Mock,
@@ -225,12 +229,10 @@ def test_due_run_finishes_attempt_after_service_commit(
         trigger="schedule",
         schedule_kind="intraday",
         persist=True,
+        attempt_key="cn:intraday:2026-07-30:morning:1030",
+        attempt_owner_token="owner-token",
     )
-    repository.finish_scheduled_attempt.assert_called_once_with(
-        result["attempt_key"],
-        status="succeeded",
-        run_id=result["run_id"],
-    )
+    repository.finish_scheduled_attempt.assert_not_called()
     assert result == {
         "status": "succeeded",
         "attempt_key": "cn:intraday:2026-07-30:morning:1030",
@@ -271,6 +273,68 @@ def test_duplicate_terminal_attempt_does_not_call_provider(
         "attempt_key": "key",
         "run_id": 12,
     }
+    service_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("run_kind", "reservation", "expected_status", "expected_reason"),
+    [
+        (
+            "intraday_due",
+            AttemptReservation("key", False, "started"),
+            "skipped",
+            "radar_already_running",
+        ),
+        (
+            "eod_due",
+            AttemptReservation("key", False, "succeeded", 12),
+            "succeeded",
+            "eod_already_finalized",
+        ),
+        (
+            "intraday_due",
+            AttemptReservation(
+                "key",
+                False,
+                "skipped",
+                reason_code="calendar_unavailable",
+            ),
+            "skipped",
+            "calendar_unavailable",
+        ),
+        (
+            "intraday_due",
+            AttemptReservation(
+                "key",
+                False,
+                "failed",
+                failure_category="provider_error",
+            ),
+            "failed",
+            "provider_error",
+        ),
+    ],
+)
+def test_non_acquired_attempt_preserves_distinct_durable_reason(
+    worker: MarketRadarRuntimeWorker,
+    policy: Mock,
+    repository: Mock,
+    service_factory: Mock,
+    run_kind: str,
+    reservation: AttemptReservation,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    policy.decide.return_value = decision(
+        kind=run_kind,
+        attempt_key=("cn:eod:2026-07-30" if run_kind == "eod_due" else "key"),
+    )
+    repository.reserve_scheduled_attempt.return_value = reservation
+
+    result = worker.run_once()
+
+    assert result["status"] == expected_status
+    assert result["reason"] == expected_reason
     service_factory.assert_not_called()
 
 
@@ -381,11 +445,7 @@ def test_success_status_clock_failure_preserves_durable_success(
         "attempt_key": "cn:intraday:2026-07-30:morning:1030",
         "run_id": 12,
     }
-    repository.finish_scheduled_attempt.assert_called_once_with(
-        "cn:intraday:2026-07-30:morning:1030",
-        status="succeeded",
-        run_id=12,
-    )
+    repository.finish_scheduled_attempt.assert_not_called()
     assert worker.status()["last_success_at"] is None
     assert worker.status()["last_error"] is None
     assert "status update failed" in caplog.text
@@ -434,6 +494,34 @@ def test_failure_summary_redacts_serialized_and_prefixed_credentials() -> None:
     assert "access-secret" not in summary
 
 
+@pytest.mark.parametrize(
+    ("message", "forbidden"),
+    [
+        ("client_secret=client-secret-value", "client-secret-value"),
+        (
+            "request https://db-user:db-password@example.test/private failed",
+            "db-password",
+        ),
+        (
+            "payload={'outer': {'credentials': {'client_secret': 'nested-secret'}}}",
+            "nested-secret",
+        ),
+        (
+            "headers={'X-Api-Key': 'header-api-secret', 'Cookie': 'sid=cookie-secret'}",
+            "header-api-secret",
+        ),
+        ("opaque=" + "Z" * 96, "Z" * 96),
+    ],
+)
+def test_failure_summary_never_persists_unclassified_secret_material(
+    message: str,
+    forbidden: str,
+) -> None:
+    _, summary = sanitize_runtime_failure(RuntimeError(message), stage="provider")
+
+    assert forbidden not in summary
+
+
 def test_failed_attempt_terminalization_failure_is_safely_logged(
     worker: MarketRadarRuntimeWorker,
     repository: Mock,
@@ -451,10 +539,9 @@ def test_failed_attempt_terminalization_failure_is_safely_logged(
     assert "provider-secret" not in caplog.text
 
 
-def test_success_terminalization_failure_is_safely_logged_and_not_success(
+def test_atomic_success_does_not_issue_a_separate_terminal_write(
     worker: MarketRadarRuntimeWorker,
     repository: Mock,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     repository.finish_scheduled_attempt.side_effect = RuntimeError(
         "database api_key=persistence-secret"
@@ -462,11 +549,8 @@ def test_success_terminalization_failure_is_safely_logged_and_not_success(
 
     result = worker.run_once()
 
-    assert result["status"] == "failed"
-    assert result["reason"] == "persistence_error"
-    assert "attempt status persistence failed" in caplog.text
-    assert "persistence-secret" not in caplog.text
-    repository.finish_scheduled_attempt.assert_called_once()
+    assert result["status"] == "succeeded"
+    repository.finish_scheduled_attempt.assert_not_called()
 
 
 @pytest.mark.parametrize(

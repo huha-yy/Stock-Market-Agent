@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +40,7 @@ from src.storage import (
     RadarConstituentSetRecord,
     RadarEtfObservationRecord,
     RadarEtfSelectionRecord,
+    RadarLifecycleHeadRecord,
     RadarPositionPlanRecord,
     RadarRegimeAssessmentRecord,
     RadarRunAttemptRecord,
@@ -82,6 +84,9 @@ class AttemptReservation:
     acquired: bool
     status: str
     run_id: int | None = None
+    owner_token: str | None = None
+    reason_code: str | None = None
+    failure_category: str | None = None
 
 
 class MarketRadarRepository:
@@ -125,6 +130,7 @@ class MarketRadarRepository:
         current = current.astimezone(timezone.utc)
         lease_expires = current + timedelta(seconds=lease_seconds)
         current_naive = to_utc_naive_datetime(current)
+        owner_token = uuid.uuid4().hex
 
         def write(session: Any) -> AttemptReservation:
             row = self._load_attempt_for_update(session, decision.attempt_key)
@@ -136,11 +142,18 @@ class MarketRadarRepository:
                     trading_date=decision.trading_date,
                     decided_at=to_utc_naive_datetime(decision.decided_at),
                     lease_expires_at=to_utc_naive_datetime(lease_expires),
+                    owner_token=owner_token,
                     status="started",
                 )
                 session.add(row)
                 session.flush()
-                return AttemptReservation(row.attempt_key, True, "started", None)
+                return AttemptReservation(
+                    row.attempt_key,
+                    True,
+                    "started",
+                    None,
+                    owner_token,
+                )
 
             expected_identity = (
                 decision.market,
@@ -166,18 +179,23 @@ class MarketRadarRepository:
             if expired:
                 row.decided_at = to_utc_naive_datetime(decision.decided_at)
                 row.lease_expires_at = to_utc_naive_datetime(lease_expires)
+                row.owner_token = owner_token
                 row.updated_at = current_naive
                 return AttemptReservation(
                     row.attempt_key,
                     True,
                     "started",
                     row.run_id,
+                    owner_token,
                 )
             return AttemptReservation(
                 row.attempt_key,
                 False,
                 row.status,
                 row.run_id,
+                None,
+                row.reason_code,
+                row.failure_category,
             )
 
         return self._run_idempotent_write(
@@ -189,6 +207,7 @@ class MarketRadarRepository:
         self,
         attempt_key: str,
         *,
+        owner_token: str,
         status: Literal["succeeded", "skipped", "failed"],
         run_id: int | None = None,
         reason_code: str | None = None,
@@ -197,6 +216,8 @@ class MarketRadarRepository:
     ) -> None:
         if status not in {"succeeded", "skipped", "failed"}:
             raise ValueError(f"invalid scheduled attempt terminal status: {status}")
+        if not owner_token:
+            raise ValueError("scheduled attempt owner_token is required")
         values = {
             "status": status,
             "run_id": run_id,
@@ -209,6 +230,10 @@ class MarketRadarRepository:
             row = self._load_attempt_for_update(session, attempt_key)
             if row is None:
                 raise ValueError(f"unknown scheduled attempt: {attempt_key}")
+            if row.owner_token != owner_token:
+                raise ValueError(
+                    f"scheduled attempt ownership lost: {attempt_key}"
+                )
             actual = {key: getattr(row, key) for key in values}
             if row.status != "started":
                 if actual == values:
@@ -411,6 +436,15 @@ class MarketRadarRepository:
 
     def load_lifecycle_context(self) -> LifecycleContext:
         with self.db.get_session() as session:
+            head = session.get(RadarLifecycleHeadRecord, "cn")
+            head_run_key: str | None = None
+            head_effective_at: datetime | None = None
+            if head is not None:
+                head_run = session.get(RadarRunRecord, head.last_run_id)
+                if head_run is None or head_run.market != "cn":
+                    raise ValueError("Market Radar lifecycle head is corrupt")
+                head_run_key = head_run.run_key
+                head_effective_at = _aware(head.last_effective_at)
             rows = session.execute(
                 select(RadarSignalInstanceRecord).order_by(
                     RadarSignalInstanceRecord.sector_id,
@@ -431,6 +465,8 @@ class MarketRadarRepository:
             return LifecycleContext(
                 open_signals=tuple(open_signals),
                 latest_instance_by_sector=latest,
+                head_run_key=head_run_key,
+                head_effective_at=head_effective_at,
             )
 
     def save_scheduled_enriched_run(
@@ -440,6 +476,9 @@ class MarketRadarRepository:
         etf_observations: Sequence[EtfObservation],
         snapshot: RadarRunSnapshot,
         evaluation: LifecycleEvaluation,
+        *,
+        attempt_key: str,
+        attempt_owner_token: str,
     ) -> int:
         if snapshot.trigger != "schedule" or evaluation.run_key != snapshot.run_key:
             raise ValueError("scheduled snapshot and lifecycle evaluation must match")
@@ -453,12 +492,35 @@ class MarketRadarRepository:
         )
 
         def write(session: Any) -> int:
-            existing_id = session.execute(
-                select(RadarRunRecord.id).where(
+            attempt = self._load_attempt_for_update(session, attempt_key)
+            if attempt is None:
+                raise ValueError(f"unknown scheduled attempt: {attempt_key}")
+            if attempt.owner_token != attempt_owner_token:
+                raise ValueError(
+                    f"scheduled attempt ownership lost: {attempt_key}"
+                )
+            if attempt.status not in {"started", "succeeded"}:
+                raise ValueError(
+                    f"scheduled attempt is already terminal: {attempt_key}"
+                )
+            existing_run = session.execute(
+                select(RadarRunRecord).where(
                     RadarRunRecord.run_key == snapshot.run_key
                 )
             ).scalar_one_or_none()
-            if existing_id is not None:
+            should_advance_head = (
+                existing_run is None
+                or existing_run.lifecycle_evaluation_json is None
+            )
+            lifecycle_head = None
+            if should_advance_head:
+                lifecycle_head = self._validate_lifecycle_head_in_session(
+                    session,
+                    snapshot,
+                    evaluation,
+                )
+            if existing_run is not None:
+                existing_id = int(existing_run.id)
                 self._assert_constituent_evidence_compatible_in_session(
                     session,
                     validated_evidence,
@@ -470,16 +532,32 @@ class MarketRadarRepository:
                 )
                 self._assert_run_semantically_equal_in_session(
                     session,
-                    int(existing_id),
+                    existing_id,
                     snapshot,
                     validated_observations,
                 )
                 self._save_lifecycle_in_session(
                     session,
-                    int(existing_id),
+                    existing_id,
                     evaluation,
                 )
-                return int(existing_id)
+                if should_advance_head:
+                    self._advance_lifecycle_head_in_session(
+                        session,
+                        lifecycle_head,
+                        snapshot,
+                        existing_id,
+                    )
+                self._succeed_scheduled_attempt_in_session(
+                    attempt,
+                    existing_id,
+                )
+                return existing_id
+
+            if attempt.status != "started":
+                raise ValueError(
+                    f"scheduled attempt run binding conflict: {attempt_key}"
+                )
 
             self._sync_universe_in_session(session, sectors)
             self._save_constituent_evidence_in_session(
@@ -497,12 +575,112 @@ class MarketRadarRepository:
                 validated_observations,
             )
             self._save_lifecycle_in_session(session, run_id, evaluation)
+            self._advance_lifecycle_head_in_session(
+                session,
+                lifecycle_head,
+                snapshot,
+                run_id,
+            )
+            self._succeed_scheduled_attempt_in_session(attempt, run_id)
             return run_id
 
         return self._run_idempotent_write(
             f"save_scheduled_market_radar_run[{snapshot.run_key}]",
             write,
         )
+
+    @staticmethod
+    def _succeed_scheduled_attempt_in_session(
+        attempt: RadarRunAttemptRecord,
+        run_id: int,
+    ) -> None:
+        if attempt.status == "succeeded":
+            if attempt.run_id == run_id:
+                return
+            raise ValueError(
+                f"scheduled attempt run binding conflict: {attempt.attempt_key}"
+            )
+        if attempt.status != "started":
+            raise ValueError(
+                f"scheduled attempt is already terminal: {attempt.attempt_key}"
+            )
+        attempt.status = "succeeded"
+        attempt.run_id = run_id
+        attempt.reason_code = None
+        attempt.failure_category = None
+        attempt.failure_summary = None
+        attempt.lease_expires_at = None
+        attempt.updated_at = utc_naive_now()
+
+    def _load_lifecycle_head_for_update(
+        self,
+        session: Any,
+        market: str,
+    ) -> RadarLifecycleHeadRecord | None:
+        if self.db._is_sqlite_engine:
+            return session.get(RadarLifecycleHeadRecord, market)
+        return session.execute(
+            select(RadarLifecycleHeadRecord)
+            .where(RadarLifecycleHeadRecord.market == market)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+    def _validate_lifecycle_head_in_session(
+        self,
+        session: Any,
+        snapshot: RadarRunSnapshot,
+        evaluation: LifecycleEvaluation,
+    ) -> RadarLifecycleHeadRecord | None:
+        head = self._load_lifecycle_head_for_update(session, snapshot.market)
+        expected = (
+            evaluation.expected_head_run_key,
+            (
+                _aware(evaluation.expected_head_effective_at)
+                if evaluation.expected_head_effective_at is not None
+                else None
+            ),
+        )
+        if head is None:
+            if expected != (None, None):
+                raise ValueError("Market Radar lifecycle head predecessor conflict")
+            return None
+
+        if head.lifecycle_version != "cn-lifecycle-v1":
+            raise ValueError("Market Radar lifecycle head version conflict")
+        head_run = session.get(RadarRunRecord, head.last_run_id)
+        if head_run is None or head_run.market != snapshot.market:
+            raise ValueError("Market Radar lifecycle head is corrupt")
+        actual_effective_at = _aware(head.last_effective_at)
+        actual = (head_run.run_key, actual_effective_at)
+        if expected != actual:
+            raise ValueError("Market Radar lifecycle head predecessor conflict")
+        if snapshot.as_of.astimezone(timezone.utc) <= actual_effective_at:
+            raise ValueError(
+                "scheduled lifecycle run must be strictly newer than its head"
+            )
+        return head
+
+    @staticmethod
+    def _advance_lifecycle_head_in_session(
+        session: Any,
+        head: RadarLifecycleHeadRecord | None,
+        snapshot: RadarRunSnapshot,
+        run_id: int,
+    ) -> None:
+        effective_at = to_utc_naive_datetime(snapshot.as_of)
+        if head is None:
+            session.add(
+                RadarLifecycleHeadRecord(
+                    market=snapshot.market,
+                    last_run_id=run_id,
+                    last_effective_at=effective_at,
+                    lifecycle_version="cn-lifecycle-v1",
+                )
+            )
+            return
+        head.last_run_id = run_id
+        head.last_effective_at = effective_at
+        head.updated_at = utc_naive_now()
 
     def _save_lifecycle_in_session(
         self,

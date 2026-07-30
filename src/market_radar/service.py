@@ -376,6 +376,8 @@ class MarketRadarService:
         persist: bool = True,
         discovery_only: bool = False,
         previous_snapshot: RadarRunSnapshot | None = None,
+        attempt_key: str | None = None,
+        attempt_owner_token: str | None = None,
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar supports market=cn only")
@@ -394,8 +396,14 @@ class MarketRadarService:
                 )
             if self.lifecycle_engine is None:
                 raise ValueError("lifecycle_engine is required for schedule runs")
+            if not attempt_key or not attempt_owner_token:
+                raise ValueError(
+                    "schedule runs require attempt_key and attempt_owner_token"
+                )
         elif schedule_kind is not None:
             raise ValueError("schedule_kind is only valid for schedule runs")
+        elif attempt_key is not None or attempt_owner_token is not None:
+            raise ValueError("scheduled attempt identity is only valid for schedule runs")
         if trigger == "replay":
             raise ValueError(
                 "MarketRadarService.run does not perform live replay; use "
@@ -554,6 +562,8 @@ class MarketRadarService:
                     etf_observations,
                     snapshot,
                     evaluation,
+                    attempt_key=attempt_key,
+                    attempt_owner_token=attempt_owner_token,
                 )
             elif enrichment is None and not phase2b_enabled:
                 run_id = repository.save_run_with_universe(

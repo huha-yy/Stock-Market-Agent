@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -26,14 +25,6 @@ _FAILURE_CATEGORIES = {
     "persistence": "persistence_error",
     "runtime": "runtime_error",
 }
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?<![A-Za-z0-9])(?P<quote>[\"']?)"
-    r"(?P<name>(?:[A-Za-z0-9]+[_-])*(?:token|key|authorization|cookie|password))"
-    r"\b(?P=quote)\s*[=:]\s*"
-    r"(?:\"[^\"]*\"|'[^']*'|(?:Bearer\s+)?[^\s,;]+)",
-    re.IGNORECASE,
-)
-
 FailureStage = Literal["calendar", "provider", "persistence", "runtime"]
 
 
@@ -43,18 +34,14 @@ def sanitize_runtime_failure(
     stage: FailureStage = "runtime",
     limit: int = 512,
 ) -> tuple[str, str]:
-    """Return a stable category and a bounded, redacted diagnostic summary."""
+    """Return a stable category and a bounded allowlisted diagnostic summary."""
     category = _FAILURE_CATEGORIES[stage]
     if isinstance(exc, SQLAlchemyError) or exc.__class__.__module__.startswith(
         ("sqlalchemy", "sqlite3")
     ):
         category = "persistence_error"
-    summary = f"{type(exc).__name__}: {exc}"
-    summary = _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group('name')}=[REDACTED]",
-        summary,
-    )
-    return category, summary[:limit]
+    summary = f"{category}:{type(exc).__name__}"
+    return category, summary[: max(0, limit)]
 
 
 class MarketRadarRuntimeWorker:
@@ -102,20 +89,16 @@ class MarketRadarRuntimeWorker:
         reservation: AttemptReservation | None = None
         failure_stage: FailureStage = "persistence"
         can_terminalize_failure = False
-        terminal_write_started = False
         try:
             reservation = self.repository.reserve_scheduled_attempt(
                 decision,
                 lease_seconds=900,
             )
             if not reservation.acquired:
-                return {
-                    "status": reservation.status,
-                    "reason": "duplicate_slot",
-                    "attempt_key": reservation.attempt_key,
-                    "run_id": reservation.run_id,
-                }
+                return self._existing_reservation_result(decision, reservation)
 
+            if not reservation.owner_token:
+                raise ValueError("scheduled attempt reservation has no owner token")
             can_terminalize_failure = True
             self._status["running"] = True
             schedule_kind = "eod" if decision.kind == "eod_due" else "intraday"
@@ -129,16 +112,12 @@ class MarketRadarRuntimeWorker:
                 trigger="schedule",
                 schedule_kind=schedule_kind,
                 persist=True,
+                attempt_key=reservation.attempt_key,
+                attempt_owner_token=reservation.owner_token,
             )
             failure_stage = "persistence"
-            run_id = self.repository.get_run_id_by_key(snapshot.run_key)
             can_terminalize_failure = False
-            terminal_write_started = True
-            self.repository.finish_scheduled_attempt(
-                reservation.attempt_key,
-                status="succeeded",
-                run_id=run_id,
-            )
+            run_id = self.repository.get_run_id_by_key(snapshot.run_key)
             self._record_success()
             return {
                 "status": "succeeded",
@@ -151,7 +130,6 @@ class MarketRadarRuntimeWorker:
                 stage=failure_stage,
                 attempt_key=decision.attempt_key,
                 reservation=(reservation if can_terminalize_failure else None),
-                log_persistence_failure=terminal_write_started,
             )
         finally:
             self._status["running"] = False
@@ -173,6 +151,7 @@ class MarketRadarRuntimeWorker:
             try:
                 self.repository.finish_scheduled_attempt(
                     reservation.attempt_key,
+                    owner_token=reservation.owner_token,
                     status="skipped",
                     reason_code="calendar_unavailable",
                 )
@@ -183,10 +162,47 @@ class MarketRadarRuntimeWorker:
                     attempt_key=decision.attempt_key,
                     log_persistence_failure=True,
                 )
+        else:
+            return self._existing_reservation_result(decision, reservation)
         return {
             "status": "skipped",
             "reason": "calendar_unavailable",
             "attempt_key": decision.attempt_key,
+        }
+
+    @staticmethod
+    def _existing_reservation_result(
+        decision: RadarRunDecision,
+        reservation: AttemptReservation,
+    ) -> dict[str, Any]:
+        if reservation.status == "started":
+            status = "skipped"
+            reason = "radar_already_running"
+        elif reservation.status == "succeeded":
+            status = "succeeded"
+            reason = (
+                "eod_already_finalized"
+                if decision.kind == "eod_due"
+                else "duplicate_slot"
+            )
+        elif reservation.status == "skipped":
+            status = "skipped"
+            reason = reservation.reason_code or (
+                "calendar_unavailable"
+                if decision.kind == "calendar_unavailable"
+                else "duplicate_slot"
+            )
+        elif reservation.status == "failed":
+            status = "failed"
+            reason = reservation.failure_category or "runtime_error"
+        else:
+            status = reservation.status
+            reason = "duplicate_slot"
+        return {
+            "status": status,
+            "reason": reason,
+            "attempt_key": reservation.attempt_key,
+            "run_id": reservation.run_id,
         }
 
     def _failure_result(
@@ -205,6 +221,7 @@ class MarketRadarRuntimeWorker:
             try:
                 self.repository.finish_scheduled_attempt(
                     reservation.attempt_key,
+                    owner_token=reservation.owner_token,
                     status="failed",
                     failure_category=category,
                     failure_summary=summary,

@@ -81,9 +81,23 @@ class LifecycleTransition(FrozenModel):
 class LifecycleContext(FrozenModel):
     open_signals: tuple[LifecycleSignal, ...] = ()
     latest_instance_by_sector: Mapping[str, int] = Field(default_factory=dict)
+    head_run_key: str | None = None
+    head_effective_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_signal_instances(self) -> "LifecycleContext":
+        if (self.head_run_key is None) != (self.head_effective_at is None):
+            raise ValueError(
+                "lifecycle head run key and effective time must be provided together"
+            )
+        if (
+            self.head_effective_at is not None
+            and (
+                self.head_effective_at.tzinfo is None
+                or self.head_effective_at.utcoffset() is None
+            )
+        ):
+            raise ValueError("lifecycle head effective time must be timezone-aware")
         sector_ids = [signal.sector_id for signal in self.open_signals]
         if len(sector_ids) != len(set(sector_ids)):
             raise ValueError("duplicate open signal sector_id")
@@ -100,6 +114,26 @@ class LifecycleEvaluation(FrozenModel):
     run_key: str
     signals: tuple[LifecycleSignal, ...]
     transitions: tuple[LifecycleTransition, ...]
+    expected_head_run_key: str | None = None
+    expected_head_effective_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_expected_head(self) -> "LifecycleEvaluation":
+        if (self.expected_head_run_key is None) != (
+            self.expected_head_effective_at is None
+        ):
+            raise ValueError(
+                "expected lifecycle head run key and effective time must be provided together"
+            )
+        if (
+            self.expected_head_effective_at is not None
+            and (
+                self.expected_head_effective_at.tzinfo is None
+                or self.expected_head_effective_at.utcoffset() is None
+            )
+        ):
+            raise ValueError("expected lifecycle head time must be timezone-aware")
+        return self
 
 
 class MarketRadarLifecycleEngine:
@@ -188,6 +222,8 @@ class MarketRadarLifecycleEngine:
                     key=lambda item: (item.signal_key, item.transition_key),
                 )
             ),
+            expected_head_run_key=context.head_run_key,
+            expected_head_effective_at=context.head_effective_at,
         )
 
 

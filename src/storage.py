@@ -1362,6 +1362,7 @@ class RadarRunAttemptRecord(Base):
     trading_date = Column(Date, nullable=False, index=True)
     decided_at = Column(DateTime, nullable=False)
     lease_expires_at = Column(DateTime, nullable=True)
+    owner_token = Column(String(64), nullable=True)
     status = Column(String(32), nullable=False)
     reason_code = Column(String(96), nullable=True)
     run_id = Column(
@@ -1371,6 +1372,21 @@ class RadarRunAttemptRecord(Base):
     )
     failure_category = Column(String(96), nullable=True)
     failure_summary = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarLifecycleHeadRecord(Base):
+    __tablename__ = "radar_lifecycle_heads"
+
+    market = Column(String(16), primary_key=True)
+    last_run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id"),
+        nullable=False,
+    )
+    last_effective_at = Column(DateTime, nullable=False)
+    lifecycle_version = Column(String(32), nullable=False)
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
     updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
@@ -1498,6 +1514,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_decision_signal_profile_schema()
             self._ensure_market_radar_snapshot_position_schema()
             self._ensure_market_radar_lifecycle_schema()
+            self._backfill_market_radar_lifecycle_head()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1548,31 +1565,33 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     def _ensure_market_radar_lifecycle_schema(self) -> None:
         """Add lifecycle columns/indexes without rewriting existing Radar tables."""
         inspector = inspect(self._engine)
-        run_table_name = RadarRunRecord.__tablename__
-        if inspector.has_table(run_table_name):
-            run_columns = {
-                column["name"] for column in inspector.get_columns(run_table_name)
+        additive_columns = (
+            (RadarRunRecord.__table__, "lifecycle_evaluation_json"),
+            (RadarRunAttemptRecord.__table__, "owner_token"),
+        )
+        for table, column_name in additive_columns:
+            table_name = table.name
+            if not inspector.has_table(table_name):
+                continue
+            existing_columns = {
+                column["name"] for column in inspector.get_columns(table_name)
             }
-            if "lifecycle_evaluation_json" not in run_columns:
-                dialect = self._engine.dialect
-                table_sql = dialect.identifier_preparer.quote(run_table_name)
-                column_sql = str(
-                    CreateColumn(
-                        RadarRunRecord.__table__.c.lifecycle_evaluation_json
-                    ).compile(dialect=dialect)
-                )
-                add_column_sql = "ADD" if dialect.name == "mssql" else "ADD COLUMN"
-                try:
-                    with self._engine.begin() as connection:
-                        connection.exec_driver_sql(
-                            f"ALTER TABLE {table_sql} {add_column_sql} {column_sql}"
-                        )
-                except DBAPIError as exc:
-                    if not self._is_duplicate_column_error(
-                        exc,
-                        "lifecycle_evaluation_json",
-                    ):
-                        raise
+            if column_name in existing_columns:
+                continue
+            dialect = self._engine.dialect
+            table_sql = dialect.identifier_preparer.quote(table_name)
+            column_sql = str(
+                CreateColumn(table.c[column_name]).compile(dialect=dialect)
+            )
+            add_column_sql = "ADD" if dialect.name == "mssql" else "ADD COLUMN"
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_sql} {add_column_sql} {column_sql}"
+                    )
+            except DBAPIError as exc:
+                if not self._is_duplicate_column_error(exc, column_name):
+                    raise
         if not self._is_sqlite_engine:
             return
         indexes = {
@@ -1601,6 +1620,66 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         f"CREATE INDEX IF NOT EXISTS {index_name} "
                         f"ON {table_name} ({column_name})"
                     )
+
+    def _backfill_market_radar_lifecycle_head(self) -> None:
+        """Create the chronological head for databases written before Phase 2D fencing."""
+        inspector = inspect(self._engine)
+        run_table = RadarRunRecord.__tablename__
+        head_table = RadarLifecycleHeadRecord.__tablename__
+        if not inspector.has_table(run_table) or not inspector.has_table(head_table):
+            return
+        required_run_columns = {
+            "id",
+            "run_key",
+            "market",
+            "as_of",
+            "lifecycle_evaluation_json",
+        }
+        actual_run_columns = {
+            column["name"] for column in inspector.get_columns(run_table)
+        }
+        if not required_run_columns <= actual_run_columns:
+            return
+
+        def write(session: Session) -> None:
+            if session.get(RadarLifecycleHeadRecord, "cn") is not None:
+                return
+            latest = session.execute(
+                select(RadarRunRecord)
+                .where(
+                    RadarRunRecord.market == "cn",
+                    RadarRunRecord.lifecycle_evaluation_json.is_not(None),
+                )
+                .order_by(RadarRunRecord.as_of.desc(), RadarRunRecord.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest is None:
+                return
+            session.add(
+                RadarLifecycleHeadRecord(
+                    market="cn",
+                    last_run_id=latest.id,
+                    last_effective_at=latest.as_of,
+                    lifecycle_version="cn-lifecycle-v1",
+                )
+            )
+
+        session = self._SessionLocal()
+        try:
+            if self._is_sqlite_engine:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            write(session)
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                if verify_session.get(RadarLifecycleHeadRecord, "cn") is None:
+                    raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()
