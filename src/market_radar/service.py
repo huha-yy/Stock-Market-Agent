@@ -379,11 +379,15 @@ class MarketRadarService:
     ) -> RadarRunSnapshot:
         if market != "cn":
             raise ValueError("Market Radar supports market=cn only")
+        if trigger not in ("manual", "schedule", "replay"):
+            raise ValueError("trigger must be manual, schedule, or replay")
         if trigger == "schedule":
-            if not persist or schedule_kind is None:
+            if schedule_kind not in ("intraday", "eod"):
                 raise ValueError(
-                    "schedule runs require persistence and schedule_kind"
+                    "schedule_kind must be intraday or eod for schedule runs"
                 )
+            if not persist:
+                raise ValueError("schedule runs require persistence")
             if discovery_only or self.enricher is None or self.etf_collector is None:
                 raise ValueError(
                     "schedule runs require full Phase 2B enrichment"

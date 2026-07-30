@@ -324,6 +324,39 @@ def test_schedule_run_requires_persistence_and_schedule_kind() -> None:
         service.run(trigger="manual", schedule_kind="eod")
 
 
+def test_invalid_trigger_rejects_before_dependencies() -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="trigger"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=FakeRepository(events=events),
+            lifecycle_engine=RecordingLifecycleEngine(events),
+            clock=lambda: (events.append("clock"), NOW)[1],
+        ).run(trigger="cron")
+
+    assert events == []
+
+
+def test_invalid_schedule_kind_rejects_before_dependencies() -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="schedule_kind"):
+        _service(
+            universe=FakeUniverse(events=events),
+            provider=FakeProvider(events=events),
+            repository=FakeRepository(events=events),
+            enricher=RecordingEnricher(EnrichmentBatch((), (), ()), events),
+            candidate_selector=RecordingSelector(events=events),
+            etf_collector=EmptyEtfCollector(events),
+            lifecycle_engine=RecordingLifecycleEngine(events),
+            clock=lambda: (events.append("clock"), NOW)[1],
+        ).run(trigger="schedule", schedule_kind="weekly")
+
+    assert events == []
+
+
 @pytest.mark.parametrize(
     ("enricher", "etf_collector", "discovery_only"),
     [
@@ -360,7 +393,8 @@ def test_schedule_run_requires_full_phase2b_enrichment(
     assert events == []
 
 
-def test_schedule_run_saves_snapshot_and_lifecycle_once() -> None:
+@pytest.mark.parametrize("schedule_kind", ["intraday", "eod"])
+def test_schedule_run_saves_snapshot_and_lifecycle_once(schedule_kind) -> None:
     events: list[str] = []
     repository = FakeRepository(events=events)
     lifecycle_engine = RecordingLifecycleEngine(events)
@@ -377,7 +411,7 @@ def test_schedule_run_saves_snapshot_and_lifecycle_once() -> None:
     result = service.run(
         trigger="schedule",
         persist=True,
-        schedule_kind="intraday",
+        schedule_kind=schedule_kind,
     )
 
     assert result.trigger == "schedule"
@@ -385,7 +419,7 @@ def test_schedule_run_saves_snapshot_and_lifecycle_once() -> None:
     assert len(repository.scheduled_writes) == 1
     assert repository.enriched_writes == []
     assert lifecycle_engine.calls == [
-        (repository.snapshot, repository.lifecycle_context, "intraday")
+        (repository.snapshot, repository.lifecycle_context, schedule_kind)
     ]
     assert events == [
         "load",
