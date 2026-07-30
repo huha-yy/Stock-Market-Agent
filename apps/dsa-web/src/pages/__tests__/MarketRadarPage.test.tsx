@@ -18,7 +18,7 @@ vi.mock('../../api/marketRadar', () => ({
   marketRadarApi: { getLatest, listSectors, getSector },
 }));
 
-const runKey = 'cn:20260730T070000Z:manual';
+const runKey = 'cn:20260730T070000Z:schedule';
 const asOf = '2026-07-30T07:00:00Z';
 
 function sector(sectorId: string, name: string, score: number) {
@@ -57,7 +57,7 @@ const latest: MarketRadarLatestResponse = {
   run: {
     runKey,
     market: 'cn',
-    trigger: 'manual',
+    trigger: 'schedule',
     asOf,
     quality: 'partial',
     scoringVersion: 'cn-v1',

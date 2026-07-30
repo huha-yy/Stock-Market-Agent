@@ -115,6 +115,40 @@ class SchedulerBackgroundTaskTestCase(unittest.TestCase):
 
         self.assertEqual(order[:4], [("init", "18:00"), ("provider", False), ("background", "event_monitor"), ("daily", True)])
 
+    def test_run_with_schedule_supports_background_only_runtime(self):
+        fake_schedule = _FakeScheduleModule()
+        with patch.dict(sys.modules, {"schedule": fake_schedule}):
+            from src import scheduler as scheduler_module
+
+            order = []
+
+            class FakeScheduler:
+                def __init__(self, **_kwargs):
+                    order.append("init")
+
+                def add_background_task(self, **kwargs):
+                    order.append(f"background:{kwargs['name']}")
+
+                def set_daily_task(self, _task, run_immediately=True):
+                    order.append(f"daily:{run_immediately}")
+
+                def run(self):
+                    order.append("run")
+
+            with patch.object(scheduler_module, "Scheduler", FakeScheduler):
+                scheduler_module.run_with_schedule(
+                    task=None,
+                    run_immediately=False,
+                    background_tasks=[{
+                        "task": lambda: None,
+                        "interval_seconds": 60,
+                        "run_immediately": True,
+                        "name": "market_radar",
+                    }],
+                )
+
+        self.assertEqual(order, ["init", "background:market_radar", "run"])
+
     def test_scheduler_reloads_daily_job_when_schedule_time_changes(self):
         fake_schedule = _FakeScheduleModule()
         with patch.dict(sys.modules, {"schedule": fake_schedule}):

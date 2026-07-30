@@ -217,8 +217,16 @@ export interface ValidateSystemConfigResponse {
   issues: ConfigValidationIssue[];
 }
 
+export interface SchedulerBackgroundTaskStatus {
+  running: boolean;
+  lastDecision?: Record<string, unknown> | null;
+  lastSuccessAt?: string | null;
+  lastError?: string | null;
+}
+
 export interface SchedulerStatusResponse {
   enabled: boolean;
+  loopEnabled: boolean;
   running: boolean;
   scheduleTimes: string[];
   nextRunAt?: string | null;
@@ -227,6 +235,7 @@ export interface SchedulerStatusResponse {
   lastError?: string | null;
   lastSkippedAt?: string | null;
   lastSkipReason?: string | null;
+  backgroundTasks: Record<string, SchedulerBackgroundTaskStatus>;
 }
 
 export interface SchedulerRunNowResponse {

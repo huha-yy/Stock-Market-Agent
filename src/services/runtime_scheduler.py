@@ -12,7 +12,10 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from src.config import Config, get_config
-from src.market_radar.runtime_worker import MarketRadarRuntimeWorker
+from src.market_radar.runtime_worker import (
+    MarketRadarRuntimeWorker,
+    sanitize_runtime_failure,
+)
 from src.scheduler import Scheduler, normalize_schedule_times
 
 logger = logging.getLogger(__name__)
@@ -102,13 +105,50 @@ def build_market_radar_background_task(config: Config) -> Optional[Dict[str, Any
     """Build the opt-in Market Radar scheduler task."""
     if not getattr(config, "market_radar_schedule_enabled", False):
         return None
-    worker = MarketRadarRuntimeWorker()
+    worker: Optional[MarketRadarRuntimeWorker] = None
+    initialization_lock = threading.Lock()
+    initialization_status: Dict[str, Any] = {
+        "running": False,
+        "last_decision": None,
+        "last_success_at": None,
+        "last_error": None,
+    }
+
+    def run_once() -> Dict[str, Any]:
+        nonlocal worker
+        if worker is None:
+            with initialization_lock:
+                if worker is None:
+                    try:
+                        worker = MarketRadarRuntimeWorker()
+                    except Exception as exc:  # noqa: BLE001 - retry on the next tick.
+                        category, summary = sanitize_runtime_failure(
+                            exc,
+                            stage="runtime",
+                        )
+                        initialization_status["last_error"] = category
+                        logger.error(
+                            "Failed to initialize Market Radar runtime worker: %s",
+                            summary,
+                        )
+                        return {
+                            "status": "failed",
+                            "attempt_key": None,
+                            "reason": category,
+                        }
+        return worker.run_once()
+
+    def status() -> Dict[str, Any]:
+        if worker is None:
+            return dict(initialization_status)
+        return worker.status()
+
     return {
-        "task": worker.run_once,
+        "task": run_once,
         "interval_seconds": 60,
         "run_immediately": True,
         "name": "market_radar",
-        "status_provider": worker.status,
+        "status_provider": status,
     }
 
 
@@ -152,6 +192,7 @@ class RuntimeSchedulerService:
         self._scheduler: Optional[Scheduler] = None
         self._thread: Optional[threading.Thread] = None
         self._enabled = False
+        self._loop_enabled = False
         self._last_run_at: Optional[str] = None
         self._last_success_at: Optional[str] = None
         self._last_error: Optional[str] = None
@@ -372,7 +413,8 @@ class RuntimeSchedulerService:
             )
             self._scheduler = scheduler
             self._thread = thread
-            self._enabled = True
+            self._enabled = schedule_enabled
+            self._loop_enabled = True
             thread.start()
 
     def stop(self) -> None:
@@ -382,6 +424,7 @@ class RuntimeSchedulerService:
         self._scheduler = None
         self._thread = None
         self._enabled = False
+        self._loop_enabled = False
 
     def reconcile_from_config(
         self,
@@ -439,6 +482,7 @@ class RuntimeSchedulerService:
         running = self._run_lock.locked()
         return {
             "enabled": self._enabled,
+            "loop_enabled": self._loop_enabled,
             "running": running,
             "schedule_times": schedule_times,
             "next_run_at": next_run,

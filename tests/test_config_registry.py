@@ -556,6 +556,7 @@ class TestEnvExampleWebSettingsCoverage(unittest.TestCase):
                 "MARKET_RADAR_ENRICHMENT_LIMIT",
                 "MARKET_RADAR_ENRICHMENT_BUDGET_SECONDS",
                 "MARKET_RADAR_ENRICHMENT_MAX_CONCURRENCY",
+                "MARKET_RADAR_SCHEDULE_ENABLED",
             }.issubset(WEB_SETTINGS_HIDDEN_FROM_UI)
         )
 

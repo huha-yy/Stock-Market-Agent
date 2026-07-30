@@ -169,10 +169,94 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
         radar_task = scheduler.background_tasks[0]  # type: ignore[attr-defined]
         self.assertEqual(radar_task["interval_seconds"], 60)
         self.assertTrue(radar_task["run_immediately"])
+        status = service.status()
+        self.assertFalse(status["enabled"])
+        self.assertTrue(status["loop_enabled"])
         self.assertEqual(
-            service.status()["background_tasks"]["market_radar"]["running"],
+            status["background_tasks"]["market_radar"]["running"],
             False,
         )
+
+    def test_radar_initialization_failure_isolated_from_daily_scheduler(self) -> None:
+        _RecordingScheduler.instances = []
+        config = SimpleNamespace(
+            schedule_enabled=True,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+            market_radar_schedule_enabled=True,
+            agent_event_monitor_enabled=False,
+        )
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+
+        with patch(
+            "src.services.runtime_scheduler.Scheduler",
+            _RecordingScheduler,
+        ), patch(
+            "src.services.runtime_scheduler.threading.Thread",
+            _NoopThread,
+        ), patch(
+            "src.services.runtime_scheduler.MarketRadarRuntimeWorker",
+            side_effect=RuntimeError("client_secret=startup-secret"),
+        ) as worker_cls:
+            service.start()
+            scheduler = service._scheduler
+            self.assertIsNotNone(scheduler)
+            self.assertIsNotNone(scheduler.daily_task)  # type: ignore[attr-defined]
+            self.assertEqual(worker_cls.call_count, 0)
+
+            result = scheduler.background_tasks[0]["task"]()  # type: ignore[attr-defined]
+
+        self.assertEqual(result["status"], "failed")
+        status = service.status()
+        self.assertEqual(
+            status["background_tasks"]["market_radar"]["last_error"],
+            "runtime_error",
+        )
+        self.assertNotIn("startup-secret", repr(status))
+
+    def test_radar_initialization_failure_is_retried_on_next_tick(self) -> None:
+        _RecordingScheduler.instances = []
+        config = SimpleNamespace(
+            schedule_enabled=False,
+            schedule_time="18:00",
+            schedule_times=["18:00"],
+            market_radar_schedule_enabled=True,
+            agent_event_monitor_enabled=False,
+        )
+        worker = MagicMock()
+        worker.run_once.return_value = {"status": "skipped", "reason": "not_due"}
+        worker.status.return_value = {
+            "running": False,
+            "last_decision": {"kind": "not_due"},
+            "last_success_at": None,
+            "last_error": None,
+        }
+        service = RuntimeSchedulerService(config_provider=lambda: config)
+
+        with patch(
+            "src.services.runtime_scheduler.Scheduler",
+            _RecordingScheduler,
+        ), patch(
+            "src.services.runtime_scheduler.threading.Thread",
+            _NoopThread,
+        ), patch(
+            "src.services.runtime_scheduler.MarketRadarRuntimeWorker",
+            side_effect=[RuntimeError("client_secret=first-secret"), worker],
+        ) as worker_cls:
+            service.start()
+            radar_task = service._scheduler.background_tasks[0]["task"]  # type: ignore[union-attr]
+
+            first_result = radar_task()
+            second_result = radar_task()
+
+        self.assertEqual(first_result["status"], "failed")
+        self.assertEqual(second_result, {"status": "skipped", "reason": "not_due"})
+        self.assertEqual(worker_cls.call_count, 2)
+        self.assertEqual(
+            service.status()["background_tasks"]["market_radar"]["last_decision"],
+            {"kind": "not_due"},
+        )
+        self.assertNotIn("first-secret", repr(service.status()))
 
     def test_radar_worker_and_status_survive_reconciliation(self) -> None:
         _RecordingScheduler.instances = []
@@ -204,13 +288,14 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             return_value=fake_worker,
         ) as worker_cls:
             service.reconcile_from_config()
+            first_task = _RecordingScheduler.instances[0].background_tasks[0]
+            first_task["task"]()
             radar_status["last_success_at"] = "2026-07-30T12:00:00+00:00"
             config.schedule_times = ["19:00"]
             service.reconcile_from_config()
 
         self.assertEqual(worker_cls.call_count, 1)
         self.assertEqual(len(_RecordingScheduler.instances), 2)
-        first_task = _RecordingScheduler.instances[0].background_tasks[0]
         second_task = _RecordingScheduler.instances[1].background_tasks[0]
         self.assertIs(first_task["task"], second_task["task"])
         self.assertTrue(first_task["run_immediately"])
