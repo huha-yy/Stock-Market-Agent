@@ -87,7 +87,7 @@ class MarketRadarRuntimeWorker:
                 attempt_key=None,
             )
 
-        self._status["last_decision"] = decision.model_dump(mode="json")
+        self._record_decision(decision)
         if decision.kind == "not_due":
             return {"status": "skipped", "reason": decision.reason}
         if decision.kind == "calendar_unavailable":
@@ -139,10 +139,7 @@ class MarketRadarRuntimeWorker:
                 status="succeeded",
                 run_id=run_id,
             )
-            self._status.update(
-                last_success_at=self.clock().isoformat(),
-                last_error=None,
-            )
+            self._record_success()
             return {
                 "status": "succeeded",
                 "attempt_key": reservation.attempt_key,
@@ -166,18 +163,26 @@ class MarketRadarRuntimeWorker:
                 decision,
                 lease_seconds=900,
             )
-            if reservation.acquired:
-                self.repository.finish_scheduled_attempt(
-                    reservation.attempt_key,
-                    status="skipped",
-                    reason_code="calendar_unavailable",
-                )
         except Exception as exc:
             return self._failure_result(
                 exc,
                 stage="persistence",
                 attempt_key=decision.attempt_key,
             )
+        if reservation.acquired:
+            try:
+                self.repository.finish_scheduled_attempt(
+                    reservation.attempt_key,
+                    status="skipped",
+                    reason_code="calendar_unavailable",
+                )
+            except Exception as exc:
+                return self._failure_result(
+                    exc,
+                    stage="persistence",
+                    attempt_key=decision.attempt_key,
+                    log_persistence_failure=True,
+                )
         return {
             "status": "skipped",
             "reason": "calendar_unavailable",
@@ -226,6 +231,32 @@ class MarketRadarRuntimeWorker:
             limit=512,
         )
         logger.error("Market Radar attempt status persistence failed: %s", summary)
+
+    def _record_decision(self, decision: RadarRunDecision) -> None:
+        try:
+            serialized = decision.model_dump(mode="json")
+        except Exception as exc:
+            self._log_status_update_failure(exc)
+            return
+        self._status["last_decision"] = serialized
+
+    def _record_success(self) -> None:
+        self._status["last_error"] = None
+        try:
+            success_at = self.clock().isoformat()
+        except Exception as exc:
+            self._log_status_update_failure(exc)
+            return
+        self._status["last_success_at"] = success_at
+
+    @staticmethod
+    def _log_status_update_failure(exc: Exception) -> None:
+        _, summary = sanitize_runtime_failure(
+            exc,
+            stage="runtime",
+            limit=512,
+        )
+        logger.warning("Market Radar status update failed: %s", summary)
 
     def status(self) -> dict[str, Any]:
         return copy.deepcopy(self._status)

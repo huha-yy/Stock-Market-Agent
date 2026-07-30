@@ -163,6 +163,54 @@ def test_duplicate_calendar_skip_does_not_build_service(
     service_factory.assert_not_called()
 
 
+def test_calendar_terminalization_failure_is_safely_logged(
+    worker: MarketRadarRuntimeWorker,
+    policy: Mock,
+    repository: Mock,
+    service_factory: Mock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    policy.decide.return_value = decision(
+        kind="calendar_unavailable",
+        reason="calendar_unavailable",
+        attempt_key="cn:calendar-error:2026-07-30:1030",
+    )
+    repository.reserve_scheduled_attempt.return_value = AttemptReservation(
+        "cn:calendar-error:2026-07-30:1030",
+        True,
+        "started",
+    )
+    repository.finish_scheduled_attempt.side_effect = RuntimeError(
+        "database password=calendar-secret"
+    )
+
+    assert worker.run_once() == {
+        "status": "failed",
+        "attempt_key": "cn:calendar-error:2026-07-30:1030",
+        "reason": "persistence_error",
+    }
+    assert "attempt status persistence failed" in caplog.text
+    assert "calendar-secret" not in caplog.text
+    service_factory.assert_not_called()
+
+
+def test_calendar_reservation_failure_is_not_logged_as_terminalization(
+    worker: MarketRadarRuntimeWorker,
+    policy: Mock,
+    repository: Mock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    policy.decide.return_value = decision(
+        kind="calendar_unavailable",
+        reason="calendar_unavailable",
+        attempt_key="cn:calendar-error:2026-07-30:1030",
+    )
+    repository.reserve_scheduled_attempt.side_effect = RuntimeError("database down")
+
+    assert worker.run_once()["reason"] == "persistence_error"
+    assert "attempt status persistence failed" not in caplog.text
+
+
 def test_due_run_finishes_attempt_after_service_commit(
     worker: MarketRadarRuntimeWorker,
     repository: Mock,
@@ -289,6 +337,59 @@ def test_policy_failure_is_calendar_error_and_fail_open(
     }
     assert worker.status()["last_error"] == "calendar_error"
     repository.reserve_scheduled_attempt.assert_not_called()
+
+
+def test_decision_serialization_failure_does_not_change_execution_result(
+    worker: MarketRadarRuntimeWorker,
+    policy: Mock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    due = Mock(spec=RadarRunDecision)
+    due.kind = "intraday_due"
+    due.reason = None
+    due.attempt_key = "cn:intraday:2026-07-30:morning:1030"
+    due.model_dump.side_effect = RuntimeError("diagnostic token=decision-secret")
+    policy.decide.return_value = due
+
+    assert worker.run_once()["status"] == "succeeded"
+    assert worker.status()["last_decision"] is None
+    assert "status update failed" in caplog.text
+    assert "decision-secret" not in caplog.text
+
+
+def test_success_status_clock_failure_preserves_durable_success(
+    policy: Mock,
+    repository: Mock,
+    service_factory: Mock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = Mock(
+        side_effect=[
+            NOW,
+            RuntimeError("diagnostic api_key=clock-secret"),
+        ]
+    )
+    worker = MarketRadarRuntimeWorker(
+        policy=policy,
+        repository=repository,
+        service_factory=service_factory,
+        clock=clock,
+    )
+
+    assert worker.run_once() == {
+        "status": "succeeded",
+        "attempt_key": "cn:intraday:2026-07-30:morning:1030",
+        "run_id": 12,
+    }
+    repository.finish_scheduled_attempt.assert_called_once_with(
+        "cn:intraday:2026-07-30:morning:1030",
+        status="succeeded",
+        run_id=12,
+    )
+    assert worker.status()["last_success_at"] is None
+    assert worker.status()["last_error"] is None
+    assert "status update failed" in caplog.text
+    assert "clock-secret" not in caplog.text
 
 
 def test_reservation_failure_is_persistence_error_without_provider_call(
