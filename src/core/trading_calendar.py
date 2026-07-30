@@ -328,6 +328,8 @@ def get_market_session_bounds(
             if has_break
             else None
         )
+        if has_break and (break_start is None or break_end is None):
+            return None
         return MarketSessionBounds(
             session_date=session.date(),
             open_at=open_at,
