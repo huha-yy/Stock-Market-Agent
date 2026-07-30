@@ -32,9 +32,57 @@ Phase 2A works without new configuration. The following optional integer setting
 
 The formula thresholds remain code-owned and versioned; these settings are not exposed in Web settings because Market Radar has no Web administration surface. Phase 2B adds no environment variables. ETF collection is fixed at 30 unique ETFs, a 90-second monotonic budget, and maximum concurrency of 6.
 
+Phase 2D adds one startup setting for the scheduled runtime:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `MARKET_RADAR_SCHEDULE_ENABLED=false` | `false` | Enable the A-share Market Radar background worker in a long-running schedule/API/Web/Desktop process |
+
+This setting is intentionally absent from Web settings. The 30-minute scan cadence, 60-second scheduler tick, 900-second attempt lease, China exchange session rules, confirmation count, and lifecycle thresholds are versioned domain policy rather than operator-tunable values.
+
 AkShare currently implements board history, benchmark history, industry flow, and current industry/concept membership. Its current membership endpoints do not supply an authoritative observation date. Those codes may remain visible as partial provenance, but undated membership is excluded from dated breadth, concentration, constituent-set keys, and persisted constituent evidence; its date is never inferred from board history or constituent quotes. Concept flow has no equivalent capability and is explicitly `unavailable`.
 
 Constituent realtime quotes use the existing `DataFetcherManager` fallback chain. The default A-share path accepts AkShare Tencent and Sina quotes when the provider payload supplies an authoritative Asia/Shanghai timestamp, previous close, current price, and traded amount. It never substitutes the local fetch time for a missing provider timestamp. A malformed or missing timestamp or previous close leaves that quote unusable and continues fallback; EFinance/Eastmoney may therefore remain invalid for this capability when those authoritative fields are absent. Tushare and TickFlow do not currently override the optional normalized board-capability methods. Future implementations may participate only when they satisfy the same normalized field, date, and provenance contracts. An empty, malformed, non-finite, or wrong-date result advances that individual capability to its next implemented provider; a history failure does not discard valid flow or provider-dated constituent evidence.
+
+## Scheduled Runtime And Lifecycle (Phase 2D)
+
+Set `MARKET_RADAR_SCHEDULE_ENABLED=true` before starting a long-running schedule/API/Web/Desktop process to enable the A-share Radar worker. The default is `false`, so an upgrade does not start new provider traffic. Market Radar-only enablement starts the background scheduler without enabling the ordinary daily stock-analysis task, and Radar failures remain isolated from that task and the Event Monitor. The worker is evaluated immediately when first registered and then every 60 seconds; each tick only decides eligibility and does not necessarily call a provider.
+
+### Session Scheduling And Attempts
+
+The worker uses the China exchange calendar and `Asia/Shanghai` session boundaries. It can persist no more than one successful run in each 30-minute morning or afternoon open-session slot, skips the lunch break, and permits one end-of-day finalization after the official close. Afternoon slots are anchored to the afternoon session open, so lunch does not shift their cadence. A late process start can still run the missing end-of-day finalization for the current trading date, but missed intraday slots are not backfilled.
+
+Scheduled attempt identities are deterministic:
+
+```text
+cn:intraday:<trading-date>:<morning-or-afternoon>:<slot-start>
+cn:eod:<trading-date>
+```
+
+Attempts are recorded as `started`, `succeeded`, `skipped`, or `failed`. A `started` lease expires after 900 seconds so a process crash can be retried without immediate concurrent re-entry. Duplicate terminal attempts do not call providers again. Calendar failure is fail-closed: it records at most one `calendar_unavailable` skip per local 30-minute window and performs no provider call. Premarket, lunch-break, closed-market, duplicate, lock-busy, and failure outcomes cannot advance lifecycle state. Failure diagnostics use bounded, redacted categories, while the last committed snapshot and lifecycle state remain readable.
+
+### Lifecycle Contract
+
+Only successful persisted runs with `trigger="schedule"` participate in lifecycle version `cn-lifecycle-v1`. Manual persisted runs and replay remain snapshot-only and neither mutate lifecycle state nor consume a scheduled identity.
+
+The normal state progression is `watching -> candidate -> confirmed -> active -> downgraded -> exited`:
+
+- `watching`: the sector is `leading` or `improving`, confidence is at least `0.60`, critical quality is neither `stale` nor `unavailable`, but no supported ETF position suggestion is present.
+- `candidate`: the same sector evidence qualifies and the position plan contains a supported ETF suggestion.
+- `confirmed`: either two consecutive successful qualifying intraday observations have been committed, or one qualifying end-of-day observation contains finalized evidence. A provisional end-of-day observation does not confirm or increment the intraday streak.
+- `active`: the next successful qualifying observation after confirmation advances the signal; later qualifying observations keep it active.
+- `downgraded`: a confirmed or active signal moves here immediately when it no longer qualifies or its current position suggestion carries an invalidation code.
+- `exited`: the next successful scheduled evaluation after downgrade closes that lifecycle instance. Later requalification starts a new instance and never rewrites the exited one.
+
+If `watching` or `candidate` stops qualifying before confirmation, the instance closes with `preconfirmation_no_longer_qualifies` without emitting an exited transition. A successful non-qualifying observation therefore breaks the confirmation sequence; a failed, skipped, duplicate, or calendar-unavailable attempt neither confirms nor breaks it. Lifecycle reason codes are deterministic and ordered.
+
+The snapshot, signal-instance updates, and immutable transitions commit in one database transaction. Validation, lifecycle, or persistence failure rolls back that entire successful-run transaction; the separate scheduled attempt is marked failed when its status store remains available. Same-key retries must be semantically identical, so crash recovery cannot overwrite conflicting snapshot or transition history.
+
+Phase 2D does not add run or configuration controls to the read-only API, Web cockpit, or Desktop shell. It also does not send transition alerts, generate reports, call an LLM for lifecycle decisions, or place orders.
+
+### Rollback
+
+To stop runtime execution, set `MARKET_RADAR_SCHEDULE_ENABLED=false` and reconcile or restart the long-running process. This removes the Radar background task and does not delete or reverse any state. Existing snapshots, attempts, signal instances, and transitions remain readable by the current database schema; no destructive migration or data rollback is required. Re-enabling later resumes from persisted lifecycle state at the next eligible slot. Roll back the Phase 2D code and schema only through the deployment's normal application/database restore procedure if the stored audit history itself must also be removed.
 
 ## Two-Stage Flow
 
@@ -199,17 +247,17 @@ Information is presented in this order:
 
 The page selects the first persisted rank initially and loads another sector detail only when the user selects it. Refresh requests the latest snapshot and ranking together, invalidates any in-flight detail request, and reloads the current sector against the accepted run. A missing or different run key on either summary response is treated as a summary error rather than combining two snapshots; detail responses with another run key are rejected as a local detail error. A detail error stays local so the overview and ranking remain usable, and stale detail responses cannot replace a newer selection or refresh. With no persisted run on both summary routes, the page shows an empty bootstrap state; legacy snapshots show unavailable regime and policy values instead of zero.
 
-This cockpit is A-share-only and read-only. It has no run, scheduling, alert, notification, report, configuration, or mutation controls. Creating a fresh snapshot remains an operator workflow through `scripts/run_market_radar.py --market cn --persist`.
+This cockpit is A-share-only and read-only. It has no run, scheduling, alert, notification, report, configuration, or mutation controls. Operators can create a manual snapshot through `scripts/run_market_radar.py --market cn --persist`, while the optional Phase 2D runtime creates scheduled snapshots outside the cockpit.
 
-## Phase 2C Out Of Scope
+## Current Out Of Scope
 
 The current exclusions are:
 
 - historical provider backfill;
 - reconstructing old observations from current constituents;
 - catalyst/news/policy scoring;
-- lifecycle hysteresis, signals, state-transition alerts, scheduling, or notifications;
-- write APIs, Desktop, or report rendering;
+- state-transition alerts or notifications;
+- write APIs, Desktop controls, or report rendering;
 - outcomes and calibration;
 - Hong Kong data and A/H links;
 - LLM calls or narrative generation;

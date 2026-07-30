@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 新增可选的 A 股 Market Radar 盘中调度与确定性生命周期转换持久化。
 - [新功能] Market Radar 新增 A 股 Web 监控驾驶舱，集中展示市场状态、板块排名、ETF 候选、仓位上限与失效证据。
 - [新功能] Market Radar 新增最新快照、板块排名和板块详情只读 API，为 Web 监控驾驶舱提供稳定数据契约。
 - [新功能] Market Radar Phase 2B 新增可追溯的 ETF 筛选、市场状态评估、通用模型仓位区间及原子持久化回放。
