@@ -208,19 +208,22 @@ class MarketRadarRepository:
         attempt_key: str,
         *,
         owner_token: str,
-        status: Literal["succeeded", "skipped", "failed"],
-        run_id: int | None = None,
+        status: Literal["skipped", "failed"],
         reason_code: str | None = None,
         failure_category: str | None = None,
         failure_summary: str | None = None,
     ) -> None:
-        if status not in {"succeeded", "skipped", "failed"}:
+        if status == "succeeded":
+            raise ValueError(
+                "scheduled attempt success requires atomic scheduled persistence"
+            )
+        if status not in {"skipped", "failed"}:
             raise ValueError(f"invalid scheduled attempt terminal status: {status}")
         if not owner_token:
             raise ValueError("scheduled attempt owner_token is required")
         values = {
             "status": status,
-            "run_id": run_id,
+            "run_id": None,
             "reason_code": reason_code,
             "failure_category": failure_category,
             "failure_summary": failure_summary[:512] if failure_summary else None,

@@ -826,18 +826,18 @@ def test_phase2b_retry_rejects_changed_semantics(
         )
 
 
-def test_reserve_attempt_reuses_terminal_identity(isolated_db) -> None:
+def test_reserve_attempt_reuses_atomically_committed_identity(isolated_db) -> None:
     repo = MarketRadarRepository(isolated_db)
-    run_id = repo.save_run(_snapshot())
-    decision = _intraday_decision()
-
-    first = repo.reserve_scheduled_attempt(decision, lease_seconds=900, now=NOW)
-    repo.finish_scheduled_attempt(
-        first.attempt_key,
-        owner_token=first.owner_token,
-        status="succeeded",
-        run_id=run_id,
+    bundle = _scheduled_bundle()
+    first = _reserve_scheduled_bundle(repo, bundle)
+    run_id = _save_reserved_scheduled_bundle(repo, bundle, first)
+    snapshot = bundle["snapshot"]
+    assert isinstance(snapshot, RadarRunSnapshot)
+    decision = _intraday_decision(
+        decided_at=snapshot.as_of,
+        attempt_key=first.attempt_key,
     )
+
     second = repo.reserve_scheduled_attempt(
         decision,
         lease_seconds=900,
@@ -847,6 +847,56 @@ def test_reserve_attempt_reuses_terminal_identity(isolated_db) -> None:
     assert second.acquired is False
     assert second.status == "succeeded"
     assert second.run_id == run_id
+
+
+def test_finish_attempt_rejects_independent_success_without_mutating_state(
+    isolated_db,
+) -> None:
+    repo = MarketRadarRepository(isolated_db)
+    run_id = repo.save_run(_snapshot())
+    decision = _intraday_decision()
+    reservation = repo.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW,
+    )
+    with isolated_db.get_session() as session:
+        attempt_before = session.get(RadarRunAttemptRecord, reservation.attempt_key)
+        run_before = session.get(RadarRunRecord, run_id)
+        attempt_state_before = {
+            attribute.key: getattr(attempt_before, attribute.key)
+            for attribute in inspect(attempt_before).mapper.column_attrs
+        }
+        run_state_before = {
+            attribute.key: getattr(run_before, attribute.key)
+            for attribute in inspect(run_before).mapper.column_attrs
+        }
+
+    with pytest.raises(ValueError, match="atomic scheduled persistence"):
+        repo.finish_scheduled_attempt(
+            reservation.attempt_key,
+            owner_token=reservation.owner_token,
+            status="succeeded",
+        )
+
+    with isolated_db.get_session() as session:
+        attempt = session.get(RadarRunAttemptRecord, reservation.attempt_key)
+        stored_run = session.get(RadarRunRecord, run_id)
+        assert attempt.status == "started"
+        assert attempt.run_id is None
+        assert attempt.owner_token == reservation.owner_token
+        assert attempt.lease_expires_at is not None
+        assert stored_run is not None
+        assert stored_run.run_key == "cn:20260721T060000Z:manual"
+        assert session.scalar(select(func.count()).select_from(RadarRunRecord)) == 1
+        assert {
+            attribute.key: getattr(attempt, attribute.key)
+            for attribute in inspect(attempt).mapper.column_attrs
+        } == attempt_state_before
+        assert {
+            attribute.key: getattr(stored_run, attribute.key)
+            for attribute in inspect(stored_run).mapper.column_attrs
+        } == run_state_before
 
 
 def test_started_attempt_can_only_be_reclaimed_after_lease(isolated_db) -> None:
