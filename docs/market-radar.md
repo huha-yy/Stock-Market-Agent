@@ -46,7 +46,9 @@ Constituent realtime quotes use the existing `DataFetcherManager` fallback chain
 
 ## Scheduled Runtime And Lifecycle (Phase 2D)
 
-Set `MARKET_RADAR_SCHEDULE_ENABLED=true` before starting a long-running schedule/API/Web/Desktop process to enable the A-share Radar worker. The default is `false`, so an upgrade does not start new provider traffic. Market Radar-only enablement starts the background scheduler without enabling the ordinary daily stock-analysis task, and Radar failures remain isolated from that task and the Event Monitor. The worker is evaluated immediately when first registered and then every 60 seconds; each tick only decides eligibility and does not necessarily call a provider.
+Set `MARKET_RADAR_SCHEDULE_ENABLED=true` before starting a long-running schedule/API/Web/Desktop process to enable the A-share Radar worker. The default is `false`, so an upgrade does not start new provider traffic. The API/Web/Desktop runtime scheduler and the CLI scheduler used by `python main.py --schedule` register the same lazy Radar background task. Market Radar-only enablement starts that scheduler loop without enabling the ordinary daily stock-analysis task; an explicit `--schedule` continues to enable the daily task. Radar initialization and run failures remain isolated from daily analysis and the Event Monitor. The worker is evaluated immediately when first registered and then every 60 seconds; each tick only decides eligibility and does not necessarily call a provider.
+
+The additive scheduler status keeps `enabled` as the ordinary daily-analysis setting. `loop_enabled` reports whether the scheduler loop is active, including Radar-only mode, and `background_tasks.market_radar` exposes category-only worker diagnostics. These fields are returned by the existing read-only scheduler status endpoint and do not add a Radar run or configuration control to Web.
 
 ### Session Scheduling And Attempts
 
@@ -59,7 +61,7 @@ cn:intraday:<trading-date>:<morning-or-afternoon>:<slot-start>
 cn:eod:<trading-date>
 ```
 
-Attempts are recorded as `started`, `succeeded`, `skipped`, or `failed`. A `started` lease expires after 900 seconds so a process crash can be retried without immediate concurrent re-entry. Duplicate terminal attempts do not call providers again. Calendar failure is fail-closed: it records at most one `calendar_unavailable` skip per local 30-minute window and performs no provider call. Premarket, lunch-break, closed-market, duplicate, lock-busy, and failure outcomes cannot advance lifecycle state. Failure diagnostics use bounded, redacted categories, while the last committed snapshot and lifecycle state remain readable.
+Attempts are recorded as `started`, `succeeded`, `skipped`, or `failed`. A `started` lease expires after 900 seconds so a process crash can be retried without immediate concurrent re-entry. Each acquisition receives an opaque owner token; reclaim rotates that token, and scheduled persistence or terminalization from an expired owner is rejected. A successful attempt stores its committed run ID in the same transaction as the snapshot and lifecycle changes, so recovery returns that run without rebuilding providers. Duplicate terminal attempts do not call providers again. Calendar failure is fail-closed: it records at most one `calendar_unavailable` skip per local 30-minute window and performs no provider call. Premarket, lunch-break, closed-market, duplicate, lock-busy, and failure outcomes cannot advance lifecycle state. Persisted and logged failure summaries contain only a stable category and exception class, never raw exception text, while the last committed snapshot and lifecycle state remain readable.
 
 ### Lifecycle Contract
 
@@ -76,7 +78,7 @@ The normal state progression is `watching -> candidate -> confirmed -> active ->
 
 If `watching` or `candidate` stops qualifying before confirmation, the instance closes with `preconfirmation_no_longer_qualifies` without emitting an exited transition. A successful non-qualifying observation therefore breaks the confirmation sequence; a failed, skipped, duplicate, or calendar-unavailable attempt neither confirms nor breaks it. Lifecycle reason codes are deterministic and ordered.
 
-The snapshot, signal-instance updates, and immutable transitions commit in one database transaction. Validation, lifecycle, or persistence failure rolls back that entire successful-run transaction; the separate scheduled attempt is marked failed when its status store remains available. Same-key retries must be semantically identical, so crash recovery cannot overwrite conflicting snapshot or transition history.
+The snapshot, market lifecycle head, signal-instance updates, immutable transitions, and scheduled attempt's `succeeded`/run-ID binding commit in one database transaction. Validation, lifecycle, or persistence failure rolls back that entire successful-run transaction; failures before that transaction are terminalized only while the worker still owns the attempt. One chronological lifecycle head is locked per market, and a scheduled run must match its exact predecessor and have a strictly later observation time. Stale, disjoint, or backdated evaluations therefore cannot rewind or fork effective state. Same-key retries must be semantically identical, so crash recovery cannot overwrite conflicting snapshot or transition history.
 
 Phase 2D does not add run or configuration controls to the read-only API, Web cockpit, or Desktop shell. It also does not send transition alerts, generate reports, call an LLM for lifecycle decisions, or place orders.
 
