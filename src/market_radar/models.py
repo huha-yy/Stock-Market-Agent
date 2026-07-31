@@ -466,7 +466,7 @@ class PositionPlan(FrozenModel):
 class RadarRunSnapshot(FrozenModel):
     run_key: str
     market: MarketRadarMarket
-    trigger: Literal["manual", "replay"]
+    trigger: Literal["manual", "schedule", "replay"]
     as_of: datetime
     quality: DataQuality
     scoring_version: Literal["cn-v1"]

@@ -123,6 +123,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "schedule_enabled": False,
             "schedule_time": "18:00",
             "schedule_run_immediately": True,
+            "market_radar_schedule_enabled": False,
             "run_immediately": True,
             "agent_event_monitor_enabled": False,
             "agent_event_alert_rules_json": "",
@@ -616,6 +617,54 @@ class MainScheduleModeTestCase(unittest.TestCase):
         run_full_analysis.assert_not_called()
         self.assertEqual(len(scheduled_call["background_tasks"]), 1)
         self.assertEqual(scheduled_call["background_tasks"][0]["name"], "agent_event_monitor")
+
+    def test_radar_only_config_uses_cli_scheduler_without_daily_analysis(self) -> None:
+        args = self._make_args(schedule=False)
+        config = self._make_config(
+            schedule_enabled=False,
+            market_radar_schedule_enabled=True,
+        )
+        radar_task = {
+            "task": MagicMock(),
+            "interval_seconds": 60,
+            "run_immediately": True,
+            "name": "market_radar",
+            "status_provider": MagicMock(),
+        }
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call.update(
+                task=task,
+                run_immediately=run_immediately,
+                background_tasks=background_tasks or [],
+            )
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch(
+                 "src.services.runtime_scheduler.build_market_radar_background_task",
+                 return_value=radar_task,
+             ) as build_radar, \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNone(scheduled_call["task"])
+        self.assertFalse(scheduled_call["run_immediately"])
+        self.assertEqual(scheduled_call["background_tasks"], [radar_task])
+        build_radar.assert_called_once_with(config)
+        run_full_analysis.assert_not_called()
 
     def test_check_notify_returns_before_other_modes(self) -> None:
         args = self._make_args(check_notify=True, serve=True, schedule=True, market_review=True)

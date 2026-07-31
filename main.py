@@ -1413,7 +1413,9 @@ def main() -> int:
         else:
             os.environ.pop(RUNTIME_SCHEDULER_SUPPRESS_START_ENV, None)
         runtime_schedule_requested = not args.serve_only and (
-            args.schedule or config.schedule_enabled
+            args.schedule
+            or config.schedule_enabled
+            or getattr(config, "market_radar_schedule_enabled", False)
         )
         if not args.serve_only and args.schedule:
             os.environ[RUNTIME_SCHEDULER_FORCE_ENABLED_ENV] = "true"
@@ -1522,7 +1524,11 @@ def main() -> int:
             return 0
 
         # 模式2: 定时任务模式
-        if args.schedule or config.schedule_enabled:
+        if (
+            args.schedule
+            or config.schedule_enabled
+            or getattr(config, "market_radar_schedule_enabled", False)
+        ):
             if start_serve:
                 logger.info("模式: Web/API runtime scheduler")
                 logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
@@ -1541,7 +1547,10 @@ def main() -> int:
             # Determine whether to run immediately:
             # Command line arg --no-run-immediately overrides config if present.
             # Otherwise use config (defaults to True).
-            should_run_immediately = config.schedule_run_immediately
+            daily_schedule_enabled = bool(args.schedule or config.schedule_enabled)
+            should_run_immediately = (
+                config.schedule_run_immediately if daily_schedule_enabled else False
+            )
             if getattr(args, 'no_run_immediately', False):
                 should_run_immediately = False
 
@@ -1576,8 +1585,17 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
+            if getattr(config, "market_radar_schedule_enabled", False):
+                from src.services.runtime_scheduler import (
+                    build_market_radar_background_task,
+                )
+
+                radar_task = build_market_radar_background_task(config)
+                if radar_task is not None:
+                    background_tasks.append(radar_task)
+
             schedule_kwargs = {
-                "task": scheduled_task,
+                "task": scheduled_task if daily_schedule_enabled else None,
                 "schedule_time": config.schedule_time,
                 "run_immediately": should_run_immediately,
                 "background_tasks": background_tasks,

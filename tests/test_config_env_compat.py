@@ -16,6 +16,34 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_market_radar_schedule_defaults_disabled(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config._load_from_env()
+
+        self.assertFalse(config.market_radar_schedule_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_market_radar_schedule_can_be_enabled(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {"MARKET_RADAR_SCHEDULE_ENABLED": "true"},
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.market_radar_schedule_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     @patch.object(Config, "_parse_stock_email_groups", return_value=[])
     def test_stock_list_accepts_common_copy_paste_separators(
         self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env

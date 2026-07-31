@@ -415,7 +415,7 @@ class Scheduler:
 
 
 def run_with_schedule(
-    task: Callable,
+    task: Optional[Callable],
     schedule_time: str = "18:00",
     run_immediately: bool = True,
     background_tasks: Optional[List[Dict[str, Any]]] = None,
@@ -427,7 +427,7 @@ def run_with_schedule(
     便捷函数：使用定时调度运行任务
 
     Args:
-        task: 要执行的任务函数
+        task: 要执行的每日任务函数；仅运行后台任务时可为 None
         schedule_time: 每日执行时间
         run_immediately: 是否立即执行一次
         background_tasks: 可选的后台任务定义列表。每项为一个字典，
@@ -452,7 +452,8 @@ def run_with_schedule(
             run_immediately=entry.get("run_immediately", False),
             name=entry.get("name"),
         )
-    scheduler.set_daily_task(task, run_immediately=run_immediately)
+    if task is not None:
+        scheduler.set_daily_task(task, run_immediately=run_immediately)
     scheduler.run()
 
 

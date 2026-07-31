@@ -53,7 +53,8 @@ from sqlalchemy.orm import (
     sessionmaker,
     Session,
 )
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.schema import CreateColumn
 
 from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
@@ -1227,6 +1228,7 @@ class RadarRunRecord(Base):
     quality = Column(String(32), nullable=False)
     scoring_version = Column(String(32), nullable=False)
     provider_trace_json = Column(Text, nullable=False, default="[]")
+    lifecycle_evaluation_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
 
@@ -1351,6 +1353,83 @@ class RadarPositionPlanRecord(Base):
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
 
 
+class RadarRunAttemptRecord(Base):
+    __tablename__ = "radar_run_attempts"
+
+    attempt_key = Column(String(192), primary_key=True)
+    market = Column(String(16), nullable=False, index=True)
+    trigger_type = Column(String(32), nullable=False)
+    trading_date = Column(Date, nullable=False, index=True)
+    decided_at = Column(DateTime, nullable=False)
+    lease_expires_at = Column(DateTime, nullable=True)
+    owner_token = Column(String(64), nullable=True)
+    status = Column(String(32), nullable=False)
+    reason_code = Column(String(96), nullable=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    failure_category = Column(String(96), nullable=True)
+    failure_summary = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarLifecycleHeadRecord(Base):
+    __tablename__ = "radar_lifecycle_heads"
+
+    market = Column(String(16), primary_key=True)
+    last_run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id"),
+        nullable=False,
+    )
+    last_effective_at = Column(DateTime, nullable=False)
+    lifecycle_version = Column(String(32), nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarSignalInstanceRecord(Base):
+    __tablename__ = "radar_signal_instances"
+
+    signal_key = Column(String(192), primary_key=True)
+    market = Column(String(16), nullable=False, index=True)
+    sector_id = Column(String(160), nullable=False, index=True)
+    instance_number = Column(Integer, nullable=False)
+    state = Column(String(32), nullable=False)
+    lifecycle_version = Column(String(32), nullable=False)
+    first_run_id = Column(Integer, ForeignKey("radar_runs.id"), nullable=False)
+    last_run_id = Column(Integer, ForeignKey("radar_runs.id"), nullable=False)
+    signal_json = Column(Text, nullable=False)
+    closed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
+class RadarSignalTransitionRecord(Base):
+    __tablename__ = "radar_signal_transitions"
+
+    transition_key = Column(String(224), primary_key=True)
+    signal_key = Column(
+        String(192),
+        ForeignKey("radar_signal_instances.signal_key"),
+        nullable=False,
+        index=True,
+    )
+    effective_run_id = Column(
+        Integer,
+        ForeignKey("radar_runs.id"),
+        nullable=False,
+        index=True,
+    )
+    previous_state = Column(String(32), nullable=True)
+    new_state = Column(String(32), nullable=False)
+    transition_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1434,6 +1513,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_market_radar_snapshot_position_schema()
+            self._ensure_market_radar_lifecycle_schema()
+            self._backfill_market_radar_lifecycle_head()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1480,6 +1561,125 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "CREATE INDEX IF NOT EXISTS idx_radar_sector_run_position "
                 f"ON {table_name} (run_id, position)"
             )
+
+    def _ensure_market_radar_lifecycle_schema(self) -> None:
+        """Add lifecycle columns/indexes without rewriting existing Radar tables."""
+        inspector = inspect(self._engine)
+        additive_columns = (
+            (RadarRunRecord.__table__, "lifecycle_evaluation_json"),
+            (RadarRunAttemptRecord.__table__, "owner_token"),
+        )
+        for table, column_name in additive_columns:
+            table_name = table.name
+            if not inspector.has_table(table_name):
+                continue
+            existing_columns = {
+                column["name"] for column in inspector.get_columns(table_name)
+            }
+            if column_name in existing_columns:
+                continue
+            dialect = self._engine.dialect
+            table_sql = dialect.identifier_preparer.quote(table_name)
+            column_sql = str(
+                CreateColumn(table.c[column_name]).compile(dialect=dialect)
+            )
+            add_column_sql = "ADD" if dialect.name == "mssql" else "ADD COLUMN"
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_sql} {add_column_sql} {column_sql}"
+                    )
+            except DBAPIError as exc:
+                if not self._is_duplicate_column_error(exc, column_name):
+                    raise
+        if not self._is_sqlite_engine:
+            return
+        indexes = {
+            RadarRunAttemptRecord.__tablename__: (
+                ("ix_radar_run_attempts_market", "market"),
+                ("ix_radar_run_attempts_trading_date", "trading_date"),
+            ),
+            RadarSignalInstanceRecord.__tablename__: (
+                ("ix_radar_signal_instances_market", "market"),
+                ("ix_radar_signal_instances_sector_id", "sector_id"),
+            ),
+            RadarSignalTransitionRecord.__tablename__: (
+                ("ix_radar_signal_transitions_signal_key", "signal_key"),
+                (
+                    "ix_radar_signal_transitions_effective_run_id",
+                    "effective_run_id",
+                ),
+            ),
+        }
+        with self._engine.begin() as connection:
+            for table_name, definitions in indexes.items():
+                if not inspector.has_table(table_name):
+                    continue
+                for index_name, column_name in definitions:
+                    connection.exec_driver_sql(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {table_name} ({column_name})"
+                    )
+
+    def _backfill_market_radar_lifecycle_head(self) -> None:
+        """Create the chronological head for databases written before Phase 2D fencing."""
+        inspector = inspect(self._engine)
+        run_table = RadarRunRecord.__tablename__
+        head_table = RadarLifecycleHeadRecord.__tablename__
+        if not inspector.has_table(run_table) or not inspector.has_table(head_table):
+            return
+        required_run_columns = {
+            "id",
+            "run_key",
+            "market",
+            "as_of",
+            "lifecycle_evaluation_json",
+        }
+        actual_run_columns = {
+            column["name"] for column in inspector.get_columns(run_table)
+        }
+        if not required_run_columns <= actual_run_columns:
+            return
+
+        def write(session: Session) -> None:
+            if session.get(RadarLifecycleHeadRecord, "cn") is not None:
+                return
+            latest = session.execute(
+                select(RadarRunRecord)
+                .where(
+                    RadarRunRecord.market == "cn",
+                    RadarRunRecord.lifecycle_evaluation_json.is_not(None),
+                )
+                .order_by(RadarRunRecord.as_of.desc(), RadarRunRecord.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest is None:
+                return
+            session.add(
+                RadarLifecycleHeadRecord(
+                    market="cn",
+                    last_run_id=latest.id,
+                    last_effective_at=latest.as_of,
+                    lifecycle_version="cn-lifecycle-v1",
+                )
+            )
+
+        session = self._SessionLocal()
+        try:
+            if self._is_sqlite_engine:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            write(session)
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                if verify_session.get(RadarLifecycleHeadRecord, "cn") is None:
+                    raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()
@@ -1983,6 +2183,34 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     def _is_sqlite_duplicate_column_error(exc: OperationalError, column: str) -> bool:
         err_text = str(getattr(exc, "orig", exc)).lower()
         return "duplicate column name" in err_text and column.lower() in err_text
+
+    @staticmethod
+    def _is_duplicate_column_error(exc: DBAPIError, column: str) -> bool:
+        original = getattr(exc, "orig", exc)
+        codes = {
+            str(code)
+            for code in (
+                getattr(original, "sqlstate", None),
+                getattr(original, "pgcode", None),
+            )
+            if code is not None
+        }
+        args = getattr(original, "args", ())
+        if args:
+            codes.add(str(args[0]))
+        if codes & {"42701", "42S21", "1060", "2705"}:
+            return True
+
+        err_text = str(original).lower()
+        return column.lower() in err_text and any(
+            marker in err_text
+            for marker in (
+                "duplicate column name",
+                "duplicate column",
+                "already exists",
+                "specified more than once",
+            )
+        )
 
     @staticmethod
     def _normalize_daily_date(value: Any) -> Any:

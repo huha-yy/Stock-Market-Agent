@@ -161,7 +161,7 @@ export interface MarketRadarPositionPlan {
 export interface MarketRadarSnapshot {
   runKey: string;
   market: 'cn';
-  trigger: 'manual' | 'replay';
+  trigger: 'manual' | 'schedule' | 'replay';
   asOf: string;
   quality: MarketRadarQuality;
   scoringVersion: 'cn-v1';

@@ -6,6 +6,7 @@ import sys
 import textwrap
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -22,6 +23,13 @@ from src.market_radar.capabilities import (
     ConstituentQuote,
     ConstituentQuoteBatch,
 )
+from src.market_radar.lifecycle import (
+    LifecycleEvaluation,
+    LifecycleSignal,
+    LifecycleTransition,
+)
+from src.market_radar.runtime_worker import MarketRadarRuntimeWorker
+from src.market_radar.session_policy import RadarRunDecision
 from src.storage import DatabaseManager
 
 
@@ -600,3 +608,113 @@ def test_offline_enriched_service_rolls_back_every_table_on_atomic_failure(
                 f"SELECT COUNT(*) FROM {table}"
             ).scalar_one()
             assert count == 0, table
+
+
+def test_scheduled_lifecycle_and_attempt_survive_database_restart(
+    isolated_db,
+) -> None:
+    service, repository, _ = _offline_enriched_service(isolated_db)
+    manual_snapshot = service.run(market="cn", persist=True)
+    snapshot_data = manual_snapshot.model_dump(mode="json")
+    snapshot_data.update(
+        run_key="cn:20260721T060000Z:schedule",
+        trigger="schedule",
+    )
+    scheduled_snapshot = market_radar.RadarRunSnapshot.model_validate(
+        snapshot_data
+    )
+    sector = scheduled_snapshot.sectors[0]
+    signal = LifecycleSignal(
+        signal_key=f"cn:{sector.sector_id}:1",
+        sector_id=sector.sector_id,
+        instance_number=1,
+        state="watching",
+        first_run_key=scheduled_snapshot.run_key,
+        current_run_key=scheduled_snapshot.run_key,
+        effective_at=scheduled_snapshot.as_of,
+        intraday_qualifying_streak=0,
+        confidence=sector.confidence,
+    )
+    transition = LifecycleTransition(
+        transition_key="radar-transition:integration-restart",
+        signal_key=signal.signal_key,
+        previous_state=None,
+        new_state="watching",
+        effective_run_key=scheduled_snapshot.run_key,
+        effective_at=scheduled_snapshot.as_of,
+    )
+    evaluation = LifecycleEvaluation(
+        run_key=scheduled_snapshot.run_key,
+        signals=(signal,),
+        transitions=(transition,),
+    )
+    decision = RadarRunDecision(
+        kind="intraday_due",
+        decided_at=NOW,
+        trading_date=NOW.date(),
+        attempt_key="cn:intraday:2026-07-21:morning:1400",
+        session_segment="morning",
+        slot_start=NOW,
+    )
+    reservation = repository.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW,
+    )
+    run_id = repository.save_scheduled_enriched_run(
+        repository.list_universe(NOW.date()),
+        repository.resolve_snapshot_constituent_evidence(manual_snapshot),
+        tuple(selection.observation for selection in scheduled_snapshot.etfs),
+        scheduled_snapshot,
+        evaluation,
+        attempt_key=reservation.attempt_key,
+        attempt_owner_token=reservation.owner_token,
+    )
+    with isolated_db._engine.connect() as connection:
+        lifecycle_payloads = dict(
+            connection.exec_driver_sql(
+                "SELECT run_key, lifecycle_evaluation_json FROM radar_runs"
+            ).all()
+        )
+    assert lifecycle_payloads[manual_snapshot.run_key] is None
+    assert LifecycleEvaluation.model_validate_json(
+        lifecycle_payloads[scheduled_snapshot.run_key]
+    ) == evaluation
+
+    DatabaseManager.reset_instance()
+    reopened = market_radar.MarketRadarRepository(
+        DatabaseManager.get_instance()
+    )
+
+    assert reopened.get_run(run_id) == scheduled_snapshot
+    context = reopened.load_lifecycle_context()
+    assert context.open_signals == (signal,)
+    assert context.latest_instance_by_sector == {sector.sector_id: 1}
+    assert context.head_run_key == scheduled_snapshot.run_key
+    assert context.head_effective_at == scheduled_snapshot.as_of
+    duplicate = reopened.reserve_scheduled_attempt(
+        decision,
+        lease_seconds=900,
+        now=NOW + timedelta(hours=1),
+    )
+    assert duplicate.acquired is False
+    assert duplicate.status == "succeeded"
+    assert duplicate.run_id == run_id
+
+    policy = Mock()
+    policy.decide.return_value = decision
+    service_factory = Mock(side_effect=AssertionError("provider path reran"))
+    recovered = MarketRadarRuntimeWorker(
+        policy=policy,
+        repository=reopened,
+        service_factory=service_factory,
+        clock=lambda: NOW + timedelta(hours=1),
+    ).run_once()
+
+    assert recovered == {
+        "status": "succeeded",
+        "reason": "duplicate_slot",
+        "attempt_key": reservation.attempt_key,
+        "run_id": run_id,
+    }
+    service_factory.assert_not_called()

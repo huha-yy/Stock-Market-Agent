@@ -1024,6 +1024,7 @@ class Config:
     
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
+    market_radar_schedule_enabled: bool = False
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_times: List[str] = field(default_factory=lambda: ["18:00"])
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
@@ -1978,6 +1979,10 @@ class Config:
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',
+            market_radar_schedule_enabled=(
+                os.getenv('MARKET_RADAR_SCHEDULE_ENABLED', 'false').strip().lower()
+                == 'true'
+            ),
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_times=normalize_schedule_times(
                 schedule_times_value,
